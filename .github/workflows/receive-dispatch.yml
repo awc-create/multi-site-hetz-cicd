@@ -116,7 +116,9 @@ jobs:
           host: ${{ secrets.HZ_HOST }}
           username: ${{ secrets.HZ_USER || 'root' }}
           key: ${{ secrets.HZ_SSH_KEY }}
-          script_stop: true
+          port: 22
+          timeout: 60s
+          command_timeout: 15m
           script: |
             set -euo pipefail
 
@@ -154,6 +156,7 @@ jobs:
                   timeout: 5s
                   retries: 10
                 networks: [core_db_net]
+
               pgbouncer:
                 image: edoburu/pgbouncer
                 restart: always
@@ -165,6 +168,7 @@ jobs:
                   POOL_MODE: transaction
                   MAX_CLIENT_CONN: 200
                   DEFAULT_POOL_SIZE: 20
+                  LISTEN_PORT: 5432
                 depends_on:
                   postgres:
                     condition: service_healthy
