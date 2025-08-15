@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   deploy:
+    if: ${{ github.event.client_payload.branch == 'main-hetz' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -58,12 +59,6 @@ jobs:
           echo "DOMAIN_PROD=$DOMAIN_PROD" >> $GITHUB_OUTPUT
           echo "DOMAIN_ADMIN=$DOMAIN_ADMIN" >> $GITHUB_OUTPUT
 
-      - name: Gate – only handle prod (main-hetz) deploys
-        if: steps.p.outputs.branch != 'main-hetz'
-        run: |
-          echo "ℹ️ Branch '${{ steps.p.outputs.branch }}' is not main-hetz. Skipping."
-          exit 0
-
       - name: Derive image coordinates
         id: meta
         run: |
@@ -71,9 +66,10 @@ jobs:
           REPO_NAME="${{ steps.p.outputs.repository_name }}"
           IMAGE="ghcr.io/${OWNER_LOWER}/${REPO_NAME}"
           SHORT="${GITHUB_SHA::7}"
-          echo "image=$IMAGE"   >> $GITHUB_OUTPUT
-          echo "tag=$SHORT"     >> $GITHUB_OUTPUT
-          echo "ref=$IMAGE:$SHORT" >> $GITHUB_OUTPUT
+          echo "image=$IMAGE"            >> $GITHUB_OUTPUT
+          echo "tag=$SHORT"              >> $GITHUB_OUTPUT
+          echo "ref=$IMAGE:$SHORT"       >> $GITHUB_OUTPUT
+          echo "owner_lower=$OWNER_LOWER" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -94,7 +90,7 @@ jobs:
             ${{ steps.meta.outputs.ref }}
             ${{ steps.meta.outputs.image }}:latest
 
-      # NOTE: hard-code for drcodezenna while testing. Generalize later if desired.
+      # --- Deploy to Hetzner over SSH ---
       - name: Deploy over SSH (ensure DB stack, write env, run app; add admin router if provided)
         uses: appleboy/ssh-action@v1
         env:
@@ -104,17 +100,26 @@ jobs:
           ADMIN_DOMAIN: ${{ steps.cfg.outputs.DOMAIN_ADMIN }}
           IMAGE_REF:    ${{ steps.meta.outputs.ref }}
           SITE_ENV:     ${{ secrets.SITE_ENV__DRCODEZENNA }}
-          GHCR_USER:    ${{ github.repository_owner }}
-          GHCR_TOKEN:   ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
+          GHCR_USER:    ${{ steps.meta.outputs.owner_lower }}
+          GHCR_TOKEN:   ${{ secrets.GHCR_READ_TOKEN }}
         with:
-          host: ${{ secrets.HZ_HOST }}   # use IP or gray-clouded DNS (no Cloudflare proxy)
-          username: ${{ secrets.HZ_USER || 'root' }}
+          host: ${{ secrets.HZ_HOST }}
+          username: ${{ secrets.HZ_USER || 'root' }} # if your org doesn't support this expression, set HZ_USER or hardcode 'root'
           key: ${{ secrets.HZ_SSH_KEY }}
           port: 22
           timeout: 60s
           command_timeout: 15m
+          envs: SLUG,PORT,DOMAIN,ADMIN_DOMAIN,IMAGE_REF,SITE_ENV,GHCR_USER,GHCR_TOKEN
           script: |
             set -euo pipefail
+
+            # --- sanity checks ---
+            : "${SLUG:?Missing SLUG}"
+            : "${PORT:?Missing PORT}"
+            : "${IMAGE_REF:?Missing IMAGE_REF}"
+            : "${SITE_ENV:?Missing SITE_ENV (.env payload)}"
+            : "${GHCR_USER:?Missing GHCR_USER}"
+            : "${GHCR_TOKEN:?Missing GHCR_TOKEN}"
 
             # --- Networks (Traefik + DB) ---
             docker network create proxy       >/dev/null 2>&1 || true
@@ -124,19 +129,20 @@ jobs:
             SITE_DIR="/opt/sites/${SLUG}"
             mkdir -p "$SITE_DIR"
             cd "$SITE_DIR"
-            printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//' > .env
+            printf "%s\n" "${SITE_ENV}" | sed 's/\r$//' > .env
 
             # Extract POSTGRES_PASSWORD from site .env and write DB .env
             DB_DIR="/opt/services/postgres"
             mkdir -p "$DB_DIR"
             if grep -q '^POSTGRES_PASSWORD=' .env; then
               awk -F= '/^POSTGRES_PASSWORD=/{print "POSTGRES_PASSWORD="$2}' .env > "${DB_DIR}/.env"
+            else
+              echo "POSTGRES_PASSWORD not found in site .env" >&2
+              exit 1
             fi
 
             # --- GHCR login for pulls on the host ---
-            if [ -n "${GHCR_TOKEN:-}" ]; then
-              echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-            fi
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
             # --- Ensure global DB stack is up (Postgres + PgBouncer) ---
             cat > "${DB_DIR}/docker-compose.yml" <<'DBYAML'
@@ -145,6 +151,8 @@ jobs:
               core_db_net:
                 name: core_db_net
                 driver: bridge
+            volumes:
+              pg_data:
             services:
               postgres:
                 image: postgres:15
@@ -177,12 +185,10 @@ jobs:
                   postgres:
                     condition: service_healthy
                 networks: [core_db_net]
-            volumes:
-              pg_data:
             DBYAML
 
             cd "${DB_DIR}"
-            # Compose auto-loads ./.env in this directory
+            # Compose will substitute ${POSTGRES_PASSWORD} from ./.env we wrote above.
             docker compose up -d
 
             # --- Back to site dir; write compose (Traefik labels) ---
