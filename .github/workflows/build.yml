@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       repository:     ${{ steps.p.outputs.repository }}
-      repository_name:${{ steps.p.outputs.repository_name }}
+      repository_name: ${{ steps.p.outputs.repository_name }}
       branch:         ${{ steps.p.outputs.branch }}
       project_type:   ${{ steps.detect.outputs.PROJECT_TYPE }}
       slug:           ${{ steps.cfg.outputs.SLUG }}
