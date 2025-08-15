@@ -2,20 +2,30 @@ name: Receive & Deploy to Hetzner
 
 on:
   repository_dispatch:
-    types: [ deploy ]
+    types: [deploy]
+  push:
+    branches: [main-hetz]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Run manually even without branch payload'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   packages: write
   actions: read
 
+# Keep the group stable but avoid parser drama by quoting the whole thing
 concurrency:
-  group: hetz-${{ github.event.client_payload.repository_name }}
+  group: "hetz-${{ github.ref_name || github.event.client_payload.repository_name || 'deploy' }}"
   cancel-in-progress: true
 
 jobs:
   deploy:
-    if: ${{ github.event.client_payload.branch == 'main-hetz' }}
+    # Single-line, quoted expression so YAML parser doesn't freak out
+    if: "${{ (github.event_name == 'repository_dispatch' && endsWith((github.event.client_payload.branch || ''), 'main-hetz')) || (github.event_name == 'push' && github.ref_name == 'main-hetz') || (github.event_name == 'workflow_dispatch' && (github.ref_name == 'main-hetz' || inputs.force)) }}"
     runs-on: ubuntu-latest
 
     steps:
@@ -29,8 +39,8 @@ jobs:
       - name: Checkout target website repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ steps.p.outputs.repository }}
-          ref: ${{ steps.p.outputs.branch }}
+          repository: "${{ steps.p.outputs.repository || github.repository }}"
+          ref: "${{ steps.p.outputs.branch || github.ref_name }}"
           path: site
 
       - name: Read .cicd-config.yml (slug / port / domains.prod / domains.admin)
@@ -45,10 +55,8 @@ jobs:
 
           if [ -f ".cicd-config.yml" ]; then
             get_val(){ grep -E "^$1:" .cicd-config.yml | head -1 | awk -F': *' '{print $2}' | tr -d "\"'"; }
-            SLUG=$(get_val slug || echo "$SLUG")
-            PORT=$(get_val port || echo "$PORT")
-
-            # capture the indented block under "domains:"
+            SLUG="$(get_val slug || echo "$SLUG")"
+            PORT="$(get_val port || echo "$PORT")"
             DOM_BLOCK="$(awk '/^domains:/{f=1;next} f && /^[^ ]/{f=0} f{print}' .cicd-config.yml)"
             DOMAIN_PROD="$(printf '%s\n' "$DOM_BLOCK" | awk '/prod:/{print $2}' | tr -d "\"'")"
             DOMAIN_ADMIN="$(printf '%s\n' "$DOM_BLOCK" | awk '/admin:/{print $2}' | tr -d "\"'")"
@@ -63,7 +71,7 @@ jobs:
         id: meta
         run: |
           OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          REPO_NAME="${{ steps.p.outputs.repository_name }}"
+          REPO_NAME="${{ steps.p.outputs.repository_name || github.event.repository.name }}"
           IMAGE="ghcr.io/${OWNER_LOWER}/${REPO_NAME}"
           SHORT="${GITHUB_SHA::7}"
           echo "image=$IMAGE"            >> $GITHUB_OUTPUT
@@ -90,7 +98,6 @@ jobs:
             ${{ steps.meta.outputs.ref }}
             ${{ steps.meta.outputs.image }}:latest
 
-      # --- Deploy to Hetzner over SSH ---
       - name: Deploy over SSH (ensure DB stack, write env, run app; add admin router if provided)
         uses: appleboy/ssh-action@v1
         env:
@@ -104,7 +111,7 @@ jobs:
           GHCR_TOKEN:   ${{ secrets.GHCR_READ_TOKEN }}
         with:
           host: ${{ secrets.HZ_HOST }}
-          username: ${{ secrets.HZ_USER || 'root' }} # if your org doesn't support this expression, set HZ_USER or hardcode 'root'
+          username: ${{ secrets.HZ_USER }} # or hardcode: root
           key: ${{ secrets.HZ_SSH_KEY }}
           port: 22
           timeout: 60s
@@ -112,8 +119,6 @@ jobs:
           envs: SLUG,PORT,DOMAIN,ADMIN_DOMAIN,IMAGE_REF,SITE_ENV,GHCR_USER,GHCR_TOKEN
           script: |
             set -euo pipefail
-
-            # --- sanity checks ---
             : "${SLUG:?Missing SLUG}"
             : "${PORT:?Missing PORT}"
             : "${IMAGE_REF:?Missing IMAGE_REF}"
@@ -121,17 +126,14 @@ jobs:
             : "${GHCR_USER:?Missing GHCR_USER}"
             : "${GHCR_TOKEN:?Missing GHCR_TOKEN}"
 
-            # --- Networks (Traefik + DB) ---
             docker network create proxy       >/dev/null 2>&1 || true
             docker network create core_db_net >/dev/null 2>&1 || true
 
-            # --- Site dir & .env first (so we can sync DB password) ---
             SITE_DIR="/opt/sites/${SLUG}"
             mkdir -p "$SITE_DIR"
             cd "$SITE_DIR"
             printf "%s\n" "${SITE_ENV}" | sed 's/\r$//' > .env
 
-            # Extract POSTGRES_PASSWORD from site .env and write DB .env
             DB_DIR="/opt/services/postgres"
             mkdir -p "$DB_DIR"
             if grep -q '^POSTGRES_PASSWORD=' .env; then
@@ -141,10 +143,8 @@ jobs:
               exit 1
             fi
 
-            # --- GHCR login for pulls on the host ---
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
-            # --- Ensure global DB stack is up (Postgres + PgBouncer) ---
             cat > "${DB_DIR}/docker-compose.yml" <<'DBYAML'
             version: '3.8'
             networks:
@@ -188,10 +188,8 @@ jobs:
             DBYAML
 
             cd "${DB_DIR}"
-            # Compose will substitute ${POSTGRES_PASSWORD} from ./.env we wrote above.
             docker compose up -d
 
-            # --- Back to site dir; write compose (Traefik labels) ---
             cd "$SITE_DIR"
             cat > docker-compose.yml <<YAML
             version: '3.8'
@@ -218,7 +216,6 @@ jobs:
                 name: core_db_net
             YAML
 
-            # --- Inject admin router labels (only if ADMIN_DOMAIN set) ---
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
               awk -v s="${SLUG}" -v d="${ADMIN_DOMAIN}" '
                 /- traefik\.http\.services\..*loadbalancer\.server\.port/ {
@@ -233,11 +230,9 @@ jobs:
               ' docker-compose.yml > docker-compose.tmp && mv docker-compose.tmp docker-compose.yml
             fi
 
-            # --- Deploy app ---
             docker compose pull || true
             docker compose up -d --remove-orphans
 
-            # --- Run Prisma migrations (best-effort) ---
             set +e
             docker compose exec -T app sh -lc "npx prisma migrate deploy" || true
             set -e
@@ -245,7 +240,10 @@ jobs:
       - name: Health check (primary + admin if present)
         shell: bash
         run: |
-          urls=("https://${{ steps.cfg.outputs.DOMAIN_PROD }}/api/healthz")
+          urls=()
+          if [ -n "${{ steps.cfg.outputs.DOMAIN_PROD }}" ]; then
+            urls+=("https://${{ steps.cfg.outputs.DOMAIN_PROD }}/api/healthz")
+          fi
           if [ -n "${{ steps.cfg.outputs.DOMAIN_ADMIN }}" ]; then
             urls+=("https://${{ steps.cfg.outputs.DOMAIN_ADMIN }}/api/healthz")
           fi
