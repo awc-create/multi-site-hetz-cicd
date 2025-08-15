@@ -246,23 +246,46 @@ jobs:
             docker compose exec -T app sh -lc "npx prisma migrate deploy" || true
             set -e
 
-      - name: Health check (primary + admin if present)
-        shell: bash
-        run: |
-          urls=("https://${{ steps.cfg.outputs.DOMAIN_PROD }}/api/healthz")
-          if [ -n "${{ steps.cfg.outputs.DOMAIN_ADMIN }}" ]; then
-            urls+=("https://${{ steps.cfg.outputs.DOMAIN_ADMIN }}/api/healthz")
-          fi
+      - name: In-container health check (no DNS needed)
+        uses: appleboy/ssh-action@v1
+        env:
+          SLUG: ${{ steps.cfg.outputs.SLUG }}
+        with:
+          host: ${{ secrets.HZ_HOST }}
+          username: ${{ secrets.HZ_USER || 'root' }}
+          key: ${{ secrets.HZ_SSH_KEY }}
+          port: 22
+          timeout: 60s
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            cd /opt/sites/${SLUG}
 
-          for u in "${urls[@]}"; do
-            echo "Waiting on: $u"
+            # Detect app port inside the container (defaults to 3000 from your Dockerfile)
+            PORT=$(docker compose exec -T app sh -lc 'printf "%s" "${PORT:-3000}"')
+            echo "Detected app PORT=$PORT"
+
+            # Probe from inside the container so DNS/SSL/Cloudflare don't matter.
+            # Try both paths in case your repo has a nested `app/` folder temporarily.
             ok=0
-            for i in {1..20}; do
-              if curl -fsSL "$u" >/dev/null; then ok=1; break; fi
-              echo "  retry $i"; sleep 5
+            for path in /api/healthz /app/api/healthz; do
+              echo "Probing http://127.0.0.1:${PORT}${path}"
+              for i in $(seq 1 20); do
+                # Use Node to do the HTTP request (always available in the image)
+                if docker compose exec -T app node -e "require('http').get({host:'127.0.0.1',port:${PORT},path:'${path}'},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"; then
+                  echo "✅ ${path} OK"
+                  ok=1
+                  break
+                fi
+                echo "  retry $i"; sleep 3
+              done
+              [ $ok -eq 1 ] && break
             done
+
             if [ $ok -ne 1 ]; then
-              echo "❌ Healthcheck failed for $u"; exit 1
+              echo "❌ Health failed. Recent logs:"
+              docker compose logs --no-color --tail=200 app || true
+              exit 1
             fi
-            echo "✅ $u OK"
-          done
+
+            echo "✅ App healthy inside container"
