@@ -94,13 +94,7 @@ jobs:
             ${{ steps.meta.outputs.ref }}
             ${{ steps.meta.outputs.image }}:latest
 
-      - name: Compute site env secret key (multiline .env)
-        id: k
-        run: |
-          REPO_NAME="${{ steps.p.outputs.repository_name }}"
-          KEY="$(echo "$REPO_NAME" | tr '[:lower:]-' '[:upper:]_')"
-          echo "SITE_ENV_KEY=SITE_ENV__${KEY}" >> $GITHUB_OUTPUT
-
+      # NOTE: hard-code for drcodezenna while testing. Generalize later if desired.
       - name: Deploy over SSH (ensure DB stack, write env, run app; add admin router if provided)
         uses: appleboy/ssh-action@v1
         env:
@@ -109,11 +103,11 @@ jobs:
           DOMAIN:       ${{ steps.cfg.outputs.DOMAIN_PROD }}
           ADMIN_DOMAIN: ${{ steps.cfg.outputs.DOMAIN_ADMIN }}
           IMAGE_REF:    ${{ steps.meta.outputs.ref }}
-          SITE_ENV:     ${{ secrets[steps.k.outputs.SITE_ENV_KEY] }}
+          SITE_ENV:     ${{ secrets.SITE_ENV__DRCODEZENNA }}
           GHCR_USER:    ${{ github.repository_owner }}
           GHCR_TOKEN:   ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
         with:
-          host: ${{ secrets.HZ_HOST }}
+          host: ${{ secrets.HZ_HOST }}   # use IP or gray-clouded DNS (no Cloudflare proxy)
           username: ${{ secrets.HZ_USER || 'root' }}
           key: ${{ secrets.HZ_SSH_KEY }}
           port: 22
@@ -126,14 +120,26 @@ jobs:
             docker network create proxy       >/dev/null 2>&1 || true
             docker network create core_db_net >/dev/null 2>&1 || true
 
+            # --- Site dir & .env first (so we can sync DB password) ---
+            SITE_DIR="/opt/sites/${SLUG}"
+            mkdir -p "$SITE_DIR"
+            cd "$SITE_DIR"
+            printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//' > .env
+
+            # Extract POSTGRES_PASSWORD from site .env and write DB .env
+            DB_DIR="/opt/services/postgres"
+            mkdir -p "$DB_DIR"
+            if grep -q '^POSTGRES_PASSWORD=' .env; then
+              awk -F= '/^POSTGRES_PASSWORD=/{print "POSTGRES_PASSWORD="$2}' .env > "${DB_DIR}/.env"
+            fi
+
             # --- GHCR login for pulls on the host ---
             if [ -n "${GHCR_TOKEN:-}" ]; then
               echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             fi
 
             # --- Ensure global DB stack is up (Postgres + PgBouncer) ---
-            mkdir -p /opt/services/postgres
-            cat > /opt/services/postgres/docker-compose.yml <<'DBYAML'
+            cat > "${DB_DIR}/docker-compose.yml" <<'DBYAML'
             version: '3.8'
             networks:
               core_db_net:
@@ -156,7 +162,6 @@ jobs:
                   timeout: 5s
                   retries: 10
                 networks: [core_db_net]
-
               pgbouncer:
                 image: edoburu/pgbouncer
                 restart: always
@@ -168,7 +173,6 @@ jobs:
                   POOL_MODE: transaction
                   MAX_CLIENT_CONN: 200
                   DEFAULT_POOL_SIZE: 20
-                  LISTEN_PORT: 5432
                 depends_on:
                   postgres:
                     condition: service_healthy
@@ -177,16 +181,12 @@ jobs:
               pg_data:
             DBYAML
 
-            cd /opt/services/postgres
+            cd "${DB_DIR}"
+            # Compose auto-loads ./.env in this directory
             docker compose up -d
 
-            # --- Site dir & .env ---
-            SITE_DIR="/opt/sites/${SLUG}"
-            mkdir -p "$SITE_DIR"
+            # --- Back to site dir; write compose (Traefik labels) ---
             cd "$SITE_DIR"
-            printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//' > .env
-
-            # --- Base compose (primary router) ---
             cat > docker-compose.yml <<YAML
             version: '3.8'
             services:
