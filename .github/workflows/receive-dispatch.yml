@@ -1,0 +1,254 @@
+name: Receive & Deploy to Hetzner
+
+on:
+  repository_dispatch:
+    types: [ deploy ]
+
+permissions:
+  contents: read
+  packages: write
+  actions: read
+
+concurrency:
+  group: hetz-${{ github.event.client_payload.repository_name }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Extract payload
+        id: p
+        run: |
+          echo "repository=${{ github.event.client_payload.repository }}" >> $GITHUB_OUTPUT
+          echo "repository_name=${{ github.event.client_payload.repository_name }}" >> $GITHUB_OUTPUT
+          echo "branch=${{ github.event.client_payload.branch }}" >> $GITHUB_OUTPUT
+
+      - name: Checkout target website repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.p.outputs.repository }}
+          ref: ${{ steps.p.outputs.branch }}
+          path: site
+
+      - name: Read .cicd-config.yml (slug / port / domains.prod / domains.admin)
+        id: cfg
+        shell: bash
+        run: |
+          cd site
+          SLUG="site"
+          PORT="3000"
+          DOMAIN_PROD=""
+          DOMAIN_ADMIN=""
+
+          if [ -f ".cicd-config.yml" ]; then
+            get_val(){ grep -E "^$1:" .cicd-config.yml | head -1 | awk -F': *' '{print $2}' | tr -d "\"'"; }
+            SLUG=$(get_val slug || echo "$SLUG")
+            PORT=$(get_val port || echo "$PORT")
+
+            # capture the indented block under "domains:"
+            DOM_BLOCK="$(awk '/^domains:/{f=1;next} f && /^[^ ]/{f=0} f{print}' .cicd-config.yml)"
+            DOMAIN_PROD="$(printf '%s\n' "$DOM_BLOCK" | awk '/prod:/{print $2}' | tr -d "\"'")"
+            DOMAIN_ADMIN="$(printf '%s\n' "$DOM_BLOCK" | awk '/admin:/{print $2}' | tr -d "\"'")"
+          fi
+
+          echo "SLUG=$SLUG" >> $GITHUB_OUTPUT
+          echo "PORT=$PORT" >> $GITHUB_OUTPUT
+          echo "DOMAIN_PROD=$DOMAIN_PROD" >> $GITHUB_OUTPUT
+          echo "DOMAIN_ADMIN=$DOMAIN_ADMIN" >> $GITHUB_OUTPUT
+
+      - name: Gate – only handle prod (main-hetz) deploys
+        if: steps.p.outputs.branch != 'main-hetz'
+        run: |
+          echo "ℹ️ Branch '${{ steps.p.outputs.branch }}' is not main-hetz. Skipping."
+          exit 0
+
+      - name: Derive image coordinates
+        id: meta
+        run: |
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO_NAME="${{ steps.p.outputs.repository_name }}"
+          IMAGE="ghcr.io/${OWNER_LOWER}/${REPO_NAME}"
+          SHORT="${GITHUB_SHA::7}"
+          echo "image=$IMAGE"   >> $GITHUB_OUTPUT
+          echo "tag=$SHORT"     >> $GITHUB_OUTPUT
+          echo "ref=$IMAGE:$SHORT" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR (push)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push site image
+        uses: docker/build-push-action@v6
+        with:
+          context: site
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.ref }}
+            ${{ steps.meta.outputs.image }}:latest
+
+      - name: Compute site env secret key (multiline .env)
+        id: k
+        run: |
+          REPO_NAME="${{ steps.p.outputs.repository_name }}"
+          KEY="$(echo "$REPO_NAME" | tr '[:lower:]-' '[:upper:]_')"
+          echo "SITE_ENV_KEY=SITE_ENV__${KEY}" >> $GITHUB_OUTPUT
+
+      - name: Deploy over SSH (ensure DB stack, write env, run app; add admin router if provided)
+        uses: appleboy/ssh-action@v1
+        env:
+          SLUG:         ${{ steps.cfg.outputs.SLUG }}
+          PORT:         ${{ steps.cfg.outputs.PORT }}
+          DOMAIN:       ${{ steps.cfg.outputs.DOMAIN_PROD }}
+          ADMIN_DOMAIN: ${{ steps.cfg.outputs.DOMAIN_ADMIN }}
+          IMAGE_REF:    ${{ steps.meta.outputs.ref }}
+          SITE_ENV:     ${{ secrets[steps.k.outputs.SITE_ENV_KEY] }}
+          GHCR_USER:    ${{ github.repository_owner }}
+          GHCR_TOKEN:   ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.HZ_HOST }}
+          username: ${{ secrets.HZ_USER || 'root' }}
+          key: ${{ secrets.HZ_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            # --- Networks (Traefik + DB) ---
+            docker network create proxy       >/dev/null 2>&1 || true
+            docker network create core_db_net >/dev/null 2>&1 || true
+
+            # --- GHCR login for pulls on the host ---
+            if [ -n "${GHCR_TOKEN:-}" ]; then
+              echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            fi
+
+            # --- Ensure global DB stack is up (Postgres + PgBouncer) ---
+            mkdir -p /opt/services/postgres
+            cat > /opt/services/postgres/docker-compose.yml <<'DBYAML'
+            version: '3.8'
+            networks:
+              core_db_net:
+                name: core_db_net
+                driver: bridge
+            services:
+              postgres:
+                image: postgres:15
+                restart: always
+                environment:
+                  POSTGRES_USER: admin
+                  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_now}
+                  POSTGRES_DB: drcode
+                  POSTGRES_INITDB_ARGS: "--auth=scram-sha-256"
+                volumes:
+                  - pg_data:/var/lib/postgresql/data
+                healthcheck:
+                  test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+                  interval: 10s
+                  timeout: 5s
+                  retries: 10
+                networks: [core_db_net]
+              pgbouncer:
+                image: edoburu/pgbouncer
+                restart: always
+                environment:
+                  DB_USER: admin
+                  DB_PASSWORD: ${POSTGRES_PASSWORD:-change_me_now}
+                  DB_HOST: postgres
+                  DB_NAME: drcode
+                  POOL_MODE: transaction
+                  MAX_CLIENT_CONN: 200
+                  DEFAULT_POOL_SIZE: 20
+                depends_on:
+                  postgres:
+                    condition: service_healthy
+                networks: [core_db_net]
+            volumes:
+              pg_data:
+            DBYAML
+
+            cd /opt/services/postgres
+            docker compose up -d
+
+            # --- Site dir & .env ---
+            SITE_DIR="/opt/sites/${SLUG}"
+            mkdir -p "$SITE_DIR"
+            cd "$SITE_DIR"
+            printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//' > .env
+
+            # --- Base compose (primary router) ---
+            cat > docker-compose.yml <<YAML
+            version: '3.8'
+            services:
+              app:
+                image: ${IMAGE_REF}
+                restart: unless-stopped
+                env_file: .env
+                labels:
+                  - traefik.enable=true
+                  - traefik.http.routers.${SLUG}.rule=Host(\`${DOMAIN}\`)
+                  - traefik.http.routers.${SLUG}.entrypoints=websecure
+                  - traefik.http.routers.${SLUG}.tls.certresolver=le
+                  - traefik.http.services.${SLUG}.loadbalancer.server.port=${PORT}
+                networks:
+                  - proxy
+                  - core_db_net
+            networks:
+              proxy:
+                external: true
+                name: proxy
+              core_db_net:
+                external: true
+                name: core_db_net
+            YAML
+
+            # --- Inject admin router labels (only if ADMIN_DOMAIN set) ---
+            if [ -n "${ADMIN_DOMAIN:-}" ]; then
+              awk -v s="${SLUG}" -v d="${ADMIN_DOMAIN}" '
+                /- traefik\.http\.services\..*loadbalancer\.server\.port/ {
+                  print;
+                  print "                  - traefik.http.routers." s "-admin.rule=Host(`" d "`)";
+                  print "                  - traefik.http.routers." s "-admin.entrypoints=websecure";
+                  print "                  - traefik.http.routers." s "-admin.tls.certresolver=le";
+                  print "                  - traefik.http.routers." s "-admin.service=" s;
+                  next
+                }
+                {print}
+              ' docker-compose.yml > docker-compose.tmp && mv docker-compose.tmp docker-compose.yml
+            fi
+
+            # --- Deploy app ---
+            docker compose pull || true
+            docker compose up -d --remove-orphans
+
+            # --- Run Prisma migrations (best-effort) ---
+            set +e
+            docker compose exec -T app sh -lc "npx prisma migrate deploy" || true
+            set -e
+
+      - name: Health check (primary + admin if present)
+        shell: bash
+        run: |
+          urls=("https://${{ steps.cfg.outputs.DOMAIN_PROD }}/api/healthz")
+          if [ -n "${{ steps.cfg.outputs.DOMAIN_ADMIN }}" ]; then
+            urls+=("https://${{ steps.cfg.outputs.DOMAIN_ADMIN }}/api/healthz")
+          fi
+
+          for u in "${urls[@]}"; do
+            echo "Waiting on: $u"
+            ok=0
+            for i in {1..20}; do
+              if curl -fsSL "$u" >/dev/null; then ok=1; break; fi
+              echo "  retry $i"; sleep 5
+            done
+            if [ $ok -ne 1 ]; then
+              echo "❌ Healthcheck failed for $u"; exit 1
+            fi
+            echo "✅ $u OK"
+          done

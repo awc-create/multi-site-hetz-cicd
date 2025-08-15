@@ -1,0 +1,88 @@
+name: Redeploy Latest to Hetzner
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository_name:
+        description: "Website repo name (e.g. drcodezenna)"
+        required: true
+      slug:
+        description: "Site slug (traefik/router & folder)"
+        required: true
+      domain:
+        description: "Production domain (e.g. drcodezenna.com)"
+        required: true
+      port:
+        description: "Internal app port"
+        required: true
+        default: "3000"
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  HETZNER_HOST:    ${{ secrets.HETZNER_HOST }}
+  HETZNER_USER:    ${{ secrets.HETZNER_USER }}
+  HETZNER_SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+
+jobs:
+  redeploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute keys & refs
+        id: meta
+        run: |
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO="${{ inputs.repository_name }}"
+          IMAGE="ghcr.io/${OWNER_LOWER}/${REPO}:latest"
+          KEY=$(echo "$REPO" | tr '[:lower:]-' '[:upper:]_')
+          echo "IMAGE_REF=$IMAGE" >> $GITHUB_OUTPUT
+          echo "SITE_ENV_KEY=SITE_ENV__${KEY}" >> $GITHUB_OUTPUT
+
+      - name: Redeploy on Hetzner
+        uses: appleboy/ssh-action@v1
+        env:
+          SLUG:       ${{ inputs.slug }}
+          PORT:       ${{ inputs.port }}
+          DOMAIN:     ${{ inputs.domain }}
+          IMAGE_REF:  ${{ steps.meta.outputs.IMAGE_REF }}
+          SITE_ENV:   ${{ secrets[steps.meta.outputs.SITE_ENV_KEY] }}
+          GHCR_USER:  ${{ github.repository_owner }}
+          GHCR_TOKEN: ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ env.HETZNER_HOST }}
+          username: ${{ env.HETZNER_USER || 'root' }}
+          key: ${{ env.HETZNER_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            docker network create proxy || true
+            docker network create core_db_net || true
+            if [ -n "${GHCR_TOKEN:-}" ]; then
+              echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            fi
+            SITE_DIR="/opt/sites/${SLUG}"
+            mkdir -p "$SITE_DIR"
+            cd "$SITE_DIR"
+            echo "${SITE_ENV:-}" | sed 's/\r$//' > .env
+            cat > docker-compose.yml <<YAML
+            version: '3.8'
+            services:
+              app:
+                image: ${IMAGE_REF}
+                restart: unless-stopped
+                env_file: .env
+                networks: [proxy, core_db_net]
+                labels:
+                  - traefik.enable=true
+                  - traefik.http.routers.${SLUG}.rule=Host(\`${DOMAIN}\`)
+                  - traefik.http.routers.${SLUG}.entrypoints=websecure
+                  - traefik.http.routers.${SLUG}.tls.certresolver=le
+                  - traefik.http.services.${SLUG}.loadbalancer.server.port=${PORT}
+            networks:
+              proxy: { external: true }
+              core_db_net: { external: true }
+            YAML
+            docker compose pull || true
+            docker compose up -d --remove-orphans

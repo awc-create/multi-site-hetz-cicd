@@ -1,0 +1,39 @@
+name: Nightly DB Backup (Hetzner)
+
+on:
+  schedule:
+    - cron: "15 2 * * *"   # 02:15 UTC nightly
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  HETZNER_HOST:    ${{ secrets.HETZNER_HOST }}
+  HETZNER_USER:    ${{ secrets.HETZNER_USER }}
+  HETZNER_SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run pg_dump on server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ env.HETZNER_HOST }}
+          username: ${{ env.HETZNER_USER || 'root' }}
+          key: ${{ env.HETZNER_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            mkdir -p /opt/backups/postgres
+            cd /opt/services/postgres
+            # Ensure stack exists
+            docker compose up -d
+            TS=$(date -u +"%Y%m%d-%H%M%S")
+            FILE="/opt/backups/postgres/drcode-${TS}.sql.gz"
+            echo "Creating backup $FILE"
+            docker compose exec -T postgres sh -lc 'pg_dump -U admin drcode' | gzip > "$FILE"
+            echo "Backup size: $(du -h "$FILE" | cut -f1)"
+            # optional: keep last 14
+            ls -1t /opt/backups/postgres/*.sql.gz | tail -n +15 | xargs -r rm -f
