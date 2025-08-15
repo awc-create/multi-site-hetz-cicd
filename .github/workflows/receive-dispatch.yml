@@ -1,38 +1,41 @@
-name: Receive & Deploy to Hetzner
+name: Manual Hetzner Deploy
 
 on:
-  repository_dispatch:
-    types: [ deploy ]
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "owner/repo of the site"
+        required: true
+        default: awc-create/drcodezenna
+      branch:
+        description: "Branch to deploy"
+        required: true
+        default: main-hetz
 
 permissions:
   contents: read
-  packages: write
   actions: read
-
-concurrency:
-  group: hetz-${{ github.event.client_payload.repository_name }}
-  cancel-in-progress: true
+  packages: write
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Extract payload
-        id: p
+      - name: Read inputs
+        id: inp
         run: |
-          echo "repository=${{ github.event.client_payload.repository }}" >> $GITHUB_OUTPUT
-          echo "repository_name=${{ github.event.client_payload.repository_name }}" >> $GITHUB_OUTPUT
-          echo "branch=${{ github.event.client_payload.branch }}" >> $GITHUB_OUTPUT
+          echo "repository=${{ github.event.inputs.repository }}" >> $GITHUB_OUTPUT
+          echo "branch=${{ github.event.inputs.branch }}" >> $GITHUB_OUTPUT
 
       - name: Checkout target website repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ steps.p.outputs.repository }}
-          ref: ${{ steps.p.outputs.branch }}
+          repository: ${{ steps.inp.outputs.repository }}
+          ref: ${{ steps.inp.outputs.branch }}
           path: site
 
-      - name: Read .cicd-config.yml (slug / port / domains.prod / domains.admin)
+      - name: Read .cicd-config.yml (slug/port/domains)
         id: cfg
         shell: bash
         run: |
@@ -41,39 +44,27 @@ jobs:
           PORT="3000"
           DOMAIN_PROD=""
           DOMAIN_ADMIN=""
-
           if [ -f ".cicd-config.yml" ]; then
-            get_val(){ grep -E "^$1:" .cicd-config.yml | head -1 | awk -F': *' '{print $2}' | tr -d "\"'"; }
-            SLUG=$(get_val slug || echo "$SLUG")
-            PORT=$(get_val port || echo "$PORT")
-
-            # grab the indented block under "domains:"
+            get(){ grep -E "^$1:" .cicd-config.yml | head -1 | awk -F': *' '{print $2}' | tr -d "\"'"; }
+            SLUG=$(get slug || echo "$SLUG")
+            PORT=$(get port || echo "$PORT")
             DOM_BLOCK="$(awk '/^domains:/{f=1;next} f && /^[^ ]/{f=0} f{print}' .cicd-config.yml)"
             DOMAIN_PROD="$(printf '%s\n' "$DOM_BLOCK" | awk '/prod:/{print $2}' | tr -d "\"'")"
             DOMAIN_ADMIN="$(printf '%s\n' "$DOM_BLOCK" | awk '/admin:/{print $2}' | tr -d "\"'")"
           fi
-
           echo "SLUG=$SLUG" >> $GITHUB_OUTPUT
           echo "PORT=$PORT" >> $GITHUB_OUTPUT
           echo "DOMAIN_PROD=$DOMAIN_PROD" >> $GITHUB_OUTPUT
           echo "DOMAIN_ADMIN=$DOMAIN_ADMIN" >> $GITHUB_OUTPUT
 
-      - name: Gate – only handle prod (main-hetz) deploys
-        if: steps.p.outputs.branch != 'main-hetz'
-        run: |
-          echo "ℹ️ Branch '${{ steps.p.outputs.branch }}' is not main-hetz. Skipping."
-          exit 0
-
       - name: Derive image coordinates
         id: meta
-        shell: bash
         run: |
           OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          REPO_NAME="${{ steps.p.outputs.repository_name }}"
+          REPO_NAME=$(basename "${{ steps.inp.outputs.repository }}")
           IMAGE="ghcr.io/${OWNER_LOWER}/${REPO_NAME}"
           SHORT="${GITHUB_SHA::7}"
-          echo "image=$IMAGE"   >> $GITHUB_OUTPUT
-          echo "tag=$SHORT"     >> $GITHUB_OUTPUT
+          echo "image=$IMAGE"     >> $GITHUB_OUTPUT
           echo "ref=$IMAGE:$SHORT" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
@@ -95,25 +86,15 @@ jobs:
             ${{ steps.meta.outputs.ref }}
             ${{ steps.meta.outputs.image }}:latest
 
-      - name: Compute site env secret key (multiline .env)
+      - name: Compute SITE_ENV secret key (multiline .env)
         id: k
-        shell: bash
         run: |
-          REPO_NAME="${{ steps.p.outputs.repository_name }}"
-          KEY="$(echo "$REPO_NAME" | tr '[:lower:]-' '[:upper:]_')"
+          REPO_NAME=$(basename "${{ steps.inp.outputs.repository }}")
+          KEY=$(echo "$REPO_NAME" | tr '[:lower:]-' '[:upper:]_')
           echo "SITE_ENV_KEY=SITE_ENV__${KEY}" >> $GITHUB_OUTPUT
 
-      - name: Deploy over SSH (ensure DB stack, write env, run app; add admin router if provided)
+      - name: Deploy over SSH (DB up, write .env, Traefik labels, run app)
         uses: appleboy/ssh-action@v1
-        env:
-          SLUG:         ${{ steps.cfg.outputs.SLUG }}
-          PORT:         ${{ steps.cfg.outputs.PORT }}
-          DOMAIN:       ${{ steps.cfg.outputs.DOMAIN_PROD }}
-          ADMIN_DOMAIN: ${{ steps.cfg.outputs.DOMAIN_ADMIN }}
-          IMAGE_REF:    ${{ steps.meta.outputs.ref }}
-          SITE_ENV:     ${{ secrets[steps.k.outputs.SITE_ENV_KEY] }}
-          GHCR_USER:    ${{ github.repository_owner }}
-          GHCR_TOKEN:   ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
         with:
           host: ${{ secrets.HZ_HOST }}
           username: ${{ secrets.HZ_USER || 'root' }}
@@ -121,40 +102,43 @@ jobs:
           port: 22
           timeout: 60s
           command_timeout: 15m
-          # 👇 actually forwards env vars into remote session
-          envs: SLUG,PORT,DOMAIN,ADMIN_DOMAIN,IMAGE_REF,SITE_ENV,GHCR_USER,GHCR_TOKEN
+
+          # 👈 IMPORTANT: pass env vars to the remote. This fixes "SLUG: unbound variable".
+          envs: |
+            SLUG=${{ steps.cfg.outputs.SLUG }},
+            PORT=${{ steps.cfg.outputs.PORT }},
+            DOMAIN=${{ steps.cfg.outputs.DOMAIN_PROD }},
+            ADMIN_DOMAIN=${{ steps.cfg.outputs.DOMAIN_ADMIN }},
+            IMAGE_REF=${{ steps.meta.outputs.ref }},
+            SITE_ENV=${{ secrets[steps.k.outputs.SITE_ENV_KEY] }},
+            GHCR_USER=${{ github.repository_owner }},
+            GHCR_TOKEN=${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
+
           script: |
-            set -euo pipefail
+            set -eo pipefail
+            : "${SLUG:?missing SLUG}"
+            : "${PORT:?missing PORT}"
+            : "${DOMAIN:?missing DOMAIN}"
+            : "${IMAGE_REF:?missing IMAGE_REF}"
 
-            # --- Networks (Traefik + DB) ---
-            docker network create proxy       >/dev/null 2>&1 || true
-            docker network create core_db_net >/dev/null 2>&1 || true
+            # Create Traefik network if missing; let Compose create core_db_net (avoid label mismatch)
+            docker network create proxy >/dev/null 2>&1 || true
 
-            # --- Site dir & .env first (so we can sync DB password) ---
+            # --- Site dir & .env ---
             SITE_DIR="/opt/sites/${SLUG}"
             mkdir -p "$SITE_DIR"
             cd "$SITE_DIR"
             printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//' > .env
 
-            # Extract POSTGRES_PASSWORD from site .env and write DB .env
+            # --- Sync DB password into global DB stack .env ---
             DB_DIR="/opt/services/postgres"
             mkdir -p "$DB_DIR"
             if grep -q '^POSTGRES_PASSWORD=' .env; then
               awk -F= '/^POSTGRES_PASSWORD=/{print "POSTGRES_PASSWORD="$2}' .env > "${DB_DIR}/.env"
             fi
 
-            # --- GHCR login for pulls on the host ---
-            if [ -n "${GHCR_TOKEN:-}" ]; then
-              echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-            fi
-
-            # --- Ensure global DB stack is up (Postgres + PgBouncer) ---
+            # --- DB stack (creates core_db_net with correct labels) ---
             cat > "${DB_DIR}/docker-compose.yml" <<'DBYAML'
-            networks:
-              core_db_net:
-                external: true
-                name: core_db_net
-
             services:
               postgres:
                 image: postgres:15
@@ -172,7 +156,6 @@ jobs:
                   timeout: 5s
                   retries: 10
                 networks: [core_db_net]
-
               pgbouncer:
                 image: edoburu/pgbouncer
                 restart: always
@@ -188,17 +171,19 @@ jobs:
                   postgres:
                     condition: service_healthy
                 networks: [core_db_net]
-
             volumes:
               pg_data:
+            networks:
+              core_db_net:
+                name: core_db_net
             DBYAML
 
-            (cd "${DB_DIR}" && docker compose up -d)
+            cd "$DB_DIR"
+            docker compose up -d
 
-            # --- Base compose (primary router) ---
+            # --- App stack ---
             cd "$SITE_DIR"
             cat > docker-compose.yml <<YAML
-            version: '3.8'
             services:
               app:
                 image: ${IMAGE_REF}
@@ -216,13 +201,11 @@ jobs:
             networks:
               proxy:
                 external: true
-                name: proxy
               core_db_net:
                 external: true
-                name: core_db_net
             YAML
 
-            # --- Inject admin router labels (only if ADMIN_DOMAIN set) ---
+            # Optional second router for admin subdomain
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
               awk -v s="${SLUG}" -v d="${ADMIN_DOMAIN}" '
                 /- traefik\.http\.services\..*loadbalancer\.server\.port/ {
@@ -237,55 +220,16 @@ jobs:
               ' docker-compose.yml > docker-compose.tmp && mv docker-compose.tmp docker-compose.yml
             fi
 
-            # --- Deploy app ---
             docker compose pull || true
             docker compose up -d --remove-orphans
+            docker compose exec -T app sh -lc "npx prisma migrate deploy || true"
 
-            # --- Run Prisma migrations (best-effort) ---
-            set +e
-            docker compose exec -T app sh -lc "npx prisma migrate deploy" || true
-            set -e
-
-      - name: In-container health check (no DNS needed)
-        uses: appleboy/ssh-action@v1
-        env:
-          SLUG: ${{ steps.cfg.outputs.SLUG }}
-        with:
-          host: ${{ secrets.HZ_HOST }}
-          username: ${{ secrets.HZ_USER || 'root' }}
-          key: ${{ secrets.HZ_SSH_KEY }}
-          port: 22
-          timeout: 60s
-          command_timeout: 10m
-          script: |
-            set -euo pipefail
-            cd /opt/sites/${SLUG}
-
-            # Detect app port inside the container (defaults to 3000 from your Dockerfile)
-            PORT=$(docker compose exec -T app sh -lc 'printf "%s" "${PORT:-3000}"')
-            echo "Detected app PORT=$PORT"
-
-            # Probe from inside the container so DNS/SSL/Cloudflare don't matter.
-            # Try both paths in case your repo has a nested `app/` folder temporarily.
-            ok=0
-            for path in /api/healthz /app/api/healthz; do
-              echo "Probing http://127.0.0.1:${PORT}${path}"
-              for i in $(seq 1 20); do
-                # Use Node to do the HTTP request (always available in the image)
-                if docker compose exec -T app node -e "require('http').get({host:'127.0.0.1',port:${PORT},path:'${path}'},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"; then
-                  echo "✅ ${path} OK"
-                  ok=1
-                  break
-                fi
-                echo "  retry $i"; sleep 3
-              done
-              [ $ok -eq 1 ] && break
-            done
-
-            if [ $ok -ne 1 ]; then
-              echo "❌ Health failed. Recent logs:"
-              docker compose logs --no-color --tail=200 app || true
-              exit 1
-            fi
-
-            echo "✅ App healthy inside container"
+      - name: Health check
+        run: |
+          u="https://${{ steps.cfg.outputs.DOMAIN_PROD }}/api/healthz"
+          echo "Waiting on: $u"
+          for i in {1..24}; do
+            if curl -fsSL "$u" >/dev/null; then echo "✅ OK"; exit 0; fi
+            echo "retry $i"; sleep 5
+          done
+          echo "❌ Healthcheck failed"; exit 1
