@@ -158,17 +158,13 @@ jobs:
 
             # --- Ensure global DB stack is up (Postgres + PgBouncer) ---
             cat > "${DB_DIR}/docker-compose.yml" <<'DBYAML'
-            networks:
-              core_db_net:
-                external: true
-                name: core_db_net
             services:
               postgres:
                 image: postgres:15
                 restart: always
+                env_file: .env
                 environment:
                   POSTGRES_USER: admin
-                  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_now}
                   POSTGRES_DB: drcode
                   POSTGRES_INITDB_ARGS: "--auth=scram-sha-256"
                 volumes:
@@ -179,9 +175,12 @@ jobs:
                   timeout: 5s
                   retries: 10
                 networks: [core_db_net]
+
               pgbouncer:
                 image: edoburu/pgbouncer
                 restart: always
+                # .env provides POSTGRES_PASSWORD for Postgres. PgBouncer needs DB_PASSWORD explicitly:
+                env_file: .env
                 environment:
                   DB_USER: admin
                   DB_PASSWORD: ${POSTGRES_PASSWORD:-change_me_now}
@@ -190,12 +189,19 @@ jobs:
                   POOL_MODE: transaction
                   MAX_CLIENT_CONN: 200
                   DEFAULT_POOL_SIZE: 20
+                  AUTH_TYPE: plain
                 depends_on:
                   postgres:
                     condition: service_healthy
                 networks: [core_db_net]
+
             volumes:
               pg_data:
+
+            networks:
+              core_db_net:
+                external: true
+                name: core_db_net
             DBYAML
 
             (cd "${DB_DIR}" && docker compose up -d)
