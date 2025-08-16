@@ -2,7 +2,7 @@ name: Receive & Deploy to Hetzner
 
 on:
   repository_dispatch:
-    types: [deploy]
+    types: [ deploy ]
 
 permissions:
   contents: read
@@ -101,7 +101,7 @@ jobs:
           echo "SITE_ENV_KEY=SITE_ENV__${KEY}" >> $GITHUB_OUTPUT
           echo "Resolved env secret key: SITE_ENV__${KEY}"
 
-      - name: Deploy over SSH (ensure DB stack, write env, run app; add admin router if provided)
+      - name: Deploy over SSH (DB stack + app)
         uses: appleboy/ssh-action@v1
         env:
           SLUG:         ${{ steps.cfg.outputs.SLUG }}
@@ -121,7 +121,7 @@ jobs:
           command_timeout: 15m
           envs: SLUG,PORT,DOMAIN,ADMIN_DOMAIN,IMAGE_REF,SITE_ENV,GHCR_USER,GHCR_TOKEN
           script: |
-            # POSIX sh only (no pipefail / no ${var:0:20})
+            # POSIX sh (no pipefail), keep it simple
             set -e
 
             SLUG="${SLUG:-}"; PORT="${PORT:-3000}"
@@ -129,31 +129,34 @@ jobs:
             ADMIN_DOMAIN="${ADMIN_DOMAIN:-}"
 
             if [ -z "$SLUG" ] || [ -z "$DOMAIN" ] || [ -z "$IMAGE_REF" ]; then
-              IMG_SHORT="$(printf '%s' "$IMAGE_REF" | cut -c1-20)"
-              echo "Missing required env(s). SLUG='$SLUG' DOMAIN='$DOMAIN' IMAGE_REF='${IMG_SHORT}...'"
+              echo "Missing required env(s). SLUG='$SLUG' DOMAIN='$DOMAIN' IMAGE_REF='$IMAGE_REF'"
               exit 1
             fi
 
-            echo "Deploying SLUG='$SLUG' DOMAIN='$DOMAIN' PORT='$PORT' IMAGE_REF='$IMAGE_REF'"
-
-            docker network create proxy       >/dev/null 2>&1 || true
+            # --- Networks (Traefik + DB) ---
+            docker network create proxy >/dev/null 2>&1 || true
             docker network create core_db_net >/dev/null 2>&1 || true
 
+            # --- Write app secrets to .app-env (NOT .env) ---
             SITE_DIR="/opt/sites/${SLUG}"
             mkdir -p "$SITE_DIR"
             cd "$SITE_DIR"
-            printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//' > .env
+            printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//' > .app-env
 
+            # Create an empty .env so Compose has nothing to expand here
+            : > .env
+
+            # Extract POSTGRES_PASSWORD for the DB stack from .app-env
             DB_DIR="/opt/services/postgres"
             mkdir -p "$DB_DIR"
-            if grep -q '^POSTGRES_PASSWORD=' .env; then
-              awk -F= '/^POSTGRES_PASSWORD=/{print "POSTGRES_PASSWORD="$2}' .env > "${DB_DIR}/.env"
-            fi
+            awk -F= '/^POSTGRES_PASSWORD=/{print "POSTGRES_PASSWORD="$2}' .app-env > "${DB_DIR}/.env"
 
+            # --- GHCR login for pulls on the host ---
             if [ -n "${GHCR_TOKEN:-}" ]; then
               echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             fi
 
+            # --- Ensure global DB stack is up (Postgres + PgBouncer) ---
             cat > "${DB_DIR}/docker-compose.yml" <<'DBYAML'
             networks:
               core_db_net:
@@ -197,12 +200,14 @@ jobs:
 
             (cd "${DB_DIR}" && docker compose up -d)
 
+            # --- App compose (env_file points to .app-env) ---
+            cd "$SITE_DIR"
             cat > docker-compose.yml <<YAML
             services:
               app:
                 image: ${IMAGE_REF}
                 restart: unless-stopped
-                env_file: .env
+                env_file: .app-env
                 labels:
                   - traefik.enable=true
                   - traefik.http.routers.${SLUG}.rule=Host(\`${DOMAIN}\`)
@@ -221,6 +226,7 @@ jobs:
                 name: core_db_net
             YAML
 
+            # Optional admin host
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
               awk -v s="${SLUG}" -v d="${ADMIN_DOMAIN}" '
                 /- traefik\.http\.services\..*loadbalancer\.server\.port/ {
@@ -237,6 +243,8 @@ jobs:
 
             docker compose pull || true
             docker compose up -d --remove-orphans
+
+            # Run Prisma migrations (best-effort)
             docker compose exec -T app sh -lc "npx prisma migrate deploy || true"
 
       - name: In-container health check (no DNS needed)
@@ -256,18 +264,28 @@ jobs:
             cd "/opt/sites/${SLUG}"
             PORT="$(docker compose exec -T app sh -lc 'printf "%s" "${PORT:-3000}"')"
             echo "Detected app PORT=$PORT"
+
             ok=0
+            last_path=""
             for path in /api/healthz /app/api/healthz; do
+              last_path="$path"
               echo "Probing http://127.0.0.1:${PORT}${path}"
               for i in 1 2 3 4 5 6 7 8 9 10; do
                 if docker compose exec -T app node -e "require('http').get({host:'127.0.0.1',port:${PORT},path:'${path}'},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"; then
-                  echo "OK ${path}"; ok=1; break
+                  echo "✅ ${path} OK"
+                  ok=1; break
                 fi
                 echo "retry $i"; sleep 3
               done
               [ "$ok" -eq 1 ] && break
             done
+
             if [ "$ok" -ne 1 ]; then
-              echo "❌ health failed; recent logs:"; docker compose logs --no-color --tail=200 app || true; exit 1
+              echo "❌ Health failed. Dumping status/body for ${last_path}:"
+              docker compose exec -T app node -e "require('http').get({host:'127.0.0.1',port:${PORT},path:'${last_path}'},r=>{console.log('STATUS',r.statusCode);r.setEncoding('utf8');r.on('data',c=>process.stdout.write(c));r.on('end',()=>process.exit(0));}).on('error',e=>{console.error(e);process.exit(1)})" || true
+              echo; echo "Recent logs:"
+              docker compose logs --no-color --tail=200 app || true
+              exit 1
             fi
-            echo "✅ app healthy"
+
+            echo "✅ App healthy inside container"
