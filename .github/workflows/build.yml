@@ -7,18 +7,10 @@ on:
     types: [ deploy ]
   workflow_dispatch:
 
-# ---------- GLOBAL ENV (keep this section at the top) ----------
 env:
-  # Vercel (org/project IDs are overridden per-site inside jobs)
   VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
   VERCEL_ORG_ID: ""
   VERCEL_PROJECT_ID: ""
-
-  # Hetzner - single server for all sites
-  HETZNER_USER: ${{ secrets.HETZNER_USER }}
-  HETZNER_HOST: ${{ secrets.HETZNER_HOST }}
-  HETZNER_PATH: ${{ secrets.HETZNER_PATH }} # used by static SCP mode (e.g. /var/www)
-
   NODE_VERSION: 22
 
 permissions:
@@ -26,21 +18,17 @@ permissions:
   actions: read
   packages: write
 
-# ==============================================================
-#                         JOBS
-# ==============================================================
-
 jobs:
   detect:
     runs-on: ubuntu-latest
     outputs:
-      repository:     ${{ steps.p.outputs.repository }}
-      repository_name: ${{ steps.p.outputs.repository_name }}
-      branch:         ${{ steps.p.outputs.branch }}
-      project_type:   ${{ steps.detect.outputs.PROJECT_TYPE }}
-      slug:           ${{ steps.cfg.outputs.SLUG }}
-      port:           ${{ steps.cfg.outputs.PORT }}
-      domain_prod:    ${{ steps.cfg.outputs.DOMAIN_PROD }}
+      repository:       ${{ steps.p.outputs.repository }}
+      repository_name:  ${{ steps.p.outputs.repository_name }}
+      branch:           ${{ steps.p.outputs.branch }}
+      project_type:     ${{ steps.detect.outputs.PROJECT_TYPE }}
+      slug:             ${{ steps.cfg.outputs.SLUG }}
+      port:             ${{ steps.cfg.outputs.PORT }}
+      domain_prod:      ${{ steps.cfg.outputs.DOMAIN_PROD }}
     steps:
       - name: Extract payload (repo/branch)
         id: p
@@ -99,7 +87,6 @@ jobs:
           ref: ${{ needs.detect.outputs.branch }}
           path: site
 
-      # --------- Per-site Vercel IDs (override top-level placeholders) ---------
       - name: Select Vercel IDs for this site
         run: |
           case "${{ needs.detect.outputs.repository_name }}" in
@@ -107,13 +94,8 @@ jobs:
               echo "VERCEL_ORG_ID=${{ secrets.DRCODEZENNA_VERCEL_ORG_ID }}" >> $GITHUB_ENV
               echo "VERCEL_PROJECT_ID=${{ secrets.DRCODEZENNA_VERCEL_PROJECT_ID }}" >> $GITHUB_ENV
               ;;
-            # add more sites here:
-            # myothersite)
-            #   echo "VERCEL_ORG_ID=${{ secrets.MYOTHERSITE_VERCEL_ORG_ID }}" >> $GITHUB_ENV
-            #   echo "VERCEL_PROJECT_ID=${{ secrets.MYOTHERSITE_VERCEL_PROJECT_ID }}" >> $GITHUB_ENV
-            #   ;;
             *)
-              echo "ℹ️ No per-site Vercel IDs configured for ${{ needs.detect.outputs.repository_name }}. Vercel steps will fail if executed."
+              echo "ℹ️ No per-site Vercel IDs configured for ${{ needs.detect.outputs.repository_name }}."
               ;;
           esac
 
@@ -154,47 +136,6 @@ jobs:
           name: static-export
           path: site/out
 
-  # ----------- Vercel Preview for feature/fix branches -----------
-  vercel_preview:
-    needs: [detect, build_test]
-    if: startsWith(needs.detect.outputs.branch, 'feat/') || startsWith(needs.detect.outputs.branch, 'fix/')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ needs.detect.outputs.repository }}
-          ref: ${{ needs.detect.outputs.branch }}
-          path: site
-      - run: npm i -g vercel
-        working-directory: site
-      - run: vercel pull --yes --environment=preview --token=${{ env.VERCEL_TOKEN }} --scope=$VERCEL_ORG_ID
-        working-directory: site
-      - run: vercel build --token=${{ env.VERCEL_TOKEN }}
-        working-directory: site
-      - run: vercel deploy --prebuilt --token=${{ env.VERCEL_TOKEN }}
-        working-directory: site
-
-  # ----------------- Vercel Production for dev -------------------
-  vercel_prod:
-    needs: [detect, build_test]
-    if: needs.detect.outputs.branch == 'dev'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ needs.detect.outputs.repository }}
-          ref: ${{ needs.detect.outputs.branch }}
-          path: site
-      - run: npm i -g vercel
-        working-directory: site
-      - run: vercel pull --yes --environment=production --token=${{ env.VERCEL_TOKEN }} --scope=$VERCEL_ORG_ID
-        working-directory: site
-      - run: vercel build --prod --token=${{ env.VERCEL_TOKEN }}
-        working-directory: site
-      - run: vercel deploy --prebuilt --prod --token=${{ env.VERCEL_TOKEN }}
-        working-directory: site
-
-  # ---------- Build & push app image (NODE/SSR only) ----------
   image_build_push:
     needs: [detect, build_test]
     if: needs.detect.outputs.project_type == 'node' && needs.detect.outputs.branch == 'main-hetz'
@@ -237,7 +178,6 @@ jobs:
             ${{ steps.meta.outputs.ref }}
             ${{ steps.meta.outputs.image }}:latest
 
-  # ---------- Deploy to Hetzner (NODE/SSR) ----------
   hetzner_node:
     needs: [detect, image_build_push]
     if: needs.detect.outputs.project_type == 'node' && needs.detect.outputs.branch == 'main-hetz'
@@ -249,63 +189,133 @@ jobs:
           KEY="$(echo '${{ needs.detect.outputs.repository_name }}' | tr '[:lower:]-' '[:upper:]_')"
           echo "SITE_ENV_KEY=SITE_ENV__${KEY}" >> $GITHUB_OUTPUT
 
-      - name: Deploy over SSH
+      - name: Sanity check required SSH secrets
+        run: |
+          test -n "${{ secrets.HZ_HOST }}"    || { echo "❌ Missing secret: HZ_HOST"; exit 1; }
+          test -n "${{ secrets.HZ_SSH_KEY }}" || { echo "❌ Missing secret: HZ_SSH_KEY"; exit 1; }
+
+      - name: Deploy over SSH (Traefik labels + DB + app.env)
         uses: appleboy/ssh-action@v1
         env:
-          SLUG:        ${{ needs.detect.outputs.slug }}
-          PORT:        ${{ needs.detect.outputs.port }}
-          DOMAIN:      ${{ needs.detect.outputs.domain_prod }}
-          IMAGE_REF:   ${{ needs.image_build_push.outputs.ref }}
-          SITE_ENV:    ${{ secrets[steps.k.outputs.SITE_ENV_KEY] }}
-          GHCR_USER:   ${{ github.repository_owner }}
-          GHCR_TOKEN:  ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
+          SLUG:       ${{ needs.detect.outputs.slug }}
+          PORT:       ${{ needs.detect.outputs.port }}
+          DOMAIN:     ${{ needs.detect.outputs.domain_prod }}
+          IMAGE_REF:  ${{ needs.image_build_push.outputs.ref }}
+          SITE_ENV:   ${{ secrets[steps.k.outputs.SITE_ENV_KEY] }}
+          GHCR_USER:  ${{ github.repository_owner }}
+          GHCR_TOKEN: ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
         with:
-          host: ${{ secrets.HETZNER_HOST }}
-          username: ${{ secrets.HETZNER_USER || 'root' }}
-          key: ${{ secrets.HETZNER_SSH_KEY }}
-          script_stop: true
+          host: ${{ secrets.HZ_HOST }}
+          username: ${{ secrets.HZ_USER || 'root' }}
+          key: ${{ secrets.HZ_SSH_KEY }}
+          port: 22
+          timeout: 60s
+          command_timeout: 15m
+          envs: SLUG,PORT,DOMAIN,IMAGE_REF,SITE_ENV,GHCR_USER,GHCR_TOKEN
           script: |
-            set -euo pipefail
-            # networks Traefik + DB
-            docker network create proxy >/dev/null 2>&1 || true
+            # keep -e and -o pipefail, but not -u (nounset) because SITE_ENV might be empty
+            set -eo pipefail
+
+            # Guard inputs
+            SLUG="${SLUG:-}"; PORT="${PORT:-3000}"; DOMAIN="${DOMAIN:-}"; IMAGE_REF="${IMAGE_REF:-}"
+            if [ -z "$SLUG" ] || [ -z "$DOMAIN" ] || [ -z "$IMAGE_REF" ]; then
+              echo "Missing required input(s): SLUG='$SLUG' DOMAIN='$DOMAIN' IMAGE_REF='${IMAGE_REF:0:20}…'"
+              exit 1
+            fi
+            echo "Deploying $SLUG → https://$DOMAIN  (image: ${IMAGE_REF:0:20}…)"
+
+            # Networks
+            docker network create proxy       >/dev/null 2>&1 || true
             docker network create core_db_net >/dev/null 2>&1 || true
 
-            # login to GHCR
-            if [ -n "${GHCR_TOKEN:-}" ]; then
-              echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-            fi
-
+            # Site dir
             SITE_DIR="/opt/sites/${SLUG}"
             mkdir -p "$SITE_DIR"
             cd "$SITE_DIR"
 
-            # Write env from central secret (SITE_ENV__REPO)
-            # Example keys it should contain:
-            # DATABASE_URL=postgresql://admin:${POSTGRES_PASSWORD}@pgbouncer:5432/drcode
-            # NEXT_PUBLIC_SITE_URL=https://${DOMAIN}
-            # UPLOADTHING_APP_ID=...
-            # UPLOADTHING_SECRET=...
-            # RESEND_API_KEY=...
-            echo "${SITE_ENV:-}" | sed 's/\r$//' > .env
+            # IMPORTANT: Avoid Compose variable expansion breaking bcrypt ($2b$…)
+            # Put the application's env into app.env; keep .env ONLY for compose substitutions if needed.
+            printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//' > app.env
 
-            # Compose for app behind Traefik
+            # Sync DB password to a global DB stack (optional)
+            DB_DIR="/opt/services/postgres"
+            mkdir -p "$DB_DIR"
+            if grep -q '^POSTGRES_PASSWORD=' app.env; then
+              awk -F= '/^POSTGRES_PASSWORD=/{print "POSTGRES_PASSWORD="$2}' app.env > "${DB_DIR}/.env"
+            fi
+
+            # GHCR login for pulls on the host
+            if [ -n "${GHCR_TOKEN:-}" ]; then
+              echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            fi
+
+            # Global DB stack (Postgres + PgBouncer)
+            cat > "${DB_DIR}/docker-compose.yml" <<'DBYAML'
+            networks:
+              core_db_net:
+                external: true
+                name: core_db_net
+            services:
+              postgres:
+                image: postgres:15
+                restart: always
+                environment:
+                  POSTGRES_USER: admin
+                  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_now}
+                  POSTGRES_DB: drcode
+                  POSTGRES_INITDB_ARGS: "--auth=scram-sha-256"
+                volumes:
+                  - pg_data:/var/lib/postgresql/data
+                healthcheck:
+                  test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+                  interval: 10s
+                  timeout: 5s
+                  retries: 10
+                networks: [core_db_net]
+              pgbouncer:
+                image: edoburu/pgbouncer
+                restart: always
+                environment:
+                  DB_USER: admin
+                  DB_PASSWORD: ${POSTGRES_PASSWORD:-change_me_now}
+                  DB_HOST: postgres
+                  DB_NAME: drcode
+                  POOL_MODE: transaction
+                  MAX_CLIENT_CONN: 200
+                  DEFAULT_POOL_SIZE: 20
+                depends_on:
+                  postgres:
+                    condition: service_healthy
+                networks: [core_db_net]
+            volumes:
+              pg_data:
+            DBYAML
+            (cd "${DB_DIR}" && docker compose up -d)
+
+            # App compose (uses app.env)
             cat > docker-compose.yml <<'YAML'
-            version: '3.8'
             services:
               app:
                 image: __IMAGE_REF__
                 restart: unless-stopped
-                env_file: .env
+                env_file:
+                  - app.env
                 labels:
                   - traefik.enable=true
                   - traefik.http.routers.__SLUG__.rule=Host(`__DOMAIN__`)
                   - traefik.http.routers.__SLUG__.entrypoints=websecure
                   - traefik.http.routers.__SLUG__.tls.certresolver=le
                   - traefik.http.services.__SLUG__.loadbalancer.server.port=__PORT__
-                networks: [proxy, core_db_net]
+                networks:
+                  - proxy
+                  - core_db_net
             networks:
-              proxy: { external: true }
-              core_db_net: { external: true }
+              proxy:
+                external: true
+                name: proxy
+              core_db_net:
+                external: true
+                name: core_db_net
             YAML
             sed -i \
               -e "s|__IMAGE_REF__|${IMAGE_REF}|g" \
@@ -317,8 +327,8 @@ jobs:
             docker compose pull || true
             docker compose up -d --remove-orphans
 
-            # Run Prisma migrations (safe in deploy)
-            docker compose exec -T app sh -lc "npm run prisma:migrate:deploy || true"
+            # Prisma (best-effort)
+            docker compose exec -T app sh -lc "npx prisma migrate deploy || true"
 
       - name: Health check
         run: |
@@ -329,7 +339,7 @@ jobs:
           done
           echo "❌ Healthcheck failed"; exit 1
 
-  # ---------- Deploy to Hetzner (STATIC export) ----------
+  # Static path (kept for completeness; won't run for project_type=node)
   hetzner_static:
     needs: [detect, build_test]
     if: needs.detect.outputs.project_type == 'static' && needs.detect.outputs.branch == 'main-hetz'
@@ -341,52 +351,19 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: static-export
-        # will download to ./static-export; we want ./out
       - name: Move artifact to ./out
         run: |
           rm -rf out && mkdir -p out
           cp -R static-export/. out/
-
-      # Mode A: SCP to nginx root if HETZNER_PATH is set (classic static hosting)
-      - name: SCP upload to Hetzner (if HETZNER_PATH provided)
-        if: env.HETZNER_PATH != ''
-        env:
-          SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
-        run: |
-          echo "$SSH_KEY" > id_rsa && chmod 600 id_rsa
-          mkdir -p ~/.ssh && ssh-keyscan -H "$HETZNER_HOST" >> ~/.ssh/known_hosts
-          TARGET="${HETZNER_PATH%/}/${SLUG}"
-          ssh -i id_rsa "$HETZNER_USER@$HETZNER_HOST" "sudo mkdir -p '$TARGET' && sudo chown -R $HETZNER_USER:$HETZNER_USER '$TARGET'"
-          rsync -az --delete -e "ssh -i id_rsa" out/ "$HETZNER_USER@$HETZNER_HOST:$TARGET/"
-          ssh -i id_rsa "$HETZNER_USER@$HETZNER_HOST" "sudo systemctl reload nginx || true"
-
-      # Mode B: containerized nginx behind Traefik (default)
-      - name: Create Dockerfile for static image
-        if: env.HETZNER_PATH == ''
-        run: |
-          cat > site.Dockerfile <<'DOCKER'
-          FROM nginx:alpine
-          COPY out/ /usr/share/nginx/html
-          RUN adduser -D -g 'www' www \
-           && chown -R www:www /usr/share/nginx/html \
-           && sed -i 's/user  nginx;/user www;/' /etc/nginx/nginx.conf
-          EXPOSE 80
-          DOCKER
-
       - name: Set up Docker Buildx
-        if: env.HETZNER_PATH == ''
         uses: docker/setup-buildx-action@v3
-
       - name: Login to GHCR
-        if: env.HETZNER_PATH == ''
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Build & push static image
-        if: env.HETZNER_PATH == ''
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -395,19 +372,20 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository_owner }}/static-${{ needs.detect.outputs.repository_name }}:${{ github.sha }}
             ghcr.io/${{ github.repository_owner }}/static-${{ needs.detect.outputs.repository_name }}:latest
-
       - name: Deploy static container on Hetzner
-        if: env.HETZNER_PATH == ''
         uses: appleboy/ssh-action@v1
         env:
           IMAGE_REF: ghcr.io/${{ github.repository_owner }}/static-${{ needs.detect.outputs.repository_name }}:${{ github.sha }}
           GHCR_USER: ${{ github.repository_owner }}
           GHCR_TOKEN: ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
         with:
-          host: ${{ secrets.HETZNER_HOST }}
-          username: ${{ secrets.HETZNER_USER || 'root' }}
-          key: ${{ secrets.HETZNER_SSH_KEY }}
-          script_stop: true
+          host: ${{ secrets.HZ_HOST }}
+          username: ${{ secrets.HZ_USER || 'root' }}
+          key: ${{ secrets.HZ_SSH_KEY }}
+          port: 22
+          timeout: 60s
+          command_timeout: 15m
+          envs: IMAGE_REF,GHCR_USER,GHCR_TOKEN,SLUG,DOMAIN
           script: |
             set -euo pipefail
             docker network create proxy >/dev/null 2>&1 || true
@@ -418,7 +396,6 @@ jobs:
             mkdir -p "$SITE_DIR"
             cd "$SITE_DIR"
             cat > docker-compose.yml <<YAML
-            version: '3.8'
             services:
               web:
                 image: ${IMAGE_REF}
@@ -436,12 +413,3 @@ jobs:
             YAML
             docker compose pull || true
             docker compose up -d --remove-orphans
-
-      - name: Health check
-        run: |
-          for i in {1..24}; do
-            if curl -fsSL "https://${{ needs.detect.outputs.domain_prod }}/" >/dev/null; then
-              echo "✅ Site up"; exit 0; fi
-            echo "retry $i"; sleep 5
-          done
-          echo "❌ Timed out"; exit 1
