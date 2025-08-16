@@ -394,6 +394,12 @@ jobs:
             DBYAML
 
             (cd "${DB_DIR}" && docker compose up -d)
+            if grep -q '^POSTGRES_PASSWORD=' "${DB_DIR}/.env"; then
+              . "${DB_DIR}/.env"
+              echo "Syncing Postgres admin password to current POSTGRES_PASSWORD…"
+              docker compose -f "${DB_DIR}/docker-compose.yml" exec -T postgres \
+                sh -lc "psql -U postgres -d postgres -v ON_ERROR_STOP=1 -c \"ALTER ROLE admin WITH PASSWORD '${POSTGRES_PASSWORD}';\""
+            fi
 
             # --- App stack behind Traefik ---
             cat > docker-compose.yml <<'APPLY'
