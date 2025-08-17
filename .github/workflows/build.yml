@@ -321,6 +321,7 @@ jobs:
                   - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
                 environment:
                   CF_DNS_API_TOKEN: ${CF_API_TOKEN}
+                  CLOUDFLARE_API_TOKEN: ${CF_API_TOKEN}
                 ports:
                   - 80:80
                   - 443:443
@@ -334,6 +335,9 @@ jobs:
                 name: proxy
             YAML
             (cd "$TDIR" && docker compose up -d)
+
+            # Tail recent Traefik logs for ACME status
+            docker logs --since=2m traefik-traefik-1 | egrep -i 'acme|lego|certificate|dns-01|error' || true
 
             # --- GHCR login for pulls ---
             if [ -n "${GHCR_TOKEN:-}" ]; then
@@ -435,6 +439,7 @@ jobs:
                   - traefik.http.routers.__SLUG__-http.rule=Host(`__DOMAIN__`)
                   - traefik.http.routers.__SLUG__-http.entrypoints=web
                   - traefik.http.routers.__SLUG__-http.middlewares=__SLUG__-redir
+                  - traefik.http.routers.__SLUG__-http.service=__SLUG__
                   - traefik.http.middlewares.__SLUG__-redir.redirectscheme.scheme=https
 
                 networks: [proxy, core_db_net]
@@ -465,6 +470,7 @@ jobs:
                   print "                  - traefik.http.routers." s "-admin-http.rule=Host(`" d "`)";
                   print "                  - traefik.http.routers." s "-admin-http.entrypoints=web";
                   print "                  - traefik.http.routers." s "-admin-http.middlewares=" s "-redir";
+                  print "                  - traefik.http.routers." s "-admin-http.service=" s;
                   next
                 }
                 {print}
@@ -555,7 +561,7 @@ jobs:
           TARGET="${HETZNER_PATH%/}/${SLUG}"
           ssh -i id_rsa "$HETZNER_USER@$HETZNER_HOST" "sudo mkdir -p '$TARGET' && sudo chown -R $HETZNER_USER:$HETZNER_USER '$TARGET'"
           rsync -az --delete -e "ssh -i id_rsa" out/ "$HETZNER_USER@$HETZNER_HOST:$TARGET/"
-          ssh -i id_rsa "$HETZNER_USER@$HETZNER_HOST" "sudo systemctl reload nginx || true"
+          ssh -i id_rsa "$HETZNER_HOST_USER@$HETZNER_HOST" "sudo systemctl reload nginx || true"
 
       # Mode B: containerized nginx behind Traefik
       - name: Create Dockerfile for static image
@@ -630,6 +636,11 @@ jobs:
                   - traefik.http.routers.${SLUG}.entrypoints=websecure
                   - traefik.http.routers.${SLUG}.tls.certresolver=le
                   - traefik.http.services.${SLUG}.loadbalancer.server.port=80
+                  - traefik.http.routers.${SLUG}-http.rule=Host(\`${DOMAIN}\`)
+                  - traefik.http.routers.${SLUG}-http.entrypoints=web
+                  - traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redir
+                  - traefik.http.routers.${SLUG}-http.service=${SLUG}
+                  - traefik.http.middlewares.${SLUG}-redir.redirectscheme.scheme=https
                 networks: [proxy]
             networks:
               proxy:
