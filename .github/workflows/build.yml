@@ -247,18 +247,34 @@ jobs:
     if: needs.detect.outputs.project_type == 'node' && needs.detect.outputs.branch == 'main-hetz'
     runs-on: ubuntu-latest
     steps:
-      - name: Compute SITE_ENV secret key for this repo
-        id: k
+      - name: Map SITE_ENV secret to env (per repo)
+        id: siteenv
         run: |
-          KEY="$(echo '${{ needs.detect.outputs.repository_name }}' | tr '[:lower:]-' '[:upper:]_')"
-          echo "SITE_ENV_KEY=SITE_ENV__${KEY}" >> $GITHUB_OUTPUT
-          echo "Expecting site env secret: SITE_ENV__${KEY}"
+          REPO="${{ needs.detect.outputs.repository_name }}"
+          case "$REPO" in
+            drcodezenna)
+              SECRET='${{ secrets.SITE_ENV__DRCODEZENNA }}'
+              ;;
+            PrinceFoods|princefoods|prince-foods)
+              SECRET='${{ secrets.SITE_ENV_PrinceFoods }}'
+              ;;
+            *)
+              echo "❌ No SITE_ENV secret mapping for repo '$REPO'"; exit 1;;
+          esac
+          if [ -z "$SECRET" ]; then
+            echo "❌ SITE_ENV secret for $REPO is empty or not set"; exit 1
+          fi
+          {
+            echo 'SITE_ENV<<EOF'
+            printf '%s\n' "$SECRET"
+            echo 'EOF'
+          } >> "$GITHUB_ENV"
+          echo "Mapped SITE_ENV for $REPO (masked)."
 
       - name: Sanity check required SSH secrets
         run: |
           test -n "${{ secrets.HZ_HOST }}"    || { echo "❌ Missing secret: HZ_HOST"; exit 1; }
           test -n "${{ secrets.HZ_SSH_KEY }}" || { echo "❌ Missing secret: HZ_SSH_KEY"; exit 1; }
-          test -n "${{ secrets[steps.k.outputs.SITE_ENV_KEY] }}" || { echo "❌ Missing secret: ${{ steps.k.outputs.SITE_ENV_KEY }}"; exit 1; }
 
       - name: Deploy over SSH (Traefik + DB + app; bcrypt-safe env)
         uses: appleboy/ssh-action@v1
@@ -268,7 +284,7 @@ jobs:
           DOMAIN:       ${{ needs.detect.outputs.domain_prod }}
           ADMIN_DOMAIN: ${{ needs.detect.outputs.domain_admin }}
           IMAGE_REF:    ${{ needs.image_build_push.outputs.ref }}
-          SITE_ENV:     ${{ secrets[steps.k.outputs.SITE_ENV_KEY] }}
+          SITE_ENV:     ${{ env.SITE_ENV }}
           GHCR_USER:    ${{ github.repository_owner }}
           GHCR_TOKEN:   ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
         with:
@@ -283,11 +299,17 @@ jobs:
             set -eo pipefail
 
             SLUG="${SLUG:-}"; PORT="${PORT:-3000}"; DOMAIN="${DOMAIN:-}"; IMAGE_REF="${IMAGE_REF:-}"
-            [ -n "$SLUG" ] && [ -n "$DOMAIN" ] && [ -n "$IMAGE_REF" ] || { echo "Missing SLUG/DOMAIN/IMAGE_REF"; exit 1; }
-
+            if [ -z "$SLUG" ] || [ -z "$DOMAIN" ] || [ -z "$IMAGE_REF" ]; then
+              echo "Missing required input(s): SLUG='$SLUG' DOMAIN='$DOMAIN' IMAGE_REF='${IMAGE_REF:0:20}…'"
+              exit 1
+            fi
             echo "Deploying $SLUG → https://$DOMAIN  (image: ${IMAGE_REF:0:20}…)"
 
-            # --- Extract infra creds from SITE_ENV ---
+            # --- Networks ---
+            docker network create proxy       >/dev/null 2>&1 || true
+            docker network create core_db_net >/dev/null 2>&1 || true
+
+            # --- Parse sensitive values from SITE_ENV (multiline-safe) ---
             SITE_ENV_NORM="$(printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//')"
             ACME_EMAIL="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^ACME_EMAIL=/{print $2}' | tail -1)"
             CF_API_TOKEN="$(
@@ -297,16 +319,8 @@ jobs:
                 /^CF_API_TOKEN=/{if(!f)print $2}
               ' | head -1
             )"
-            if [ -z "$ACME_EMAIL" ] || echo "$ACME_EMAIL" | grep -qi 'example\.com$'; then
-              echo "❌ ACME_EMAIL missing/invalid in SITE_ENV__${SLUG^^}"; exit 1
-            fi
-            if [ -z "$CF_API_TOKEN" ]; then
-              echo "❌ Cloudflare token missing in SITE_ENV__${SLUG^^} (set CLOUDFLARE_DNS_API_TOKEN=...)"; exit 1
-            fi
-
-            # --- Networks ---
-            docker network create proxy       >/dev/null 2>&1 || true
-            docker network create core_db_net >/dev/null 2>&1 || true
+            [ -n "$ACME_EMAIL" ] || { echo "❌ ACME_EMAIL missing in SITE_ENV"; exit 1; }
+            [ -n "$CF_API_TOKEN" ] || { echo "❌ Cloudflare token missing in SITE_ENV"; exit 1; }
 
             # --- Traefik (DNS-01 via Cloudflare) ---
             TDIR="/opt/services/traefik"
@@ -347,26 +361,24 @@ jobs:
                 name: proxy
             YAML
             (cd "$TDIR" && docker compose up -d)
+            docker logs --since=2m traefik-traefik-1 | egrep -i 'acme|lego|certificate|dns-01|error' || true
 
             # --- GHCR login for pulls ---
             if [ -n "${GHCR_TOKEN:-}" ]; then
               echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             fi
 
-            # --- Write app env (filter out infra keys) ---
+            # --- App env ---
             SITE_DIR="/opt/sites/${SLUG}"
             mkdir -p "$SITE_DIR"
             cd "$SITE_DIR"
-            printf "%s\n" "$SITE_ENV_NORM" \
-              | grep -Ev '^(ACME_EMAIL|CF_API_TOKEN|CLOUDFLARE_API_TOKEN|CLOUDFLARE_DNS_API_TOKEN)=' \
-              > app.env
+            printf "%s\n" "$SITE_ENV_NORM" > app.env
 
-            # Heads-up if DATABASE_URL points at localhost
             if grep -qE '^DATABASE_URL=.*@localhost(:|/)' app.env; then
-              echo "⚠️ DATABASE_URL points to localhost; use host 'pgbouncer'."
+              echo "⚠️ DATABASE_URL points to localhost; inside container this won’t reach Postgres. Use host 'pgbouncer'."
             fi
 
-            # --- Global DB stack (Postgres + PgBouncer) ---
+            # --- DB stack ---
             DB_DIR="/opt/services/postgres"
             mkdir -p "$DB_DIR"
             if grep -q '^POSTGRES_PASSWORD=' app.env; then
@@ -417,18 +429,15 @@ jobs:
                 external: true
                 name: core_db_net
             DBYAML
-
             (cd "${DB_DIR}" && docker compose up -d)
 
-            # Sync admin password if volume pre-existed
             if grep -q '^POSTGRES_PASSWORD=' "${DB_DIR}/.env"; then
               . "${DB_DIR}/.env"
-              echo "Syncing Postgres 'admin' password…"
               docker compose -f "${DB_DIR}/docker-compose.yml" exec -T postgres \
                 sh -lc "PGPASSWORD='${POSTGRES_PASSWORD}' psql -U admin -d postgres -v ON_ERROR_STOP=1 -c \"ALTER ROLE admin WITH PASSWORD '${POSTGRES_PASSWORD}';\""
             fi
 
-            # --- App behind Traefik (HTTPS + HTTP→HTTPS redirect) ---
+            # --- App stack + Traefik labels ---
             cat > docker-compose.yml <<'APPLY'
             services:
               app:
@@ -440,14 +449,14 @@ jobs:
                   - traefik.enable=true
                   - traefik.docker.network=proxy
 
-                  # HTTPS router (main + www)
+                  # HTTPS router (root + www)
                   - traefik.http.routers.__SLUG__.rule=Host(`__DOMAIN__`) || Host(`www.__DOMAIN__`)
                   - traefik.http.routers.__SLUG__.entrypoints=websecure
                   - traefik.http.routers.__SLUG__.tls.certresolver=le
                   - traefik.http.routers.__SLUG__.service=__SLUG__
                   - traefik.http.services.__SLUG__.loadbalancer.server.port=__PORT__
 
-                  # HTTP router → HTTPS
+                  # HTTP -> HTTPS
                   - traefik.http.routers.__SLUG__-http.rule=Host(`__DOMAIN__`) || Host(`www.__DOMAIN__`)
                   - traefik.http.routers.__SLUG__-http.entrypoints=web
                   - traefik.http.routers.__SLUG__-http.middlewares=__SLUG__-redir
@@ -470,7 +479,7 @@ jobs:
               -e "s|__PORT__|${PORT}|g" \
               docker-compose.yml
 
-            # Optional admin host
+            # Admin host (optional)
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
               awk -v s="${SLUG}" -v d="${ADMIN_DOMAIN}" '
                 /- traefik\.http\.services\..*loadbalancer\.server\.port/ {
@@ -510,7 +519,6 @@ jobs:
           timeout: 60s
           command_timeout: 10m
           envs: SLUG,DOMAIN
-        # (unchanged) – verifies app responds on container port
           script: |
             set -euo pipefail
             cd /opt/sites/${SLUG}
@@ -545,9 +553,7 @@ jobs:
             fi
             echo "retry $i (got $code)"; sleep 5
           done
-          echo "❌ Healthcheck failed; showing first 400 bytes of body:"
-          curl -k -sS "https://${{ needs.detect.outputs.domain_prod }}/api/healthz" | head -c 400 | sed 's/[^[:print:]\t\r\n]/./g'
-          exit 1
+          echo "❌ Healthcheck failed"; exit 1
 
   hetzner_static:
     needs: [detect, build_test]
@@ -674,5 +680,4 @@ jobs:
               echo "✅ Site up"; exit 0; fi
             echo "retry $i"; sleep 5
           done
-          echo "❌ Timed out"
-          exit 1
+          echo "❌ Timed out"; exit 1
