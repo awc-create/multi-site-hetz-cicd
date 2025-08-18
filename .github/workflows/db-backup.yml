@@ -17,23 +17,58 @@ jobs:
   backup:
     runs-on: ubuntu-latest
     steps:
+      - name: Verify SSH secrets
+        run: |
+          test -n "${{ env.HETZNER_HOST }}"    || { echo "❌ Missing HETZNER_HOST"; exit 1; }
+          test -n "${{ env.HETZNER_SSH_KEY }}" || { echo "❌ Missing HETZNER_SSH_KEY"; exit 1; }
+
       - name: Run pg_dump on server
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ env.HETZNER_HOST }}
           username: ${{ env.HETZNER_USER || 'root' }}
           key: ${{ env.HETZNER_SSH_KEY }}
+          port: 22
+          timeout: 60s
+          command_timeout: 20m
           script_stop: true
           script: |
             set -euo pipefail
-            mkdir -p /opt/backups/postgres
-            cd /opt/services/postgres
-            # Ensure stack exists
+
+            DB_STACK_DIR="/opt/services/postgres"
+            BACKUP_DIR="/opt/backups/postgres"
+            mkdir -p "$BACKUP_DIR"
+
+            # Ensure DB stack is up (postgres + pgbouncer)
+            cd "$DB_STACK_DIR"
             docker compose up -d
-            TS=$(date -u +"%Y%m%d-%H%M%S")
-            FILE="/opt/backups/postgres/drcode-${TS}.sql.gz"
-            echo "Creating backup $FILE"
-            docker compose exec -T postgres sh -lc 'pg_dump -U admin drcode' | gzip > "$FILE"
-            echo "Backup size: $(du -h "$FILE" | cut -f1)"
-            # optional: keep last 14
-            ls -1t /opt/backups/postgres/*.sql.gz | tail -n +15 | xargs -r rm -f
+
+            # Load DB password the stack uses
+            if [ ! -s .env ]; then
+              echo "❌ ${DB_STACK_DIR}/.env missing (needs POSTGRES_PASSWORD)"
+              exit 1
+            fi
+            # shellcheck disable=SC1091
+            . ./.env
+            : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD missing in ${DB_STACK_DIR}/.env}"
+
+            TS="$(date -u +'%Y%m%d-%H%M%S')"
+            FILE="${BACKUP_DIR}/drcode-${TS}.sql.gz"
+            echo "🗄️  Creating backup ${FILE}"
+
+            # Dump directly from the postgres service (not via PgBouncer)
+            # --no-owner/--no-privileges makes restores simpler on a new server
+            docker compose exec -T -e PGPASSWORD="${POSTGRES_PASSWORD}" postgres \
+              sh -lc 'pg_dump -h 127.0.0.1 -U admin -d drcode --no-owner --no-privileges' \
+              | gzip -c > "${FILE}"
+
+            # Verify gzip integrity
+            gzip -t "${FILE}"
+            echo "✅ Backup OK — size: $(du -h "${FILE}" | cut -f1)"
+
+            # Keep last 14 backups
+            ls -1t "${BACKUP_DIR}"/drcode-*.sql.gz 2>/dev/null | tail -n +15 | xargs -r rm -f
+
+            # Optional: show latest two for sanity
+            echo "Latest backups:"
+            ls -lh "${BACKUP_DIR}"/drcode-*.sql.gz 2>/dev/null | head -n 2 || true
