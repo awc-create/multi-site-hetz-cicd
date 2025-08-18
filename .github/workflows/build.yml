@@ -8,13 +8,16 @@ on:
   workflow_dispatch:
 
 env:
-  VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
   NODE_VERSION: 22
 
 permissions:
   contents: read
   actions: read
   packages: write
+
+concurrency:
+  group: cicd-${{ github.event.repository.name || github.repository }}-${{ github.ref_name || github.event.client_payload.branch }}
+  cancel-in-progress: true
 
 jobs:
   detect:
@@ -144,6 +147,8 @@ jobs:
     needs: [detect, build_test]
     if: startsWith(needs.detect.outputs.branch, 'feat/') || startsWith(needs.detect.outputs.branch, 'fix/')
     runs-on: ubuntu-latest
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -174,6 +179,8 @@ jobs:
     needs: [detect, build_test]
     if: needs.detect.outputs.branch == 'dev'
     runs-on: ubuntu-latest
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -226,8 +233,21 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      # Guard for Docker Hub creds without putting secrets in an "if:"
+      - name: Check Docker Hub creds
+        id: dh
+        env:
+          DHU: ${{ secrets.DOCKERHUB_USERNAME }}
+          DHT: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "${DHU:-}" ] && [ -n "${DHT:-}" ]; then
+            echo "present=1" >> $GITHUB_OUTPUT
+          else
+            echo "present=0" >> $GITHUB_OUTPUT
+          fi
+
       - name: Login to Docker Hub (for base images)
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+        if: steps.dh.outputs.present == '1'
         uses: docker/login-action@v3
         with:
           registry: docker.io
@@ -257,34 +277,34 @@ jobs:
     if: needs.detect.outputs.project_type == 'node' && needs.detect.outputs.branch == 'main-hetz'
     runs-on: ubuntu-latest
     steps:
+      # Map SITE_ENV per repo into an env var (no secrets in script conditionals)
       - name: Map SITE_ENV secret to env (per repo)
         id: siteenv
+        env:
+          REPO: ${{ needs.detect.outputs.repository_name }}
+          SITE_ENV__DRCODEZENNA: ${{ secrets.SITE_ENV__DRCODEZENNA }}
+          SITE_ENV_PrinceFoods:  ${{ secrets.SITE_ENV_PrinceFoods }}
         run: |
-          REPO="${{ needs.detect.outputs.repository_name }}"
           case "$REPO" in
-            drcodezenna)
-              SECRET='${{ secrets.SITE_ENV__DRCODEZENNA }}'
-              ;;
-            PrinceFoods|princefoods|prince-foods)
-              SECRET='${{ secrets.SITE_ENV_PrinceFoods }}'
-              ;;
-            *)
-              echo "❌ No SITE_ENV secret mapping for repo '$REPO'"; exit 1;;
+            drcodezenna)  SECRET="$SITE_ENV__DRCODEZENNA" ;;
+            PrinceFoods|princefoods|prince-foods) SECRET="$SITE_ENV_PrinceFoods" ;;
+            *) echo "❌ No SITE_ENV secret mapping for repo '$REPO'"; exit 1 ;;
           esac
-          if [ -z "$SECRET" ]; then
-            echo "❌ SITE_ENV secret for $REPO is empty or not set"; exit 1
-          fi
+          [ -n "${SECRET:-}" ] || { echo "❌ SITE_ENV for $REPO is empty"; exit 1; }
           {
             echo 'SITE_ENV<<EOF'
             printf '%s\n' "$SECRET"
             echo 'EOF'
           } >> "$GITHUB_ENV"
-          echo "Mapped SITE_ENV for $REPO (masked)."
+          echo "mapped=1" >> $GITHUB_OUTPUT
 
       - name: Sanity check required SSH secrets
+        env:
+          HZ_HOST:    ${{ secrets.HZ_HOST }}
+          HZ_SSH_KEY: ${{ secrets.HZ_SSH_KEY }}
         run: |
-          test -n "${{ secrets.HZ_HOST }}"    || { echo "❌ Missing secret: HZ_HOST"; exit 1; }
-          test -n "${{ secrets.HZ_SSH_KEY }}" || { echo "❌ Missing secret: HZ_SSH_KEY"; exit 1; }
+          [ -n "${HZ_HOST:-}" ]    || { echo "❌ Missing secret: HZ_HOST"; exit 1; }
+          [ -n "${HZ_SSH_KEY:-}" ] || { echo "❌ Missing secret: HZ_SSH_KEY"; exit 1; }
 
       - name: Deploy over SSH (Traefik + DB + app; bcrypt-safe env)
         uses: appleboy/ssh-action@v1
@@ -511,26 +531,16 @@ jobs:
             docker compose pull || true
             docker compose up -d --remove-orphans
 
-            # --- Wait for the app to bind the port (Patch #1) ---
-            APP_PORT="${PORT:-3000}"
-            echo "Waiting for app to bind on 127.0.0.1:${APP_PORT} …"
-            bound=0
-            for i in $(seq 1 60); do
-              if docker compose exec -T app sh -lc "node -e 'require(\"net\").connect({host:\"127.0.0.1\",port:${APP_PORT}},()=>process.exit(0)).on(\"error\",()=>process.exit(1))'"; then
-                echo "✅ Port ${APP_PORT} is accepting connections"; bound=1; break
-              fi
-              echo "  … not yet (try $i/60)"; sleep 2
-            done
-            if [ "$bound" -ne 1 ]; then
-              echo "❌ App did not bind to port ${APP_PORT} in time"; docker compose logs --no-color --tail=200 app || true; exit 1
-            fi
+            # Prisma migrations (best-effort)
+            set +e
+            docker compose exec -T app sh -lc "npx prisma migrate deploy" || true
+            set -e
 
-      - name: In-container health check (bypasses DNS/SSL)  # Patch #2
+      - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@v1
         env:
-          SLUG:          ${{ needs.detect.outputs.slug }}
-          DOMAIN:        ${{ needs.detect.outputs.domain_prod }}
-          FALLBACK_PORT: ${{ needs.detect.outputs.port }}
+          SLUG:   ${{ needs.detect.outputs.slug }}
+          DOMAIN: ${{ needs.detect.outputs.domain_prod }}
         with:
           host: ${{ secrets.HZ_HOST }}
           username: ${{ secrets.HZ_USER || 'root' }}
@@ -538,55 +548,46 @@ jobs:
           port: 22
           timeout: 60s
           command_timeout: 10m
-          envs: SLUG,DOMAIN,FALLBACK_PORT
+          envs: SLUG,DOMAIN
           script: |
             set -euo pipefail
-            cd "/opt/sites/${SLUG}"
-            PORT="$( docker compose exec -T app sh -lc 'printf "%s" "${PORT:-}"' || true )"
-            PORT="${PORT:-${FALLBACK_PORT:-3000}}"
-            echo "Using PORT=$PORT"
-
-            PATHS="/api/healthz /api/healthz/ /app/api/healthz /app/api/healthz/ /healthz /"
+            cd /opt/sites/${SLUG}
+            PORT=$(docker compose exec -T app sh -lc 'printf "%s" "${PORT:-3000}"')
+            echo "Detected PORT=$PORT"
             ok=0
-            for path in $PATHS; do
+            for path in /api/healthz /api/healthz/ /app/api/healthz /app/api/healthz/; do
               echo "Probing http://127.0.0.1:${PORT}${path}"
-              for i in $(seq 1 40); do
-                if docker compose exec -T app node -e "
-                  const http=require('http');
-                  const req=http.get({host:'127.0.0.1',port:${PORT},path:'${path}',headers:{'x-forwarded-proto':'https','host':'${DOMAIN:-localhost}'}},r=>{
-                    const ok=(r.statusCode>=200 && r.statusCode<400);
-                    console.log('STATUS', r.statusCode);
-                    let data=''; r.on('data',c=>data+=c); r.on('end',()=>{ if(ok) process.exit(0); else { console.log((data||'').slice(0,600)); process.exit(1); }});
-                  });
-                  req.on('error',e=>{console.error(String(e)); process.exit(1)});
-                "; then ok=1; break; else echo "  …retry $i/40"; sleep 3; fi
+              for i in $(seq 1 20); do
+                if docker compose exec -T app node -e "const http=require('http');http.get({host:'127.0.0.1',port:${PORT},path:'${path}',headers:{'x-forwarded-proto':'https','host':'${DOMAIN:-localhost}'}},r=>process.exit(r.statusCode<400?0:1)).on('error',()=>process.exit(1))"; then
+                  echo "✅ ${path} OK"
+                  ok=1; break
+                fi
+                echo "  retry $i"; sleep 3
               done
-              [ "$ok" -eq 1 ] && break
+              [ $ok -eq 1 ] && break
             done
-            [ "$ok" -eq 1 ] && echo "✅ App healthy inside container"
+            if [ $ok -ne 1 ]; then
+              echo "❌ App not healthy internally. Recent logs:" && docker compose logs --no-color --tail=200 app || true
+              exit 1
+            fi
+            echo "✅ App healthy inside container"
 
-      - name: Public health check (through Traefik/Cloudflare)  # Patch #3
+      - name: Public health check (through Traefik/Cloudflare)
+        env:
+          DOMAIN: ${{ needs.detect.outputs.domain_prod }}
         run: |
-          set -euo pipefail
-          hosts=("${{ needs.detect.outputs.domain_prod }}" "www.${{ needs.detect.outputs.domain_prod }}")
-          ok=0
-          for host in "${hosts[@]}"; do
-            echo "Checking https://$host/api/healthz"
-            for i in {1..48}; do
-              code=$(curl -v -k -sS -o /tmp/body.$$ -w "%{http_code}" "https://${host}/api/healthz") || code=000
-              echo "HTTP $code"
-              if [[ "$code" =~ ^(200|204|301|302|307|308)$ ]]; then
-                echo "✅ Public health OK for $host ($code)"; ok=1; break
-              fi
-              head -c 600 /tmp/body.$$ | sed 's/[^[:print:]\t]/./g' || true
-              echo; echo "  retry $i/48"; sleep 5
-            done
-            [ "$ok" -eq 1 ] && break
+          for i in {1..36}; do
+            code=$(curl -k -sS -D >(tee /dev/stderr) -o /tmp/health_body -w "%{http_code}" "https://${DOMAIN}/api/healthz" || true)
+            echo "HTTP $code"
+            if [[ "$code" =~ ^(200|204|301|302|307|308)$ ]]; then
+              echo "✅ Public health OK ($code)"; exit 0
+            fi
+            echo "Body:"; head -c 400 /tmp/health_body || true; echo
+            echo "retry $i"; sleep 5
           done
-          [ "$ok" -eq 1 ] || { echo "❌ Public healthcheck failed"; exit 1; }
+          echo "❌ Healthcheck failed"; exit 1
 
-      # ---- Deep triage bundle if anything failed above ----
-      - name: Failure triage (logs, routing, curls, labels)
+      - name: Diagnostics (only on failure)
         if: failure()
         uses: appleboy/ssh-action@v1
         env:
@@ -602,47 +603,26 @@ jobs:
           envs: SLUG,DOMAIN
           script: |
             set -euo pipefail
-            echo "==== docker ps ===="
-            docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' || true
+            echo "== Traefik recent logs =="
+            docker logs --since=5m traefik-traefik-1 | tail -n 300 || true
 
-            echo; echo "==== networks (proxy/core_db_net) ===="
-            docker network inspect proxy --format '{{json .Containers}}' || true
-            docker network inspect core_db_net --format '{{json .Containers}}' || true
+            echo; echo "== Routers & services snapshot =="
+            docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+            echo; docker inspect traefik-traefik-1 | grep -A2 -B2 '"entryPoints"' | head -n 100 || true
 
-            echo; echo "==== app compose dir ===="
-            cd "/opt/sites/${SLUG}" || exit 0
-            docker compose ps || true
-
-            APP_ID="$(docker compose ps -q app || true)"
-            if [ -n "$APP_ID" ]; then
-              echo; echo "==== app labels ===="
-              docker inspect "$APP_ID" --format '{{range $k,$v := .Config.Labels}}{{printf "%s=%s\n" $k $v}}{{end}}' | sort || true
-
-              echo; echo "==== app listens ===="
-              docker exec "$APP_ID" sh -lc "command -v ss >/dev/null || (apk add --no-cache iproute2 >/dev/null 2>&1 || apt-get update >/dev/null 2>&1 && apt-get install -y iproute2 >/dev/null 2>&1); ss -ltnp || netstat -ltnp" || true
-
-              echo; echo "==== recent app logs (300 lines) ===="
-              docker compose logs --no-color --tail=300 app || true
+            echo; echo "== Curl from Traefik to app (proxy network) =="
+            APP_CTN=$(docker ps --format '{{.Names}}' | grep -E '(_app_1|app-1)$' | head -1 || true)
+            if [ -n "${APP_CTN:-}" ]; then
+              APP_IP=$(docker inspect -f '{{ (index .NetworkSettings.Networks "proxy").IPAddress }}' "$APP_CTN" || true)
+              echo "APP_CTN=$APP_CTN APP_IP=$APP_IP"
+              docker exec traefik-traefik-1 sh -lc "apk add --no-cache curl >/dev/null 2>&1 || true; curl -svm 5 http://$APP_IP:$(docker inspect -f '{{ index .Config.Env }}' \"$APP_CTN\" | tr ' ' '\n' | awk -F= '/^PORT=/{print $2;f=1} END{if(!f)print 3000}')/api/healthz || true"
+            else
+              echo "App container not found."
             fi
 
-            echo; echo "==== traefik recent logs (ACME/routing) ===="
-            docker logs --since=10m traefik-traefik-1 2>&1 | egrep -i 'acme|lego|dns-01|certificate|router|rule|error|middleware' || true
-
-            echo; echo "==== curls via Traefik (HTTP->HTTPS) ===="
-            for h in "$DOMAIN" "www.$DOMAIN" "admin.$DOMAIN"; do
-              echo "-- http Host:$h"
-              curl -sS -I -H "Host: $h" http://127.0.0.1 || true
-            done
-
-            echo; echo "==== curls via Traefik (HTTPS SNI) ===="
-            for h in "$DOMAIN" "www.$DOMAIN" "admin.$DOMAIN"; do
-              echo "-- https://$h (headers)"
-              curl -vkI --max-time 20 --resolve "$h:443:127.0.0.1" "https://$h/" || true
-              echo "-- https://$h/api/healthz (body)"
-              curl -vk --max-time 20 --resolve "$h:443:127.0.0.1" "https://$h/api/healthz" | head -c 600 || true
-              echo
-            done
-            echo "==== end triage ===="
+            echo; echo "== App logs (last 200) =="
+            cd /opt/sites/${SLUG}
+            docker compose logs --no-color --tail=200 app || true
 
   hetzner_static:
     needs: [detect, build_test]
@@ -655,11 +635,28 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: static-export
+
       - name: Move artifact to ./out
         run: |
           rm -rf out && mkdir -p out
           cp -R static-export/. out/
 
+      # Mode A: SCP to nginx root if HETZNER_PATH is set
+      - name: SCP upload to Hetzner (if HETZNER_PATH provided)
+        if: env.HETZNER_PATH != ''
+        env:
+          SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+          HETZNER_HOST: ${{ secrets.HETZNER_HOST }}
+          HETZNER_USER: ${{ secrets.HETZNER_USER }}
+        run: |
+          echo "$SSH_KEY" > id_rsa && chmod 600 id_rsa
+          mkdir -p ~/.ssh && ssh-keyscan -H "$HETZNER_HOST" >> ~/.ssh/known_hosts
+          TARGET="${HETZNER_PATH%/}/${SLUG}"
+          ssh -i id_rsa "$HETZNER_USER@$HETZNER_HOST" "sudo mkdir -p '$TARGET' && sudo chown -R $HETZNER_USER:$HETZNER_USER '$TARGET'"
+          rsync -az --delete -e "ssh -i id_rsa" out/ "$HETZNER_USER@$HETZNER_HOST:$TARGET/"
+          ssh -i id_rsa "$HETZNER_USER@$HETZNER_HOST" "sudo systemctl reload nginx || true"
+
+      # Mode B: containerized nginx behind Traefik
       - name: Create Dockerfile for static image
         if: env.HETZNER_PATH == ''
         run: |
