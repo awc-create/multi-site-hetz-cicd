@@ -32,7 +32,7 @@ jobs:
           ref: ${{ steps.p.outputs.branch }}
           path: site
 
-      - name: Read .cicd-config.yml (slug / port / domains.prod / domains.admin)
+      - name: Read .cicd-config.yml (slug/port/domains)
         id: cfg
         shell: bash
         run: |
@@ -60,12 +60,11 @@ jobs:
           echo "ℹ️ Branch '${{ steps.p.outputs.branch }}' is not main-hetz. Skipping."
           exit 0
 
-      - name: Guard required secrets
+      - name: Guard required infra secrets (server + registry)
         run: |
-          test -n "${{ secrets.HZ_HOST }}"            || { echo "❌ Missing secret: HZ_HOST"; exit 1; }
-          test -n "${{ secrets.HZ_SSH_KEY }}"         || { echo "❌ Missing secret: HZ_SSH_KEY"; exit 1; }
-          test -n "${{ secrets.TRAEFIK_ACME_EMAIL }}" || { echo "❌ Missing secret: TRAEFIK_ACME_EMAIL"; exit 1; }
-          test -n "${{ secrets.CF_API_TOKEN }}"       || { echo "❌ Missing secret: CF_API_TOKEN"; exit 1; }
+          test -n "${{ secrets.HZ_HOST }}"    || { echo "❌ Missing secret: HZ_HOST"; exit 1; }
+          test -n "${{ secrets.HZ_SSH_KEY }}" || { echo "❌ Missing secret: HZ_SSH_KEY"; exit 1; }
+          # SITE_ENV is validated later when we try to use it.
 
       - name: Derive image coordinates
         id: meta
@@ -97,16 +96,16 @@ jobs:
             ${{ steps.meta.outputs.ref }}
             ${{ steps.meta.outputs.image }}:latest
 
-      - name: Compute site env secret key (multiline .env)
+      - name: Compute SITE_ENV secret key for this repo
         id: k
         shell: bash
         run: |
           REPO_NAME="${{ steps.p.outputs.repository_name }}"
-          KEY="$(echo "$REPO_NAME" | tr '[:lower:]-' '[:upper:]_')"  # drcodezenna -> DRCODEZENNA
+          KEY="$(echo "$REPO_NAME" | tr '[:lower:]-' '[:upper:]_')"  # e.g. drcodezenna -> DRCODEZENNA
           echo "SITE_ENV_KEY=SITE_ENV__${KEY}" >> $GITHUB_OUTPUT
           echo "Resolved env secret key: SITE_ENV__${KEY}"
 
-      - name: Deploy over SSH (Traefik + DB + app; HTTPS + redirect; local API)
+      - name: Deploy over SSH (Traefik + DB + app; parse ACME/CF from SITE_ENV)
         uses: appleboy/ssh-action@v1
         env:
           SLUG:         ${{ steps.cfg.outputs.SLUG }}
@@ -117,8 +116,6 @@ jobs:
           SITE_ENV:     ${{ secrets[steps.k.outputs.SITE_ENV_KEY] }}
           GHCR_USER:    ${{ github.repository_owner }}
           GHCR_TOKEN:   ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
-          ACME_EMAIL:   ${{ secrets.TRAEFIK_ACME_EMAIL }}
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         with:
           host: ${{ secrets.HZ_HOST }}
           username: ${{ secrets.HZ_USER || 'root' }}
@@ -126,19 +123,36 @@ jobs:
           port: 22
           timeout: 60s
           command_timeout: 20m
-          envs: SLUG,PORT,DOMAIN,ADMIN_DOMAIN,IMAGE_REF,SITE_ENV,GHCR_USER,GHCR_TOKEN,ACME_EMAIL,CF_API_TOKEN
+          envs: SLUG,PORT,DOMAIN,ADMIN_DOMAIN,IMAGE_REF,SITE_ENV,GHCR_USER,GHCR_TOKEN
           script: |
-            set -e
+            set -euo pipefail
 
-            case "${ACME_EMAIL}" in ""|*example.com*) echo "❌ TRAEFIK_ACME_EMAIL must be a real email"; exit 1;; esac
+            # Basic inputs
             [ -n "${SLUG:-}" ] && [ -n "${DOMAIN:-}" ] && [ -n "${IMAGE_REF:-}" ] || { echo "❌ Missing SLUG/DOMAIN/IMAGE_REF"; exit 1; }
+            [ -n "${SITE_ENV:-}" ] || { echo "❌ SITE_ENV secret is empty"; exit 1; }
 
-            echo "Deploying ${SLUG} → https://${DOMAIN} (image: ${IMAGE_REF})"
+            # Normalize SITE_ENV (strip CRLF)
+            SITE_ENV_NORM="$(printf '%s\n' "$SITE_ENV" | sed 's/\r$//')"
 
-            docker network create proxy >/dev/null 2>&1 || true
+            # Extract ACME email + Cloudflare token from SITE_ENV
+            ACME_EMAIL="$(printf '%s\n' "$SITE_ENV_NORM" | awk -F= '/^ACME_EMAIL=/{print $2}' | tail -1)"
+            CF_API_TOKEN="$(
+              printf '%s\n' "$SITE_ENV_NORM" | awk -F= '
+                /^CLOUDFLARE_DNS_API_TOKEN=/{print $2;f=1}
+                /^CLOUDFLARE_API_TOKEN=/{if(!f)print $2;f=1}
+                /^CF_API_TOKEN=/{if(!f)print $2}
+              ' | head -1
+            )"
+            case "${ACME_EMAIL:-}" in ""|*example.com*) echo "❌ ACME_EMAIL missing/invalid in SITE_ENV"; exit 1;; esac
+            [ -n "${CF_API_TOKEN:-}" ] || { echo "❌ Cloudflare token missing in SITE_ENV"; exit 1; }
+
+            echo "Deploying ${SLUG} → https://${DOMAIN} (image: ${IMAGE_REF:0:25}...)"
+
+            # Networks
+            docker network create proxy       >/dev/null 2>&1 || true
             docker network create core_db_net >/dev/null 2>&1 || true
 
-            # Traefik (with local dashboard/API for CI polling)
+            # --- Traefik (DNS-01 via Cloudflare) ---
             TDIR="/opt/services/traefik"
             mkdir -p "$TDIR/letsencrypt"
             [ -f "$TDIR/letsencrypt/acme.json" ] || install -m 600 /dev/null "$TDIR/letsencrypt/acme.json"
@@ -162,12 +176,9 @@ jobs:
                   - --certificatesresolvers.le.acme.dnschallenge.provider=cloudflare
                   - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
                   - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
-                  - --api.dashboard=true
-                  - --api.insecure=true
                 ports:
                   - 80:80
                   - 443:443
-                  - 127.0.0.1:8080:8080
                 volumes:
                   - /var/run/docker.sock:/var/run/docker.sock:ro
                   - ./letsencrypt:/letsencrypt
@@ -179,19 +190,22 @@ jobs:
             YAML
             (cd "$TDIR" && docker compose up -d)
 
+            # GHCR login for pulls (private images)
             if [ -n "${GHCR_TOKEN:-}" ]; then
               echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             fi
 
+            # --- App env & DB stack ---
             SITE_DIR="/opt/sites/${SLUG}"
             mkdir -p "$SITE_DIR"
             cd "$SITE_DIR"
-            printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//' > .app-env
+            printf '%s\n' "$SITE_ENV_NORM" > .app-env
 
-            # DB stack
             DB_DIR="/opt/services/postgres"
             mkdir -p "$DB_DIR"
-            awk -F= '/^POSTGRES_PASSWORD=/{print "POSTGRES_PASSWORD="$2}' .app-env > "${DB_DIR}/.env"
+            if grep -q '^POSTGRES_PASSWORD=' .app-env; then
+              awk -F= '/^POSTGRES_PASSWORD=/{print "POSTGRES_PASSWORD="$2}' .app-env > "${DB_DIR}/.env"
+            fi
             cat > "${DB_DIR}/docker-compose.yml" <<'DBYAML'
             services:
               postgres:
@@ -236,7 +250,7 @@ jobs:
             DBYAML
             (cd "${DB_DIR}" && docker compose up -d)
 
-            # App stack (HTTPS + HTTP→HTTPS redirect)
+            # --- App stack (HTTPS + HTTP→HTTPS redirect) ---
             WWW_DOMAIN="www.${DOMAIN}"
             cat > docker-compose.yml <<YAML
             services:
@@ -247,11 +261,13 @@ jobs:
                 labels:
                   - traefik.enable=true
                   - traefik.docker.network=proxy
+                  # HTTPS (root + www)
                   - traefik.http.routers.${SLUG}.rule=Host(\`${DOMAIN}\`) || Host(\`${WWW_DOMAIN}\`)
                   - traefik.http.routers.${SLUG}.entrypoints=websecure
                   - traefik.http.routers.${SLUG}.tls.certresolver=le
                   - traefik.http.routers.${SLUG}.service=${SLUG}
                   - traefik.http.services.${SLUG}.loadbalancer.server.port=${PORT}
+                  # HTTP -> HTTPS
                   - traefik.http.routers.${SLUG}-http.rule=Host(\`${DOMAIN}\`) || Host(\`${WWW_DOMAIN}\`)
                   - traefik.http.routers.${SLUG}-http.entrypoints=web
                   - traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redirect
@@ -263,11 +279,11 @@ jobs:
               core_db_net:{ external: true, name: core_db_net }
             YAML
 
-            # Optional dedicated admin host — HTTPS only + HTTP→HTTPS
+            # Optional dedicated admin host — HTTPS only (+ HTTP→HTTPS)
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
               awk -v s="${SLUG}" -v d="${ADMIN_DOMAIN}" '
                 /- traefik\.http\.services\..*loadbalancer\.server\.port=/ {
-                  print; 
+                  print;
                   print "                  - traefik.http.routers." s "-admin.rule=Host(`" d "`)";
                   print "                  - traefik.http.routers." s "-admin.entrypoints=websecure";
                   print "                  - traefik.http.routers." s "-admin.tls.certresolver=le";
@@ -340,6 +356,7 @@ jobs:
           timeout: 60s
           command_timeout: 10m
           envs: SLUG,DOMAIN
+        # probes common Next.js health paths, sends host header so app knows its URL
           script: |
             set -e
             cd "/opt/sites/${SLUG}"
