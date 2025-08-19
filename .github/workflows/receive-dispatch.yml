@@ -63,6 +63,7 @@ jobs:
           exit 0
 
       - name: Guard required secrets
+        if: steps.p.outputs.branch == 'main-hetz'
         run: |
           test -n "${{ secrets.HZ_HOST }}"            || { echo "❌ Missing secret: HZ_HOST"; exit 1; }
           test -n "${{ secrets.HZ_SSH_KEY }}"         || { echo "❌ Missing secret: HZ_SSH_KEY"; exit 1; }
@@ -70,6 +71,7 @@ jobs:
           test -n "${{ secrets.CF_API_TOKEN }}"       || { echo "❌ Missing secret: CF_API_TOKEN"; exit 1; }
 
       - name: Derive image coordinates
+        if: steps.p.outputs.branch == 'main-hetz'
         id: meta
         shell: bash
         run: |
@@ -81,9 +83,11 @@ jobs:
           echo "ref=$IMAGE:$SHORT" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
+        if: steps.p.outputs.branch == 'main-hetz'
         uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR (push)
+        if: steps.p.outputs.branch == 'main-hetz'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -91,6 +95,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build & push site image
+        if: steps.p.outputs.branch == 'main-hetz'
         uses: docker/build-push-action@v6
         with:
           context: site
@@ -100,6 +105,7 @@ jobs:
             ${{ steps.meta.outputs.image }}:latest
 
       - name: Compute site env secret key (multiline .env)
+        if: steps.p.outputs.branch == 'main-hetz'
         id: k
         shell: bash
         run: |
@@ -109,6 +115,7 @@ jobs:
           echo "Resolved env secret key: SITE_ENV__${KEY}"
 
       - name: Deploy over SSH (Traefik + DB + app; safe env write)
+        if: steps.p.outputs.branch == 'main-hetz'
         uses: appleboy/ssh-action@v1
         env:
           SLUG:         ${{ steps.cfg.outputs.SLUG }}
@@ -138,7 +145,7 @@ jobs:
 
             echo "Deploying ${SLUG} → https://${DOMAIN} (image: ${IMAGE_REF})"
 
-            # --- Networks ---
+            # --- Networks (idempotent) ---
             docker network create proxy >/dev/null 2>&1 || true
             docker network create core_db_net >/dev/null 2>&1 || true
 
@@ -198,7 +205,6 @@ jobs:
             DB_DIR="/opt/services/postgres"
             mkdir -p "$DB_DIR"
             awk -F= '/^POSTGRES_PASSWORD=/{print "POSTGRES_PASSWORD="$2}' .app-env > "${DB_DIR}/.env"
-            # export for compose var substitution
             if [ -s "${DB_DIR}/.env" ]; then set -a; . "${DB_DIR}/.env"; set +a; fi
 
             cat > "${DB_DIR}/docker-compose.yml" <<'DBYAML'
@@ -318,11 +324,12 @@ jobs:
             docker compose exec -T app sh -lc "npx prisma migrate deploy || true"
 
             # Quick routing sanity (HTTP should 301/307)
-            curl -sS -I -H "Host: ${DOMAIN}"        http://127.0.0.1 || true
-            curl -sS -I -H "Host: ${WWW_DOMAIN}"     http://127.0.0.1 || true
+            curl -sS -I -H "Host: ${DOMAIN}"         http://127.0.0.1 || true
+            curl -sS -I -H "Host: ${WWW_DOMAIN}"      http://127.0.0.1 || true
             [ -n "${ADMIN_DOMAIN:-}" ] && curl -sS -I -H "Host: ${ADMIN_DOMAIN}" http://127.0.0.1 || true
 
       - name: In-container health check (no DNS needed)
+        if: steps.p.outputs.branch == 'main-hetz'
         uses: appleboy/ssh-action@v1
         env:
           SLUG: ${{ steps.cfg.outputs.SLUG }}
@@ -335,6 +342,7 @@ jobs:
           timeout: 60s
           command_timeout: 10m
           envs: SLUG,DOMAIN
+        # note: steps run in-order; concurrent dispatches are serialized by the concurrency.group above
           script: |
             set -e
             cd "/opt/sites/${SLUG}"
@@ -362,6 +370,7 @@ jobs:
             echo "✅ App healthy inside container"
 
       - name: Public health check (through Traefik/Cloudflare)
+        if: steps.p.outputs.branch == 'main-hetz'
         run: |
           set -e
           dom="${{ steps.cfg.outputs.DOMAIN_PROD }}"

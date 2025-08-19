@@ -1,3 +1,4 @@
+# .github/workflows/build.yml
 name: Build, Test, and Deploy (Vercel + Hetzner)
 
 on:
@@ -233,8 +234,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      # Guard for Docker Hub creds without putting secrets in an "if:"
-      - name: Check Docker Hub creds
+      - name: Check Docker Hub creds (optional)
         id: dh
         env:
           DHU: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -261,7 +261,7 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push site image (uses site's Dockerfile)
+      - name: Build & push site image
         id: buildpush
         uses: docker/build-push-action@v6
         with:
@@ -277,7 +277,6 @@ jobs:
     if: needs.detect.outputs.project_type == 'node' && needs.detect.outputs.branch == 'main-hetz'
     runs-on: ubuntu-latest
     steps:
-      # Map SITE_ENV per repo into an env var (no secrets in script conditionals)
       - name: Map SITE_ENV secret to env (per repo)
         id: siteenv
         env:
@@ -306,7 +305,7 @@ jobs:
           [ -n "${HZ_HOST:-}" ]    || { echo "❌ Missing secret: HZ_HOST"; exit 1; }
           [ -n "${HZ_SSH_KEY:-}" ] || { echo "❌ Missing secret: HZ_SSH_KEY"; exit 1; }
 
-      - name: Deploy over SSH (Traefik + DB + app; bcrypt-safe env)
+      - name: Deploy over SSH (Traefik + DB + app; HTTPS-only admin)
         uses: appleboy/ssh-action@v1
         env:
           SLUG:         ${{ needs.detect.outputs.slug }}
@@ -330,16 +329,14 @@ jobs:
 
             SLUG="${SLUG:-}"; PORT="${PORT:-3000}"; DOMAIN="${DOMAIN:-}"; IMAGE_REF="${IMAGE_REF:-}"
             if [ -z "$SLUG" ] || [ -z "$DOMAIN" ] || [ -z "$IMAGE_REF" ]; then
-              echo "Missing required input(s): SLUG='$SLUG' DOMAIN='$DOMAIN' IMAGE_REF='${IMAGE_REF:0:20}…'"
+              echo "Missing input(s): SLUG='$SLUG' DOMAIN='$DOMAIN' IMAGE_REF='${IMAGE_REF:0:20}…'"
               exit 1
             fi
             echo "Deploying $SLUG → https://$DOMAIN  (image: ${IMAGE_REF:0:20}…)"
 
-            # --- Networks ---
             docker network create proxy       >/dev/null 2>&1 || true
             docker network create core_db_net >/dev/null 2>&1 || true
 
-            # --- Parse sensitive values from SITE_ENV (multiline-safe) ---
             SITE_ENV_NORM="$(printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//')"
             ACME_EMAIL="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^ACME_EMAIL=/{print $2}' | tail -1)"
             CF_API_TOKEN="$(
@@ -352,17 +349,15 @@ jobs:
             [ -n "$ACME_EMAIL" ] || { echo "❌ ACME_EMAIL missing in SITE_ENV"; exit 1; }
             [ -n "$CF_API_TOKEN" ] || { echo "❌ Cloudflare token missing in SITE_ENV"; exit 1; }
 
-            # --- Traefik (DNS-01 via Cloudflare) ---
+            # --- Traefik (entrypoints + ACME via Cloudflare) ---
             TDIR="/opt/services/traefik"
             mkdir -p "$TDIR/letsencrypt"
             [ -f "$TDIR/letsencrypt/acme.json" ] || install -m 600 /dev/null "$TDIR/letsencrypt/acme.json"
-
             cat > "$TDIR/.env" <<EOF
             ACME_EMAIL=${ACME_EMAIL}
             CLOUDFLARE_DNS_API_TOKEN=${CF_API_TOKEN}
             CF_DNS_API_TOKEN=${CF_API_TOKEN}
             EOF
-
             cat > "$TDIR/docker-compose.yml" <<'YAML'
             services:
               traefik:
@@ -391,7 +386,6 @@ jobs:
                 name: proxy
             YAML
             (cd "$TDIR" && docker compose up -d)
-            docker logs --since=2m traefik-traefik-1 | egrep -i 'acme|lego|certificate|dns-01|error' || true
 
             # --- GHCR login for pulls ---
             if [ -n "${GHCR_TOKEN:-}" ]; then
@@ -404,11 +398,7 @@ jobs:
             cd "$SITE_DIR"
             printf "%s\n" "$SITE_ENV_NORM" > app.env
 
-            if grep -qE '^DATABASE_URL=.*@localhost(:|/)' app.env; then
-              echo "⚠️ DATABASE_URL points to localhost; inside container this won’t reach Postgres. Use host 'pgbouncer'."
-            fi
-
-            # --- DB stack ---
+            # --- DB stack (Postgres + PgBouncer) ---
             DB_DIR="/opt/services/postgres"
             mkdir -p "$DB_DIR"
             if grep -q '^POSTGRES_PASSWORD=' app.env; then
@@ -461,13 +451,7 @@ jobs:
             DBYAML
             (cd "${DB_DIR}" && docker compose up -d)
 
-            if grep -q '^POSTGRES_PASSWORD=' "${DB_DIR}/.env"; then
-              . "${DB_DIR}/.env"
-              docker compose -f "${DB_DIR}/docker-compose.yml" exec -T postgres \
-                sh -lc "PGPASSWORD='${POSTGRES_PASSWORD}' psql -U admin -d postgres -v ON_ERROR_STOP=1 -c \"ALTER ROLE admin WITH PASSWORD '${POSTGRES_PASSWORD}';\""
-            fi
-
-            # --- App stack + Traefik labels ---
+            # --- App stack + Traefik labels (HTTPS-only; HTTP just redirects) ---
             cat > docker-compose.yml <<'APPLY'
             services:
               app:
@@ -486,13 +470,12 @@ jobs:
                   - traefik.http.routers.__SLUG__.service=__SLUG__
                   - traefik.http.services.__SLUG__.loadbalancer.server.port=__PORT__
 
-                  # HTTP -> HTTPS
+                  # HTTP -> HTTPS (no content on port 80)
                   - traefik.http.routers.__SLUG__-http.rule=Host(`__DOMAIN__`) || Host(`www.__DOMAIN__`)
                   - traefik.http.routers.__SLUG__-http.entrypoints=web
-                  - traefik.http.routers.__SLUG__-http.middlewares=__SLUG__-redir
+                  - traefik.http.routers.__SLUG__-http.middlewares=__SLUG__-redirect
                   - traefik.http.routers.__SLUG__-http.service=__SLUG__
-                  - traefik.http.middlewares.__SLUG__-redir.redirectscheme.scheme=https
-
+                  - traefik.http.middlewares.__SLUG__-redirect.redirectscheme.scheme=https
                 networks: [proxy, core_db_net]
             networks:
               proxy:
@@ -509,22 +492,17 @@ jobs:
               -e "s|__PORT__|${PORT}|g" \
               docker-compose.yml
 
-            # Admin host (optional)
+            # Optional: dedicated admin host over HTTPS ONLY (no -admin-http router)
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
               awk -v s="${SLUG}" -v d="${ADMIN_DOMAIN}" '
                 /- traefik\.http\.services\..*loadbalancer\.server\.port/ {
-                  print;
+                  print; 
                   print "                  - traefik.http.routers." s "-admin.rule=Host(`" d "`)";
                   print "                  - traefik.http.routers." s "-admin.entrypoints=websecure";
                   print "                  - traefik.http.routers." s "-admin.tls.certresolver=le";
                   print "                  - traefik.http.routers." s "-admin.service=" s;
-                  print "                  - traefik.http.routers." s "-admin-http.rule=Host(`" d "`)";
-                  print "                  - traefik.http.routers." s "-admin-http.entrypoints=web";
-                  print "                  - traefik.http.routers." s "-admin-http.middlewares=" s "-redir";
-                  print "                  - traefik.http.routers." s "-admin-http.service=" s;
                   next
-                }
-                {print}
+                } {print}
               ' docker-compose.yml > docker-compose.tmp && mv docker-compose.tmp docker-compose.yml
             fi
 
@@ -624,6 +602,24 @@ jobs:
             cd /opt/sites/${SLUG}
             docker compose logs --no-color --tail=200 app || true
 
+      - name: Trigger Receive & Deploy (post-Hetzner node)
+        if: needs.detect.outputs.branch == 'main-hetz' && success()
+        run: |
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token ${{ secrets.CICD_DISPATCH_TOKEN }}" \
+            https://api.github.com/repos/CICD/multi-site-hetz-cicd/dispatches \
+            -d @- <<'JSON'
+          {
+            "event_type": "deploy",
+            "client_payload": {
+              "repository": "${{ needs.detect.outputs.repository }}",
+              "repository_name": "${{ needs.detect.outputs.repository_name }}",
+              "branch": "${{ needs.detect.outputs.branch }}"
+            }
+          }
+          JSON
+
   hetzner_static:
     needs: [detect, build_test]
     if: needs.detect.outputs.project_type == 'static' && needs.detect.outputs.branch == 'main-hetz'
@@ -641,24 +637,7 @@ jobs:
           rm -rf out && mkdir -p out
           cp -R static-export/. out/
 
-      # Mode A: SCP to nginx root if HETZNER_PATH is set
-      - name: SCP upload to Hetzner (if HETZNER_PATH provided)
-        if: env.HETZNER_PATH != ''
-        env:
-          SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
-          HETZNER_HOST: ${{ secrets.HETZNER_HOST }}
-          HETZNER_USER: ${{ secrets.HETZNER_USER }}
-        run: |
-          echo "$SSH_KEY" > id_rsa && chmod 600 id_rsa
-          mkdir -p ~/.ssh && ssh-keyscan -H "$HETZNER_HOST" >> ~/.ssh/known_hosts
-          TARGET="${HETZNER_PATH%/}/${SLUG}"
-          ssh -i id_rsa "$HETZNER_USER@$HETZNER_HOST" "sudo mkdir -p '$TARGET' && sudo chown -R $HETZNER_USER:$HETZNER_USER '$TARGET'"
-          rsync -az --delete -e "ssh -i id_rsa" out/ "$HETZNER_USER@$HETZNER_HOST:$TARGET/"
-          ssh -i id_rsa "$HETZNER_USER@$HETZNER_HOST" "sudo systemctl reload nginx || true"
-
-      # Mode B: containerized nginx behind Traefik
       - name: Create Dockerfile for static image
-        if: env.HETZNER_PATH == ''
         run: |
           cat > site.Dockerfile <<'DOCKER'
           FROM nginx:alpine
@@ -669,12 +648,9 @@ jobs:
           EXPOSE 80
           DOCKER
 
-      - name: Set up Docker Buildx
-        if: env.HETZNER_PATH == ''
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
-        if: env.HETZNER_PATH == ''
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -682,7 +658,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build & push static image
-        if: env.HETZNER_PATH == ''
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -692,8 +667,7 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/static-${{ needs.detect.outputs.repository_name }}:${{ github.sha }}
             ghcr.io/${{ github.repository_owner }}/static-${{ needs.detect.outputs.repository_name }}:latest
 
-      - name: Deploy static container on Hetzner
-        if: env.HETZNER_PATH == ''
+      - name: Deploy static container on Hetzner (HTTPS only)
         uses: appleboy/ssh-action@v1
         env:
           SLUG: ${{ needs.detect.outputs.slug }}
@@ -702,9 +676,9 @@ jobs:
           GHCR_USER: ${{ github.repository_owner }}
           GHCR_TOKEN: ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
         with:
-          host: ${{ secrets.HETZNER_HOST }}
-          username: ${{ secrets.HETZNER_USER || 'root' }}
-          key: ${{ secrets.HETZNER_SSH_KEY }}
+          host: ${{ secrets.HETZNER_HOST || secrets.HZ_HOST }}
+          username: ${{ secrets.HETZNER_USER || secrets.HZ_USER || 'root' }}
+          key: ${{ secrets.HETZNER_SSH_KEY || secrets.HZ_SSH_KEY }}
           port: 22
           timeout: 60s
           command_timeout: 15m
@@ -732,9 +706,9 @@ jobs:
                   - traefik.http.services.${SLUG}.loadbalancer.server.port=80
                   - traefik.http.routers.${SLUG}-http.rule=Host(\`${DOMAIN}\`)
                   - traefik.http.routers.${SLUG}-http.entrypoints=web
-                  - traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redir
+                  - traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redirect
                   - traefik.http.routers.${SLUG}-http.service=${SLUG}
-                  - traefik.http.middlewares.${SLUG}-redir.redirectscheme.scheme=https
+                  - traefik.http.middlewares.${SLUG}-redirect.redirectscheme.scheme=https
                 networks: [proxy]
             networks:
               proxy:
@@ -745,7 +719,6 @@ jobs:
             docker compose up -d --remove-orphans
 
       - name: Static public check
-        if: env.HETZNER_PATH == ''
         run: |
           for i in {1..36}; do
             if curl -fsSL "https://${{ needs.detect.outputs.domain_prod }}/" >/dev/null; then
@@ -753,3 +726,22 @@ jobs:
             echo "retry $i"; sleep 5
           done
           echo "❌ Timed out"; exit 1
+
+      - name: Trigger Receive & Deploy (post-Hetzner static)
+        if: needs.detect.outputs.branch == 'main-hetz' && success()
+        run: |
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token ${{ secrets.CICD_DISPATCH_TOKEN }}" \
+            https://api.github.com/repos/CICD/multi-site-hetz-cicd/dispatches \
+            -d @- <<'JSON'
+          {
+            "event_type": "deploy",
+            "client_payload": {
+              "repository": "${{ needs.detect.outputs.repository }}",
+              "repository_name": "${{ needs.detect.outputs.repository_name }}",
+              "branch": "${{ needs.detect.outputs.branch }}"
+            }
+          }
+          JSON
+
