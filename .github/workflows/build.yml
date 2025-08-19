@@ -373,13 +373,9 @@ jobs:
                   - --certificatesresolvers.le.acme.dnschallenge.provider=cloudflare
                   - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
                   - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
-                  # Local-only dashboard/API for CI polling
-                  - --api.dashboard=true
-                  - --api.insecure=true
                 ports:
                   - 80:80
                   - 443:443
-                  - 127.0.0.1:8080:8080
                 volumes:
                   - /var/run/docker.sock:/var/run/docker.sock:ro
                   - ./letsencrypt:/letsencrypt
@@ -518,54 +514,6 @@ jobs:
             docker compose exec -T app sh -lc "npx prisma migrate deploy" || true
             set -e
 
-      - name: Wait for Traefik routers (HTTPS)
-        uses: appleboy/ssh-action@v1
-        env:
-          DOMAIN:       ${{ needs.detect.outputs.domain_prod }}
-          ADMIN_DOMAIN: ${{ needs.detect.outputs.domain_admin }}
-        with:
-          host: ${{ secrets.HZ_HOST }}
-          username: ${{ secrets.HZ_USER || 'root' }}
-          key: ${{ secrets.HZ_SSH_KEY }}
-          port: 22
-          timeout: 60s
-          command_timeout: 10m
-          envs: DOMAIN,ADMIN_DOMAIN
-          script: |
-            set -euo pipefail
-
-            need_hosts=()
-            [ -n "${DOMAIN:-}" ] && need_hosts+=("$DOMAIN" "www.${DOMAIN}")
-            [ -n "${ADMIN_DOMAIN:-}" ] && need_hosts+=("${ADMIN_DOMAIN}")
-
-            echo "Waiting for Traefik API..."
-            for i in $(seq 1 60); do
-              if docker exec traefik-traefik-1 sh -lc 'apk add --no-cache curl >/dev/null 2>&1 || true; curl -sf http://127.0.0.1:8080/api/version >/dev/null'; then
-                echo "Traefik API is up"; break
-              fi
-              echo "  api not ready ($i)"; sleep 2
-            done
-
-            wait_host() {
-              host="$1"; echo "→ waiting router for $host (websecure)"
-              for i in $(seq 1 60); do
-                json="$(docker exec traefik-traefik-1 sh -lc 'curl -sf http://127.0.0.1:8080/api/http/routers' || true)"
-                if printf '%s' "$json" | grep -F "Host(\`$host\`)" >/dev/null \
-                   && printf '%s' "$json" | grep -F '"status":"enabled"' >/dev/null \
-                   && printf '%s' "$json" | grep -F '"entryPoints":["websecure"]' >/dev/null; then
-                  echo "✅ router ready for $host"
-                  return 0
-                fi
-                sleep 3
-              done
-              echo "❌ timeout waiting for router $host"
-              echo "Routers snapshot:"
-              printf '%s\n' "$json" | head -c 2000 || true
-              exit 1
-            }
-
-            for h in "${need_hosts[@]}"; do wait_host "$h"; done
-
       - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@v1
         env:
@@ -579,7 +527,6 @@ jobs:
           timeout: 60s
           command_timeout: 10m
           envs: SLUG,DOMAIN
-        # (unchanged logic)
           script: |
             set -euo pipefail
             cd /opt/sites/${SLUG}
@@ -603,6 +550,9 @@ jobs:
             fi
             echo "✅ App healthy inside container"
 
+      - name: Short settle (first issue of certificates, etc.)
+        run: sleep 10
+
       - name: Public health check (through Traefik/Cloudflare)
         env:
           DOMAIN: ${{ needs.detect.outputs.domain_prod }}
@@ -611,11 +561,12 @@ jobs:
           urls=(
             "https://${DOMAIN}/api/healthz"
             "https://${DOMAIN}/api/healthz/"
+            "https://${DOMAIN}/"
           )
           ok=0
-          for i in {1..48}; do
+          for i in {1..36}; do
             for u in "${urls[@]}"; do
-              code=$(curl -k -L -sS -D >(tee /dev/stderr) -o /tmp/health_body -w "%{http_code}" "$u" || true)
+              code=$(curl -k -L -sS -o /tmp/health_body -w "%{http_code}" "$u" || true)
               echo "GET $u -> HTTP $code"
               if [[ "$code" =~ ^(200|204|301|302|307|308)$ ]]; then
                 echo "✅ Public health OK ($code) at $u"; ok=1; break
@@ -653,9 +604,6 @@ jobs:
             echo; echo "== Routers & services snapshot =="
             docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
             echo; docker inspect traefik-traefik-1 | grep -A2 -B2 '"entryPoints"' | head -n 100 || true
-            echo; echo "== Traefik API routers/services =="
-            docker exec traefik-traefik-1 sh -lc 'apk add --no-cache curl jq >/dev/null 2>&1 || true; curl -sf http://127.0.0.1:8080/api/http/routers | jq "[ .[] | {name,entryPoints,rule,status,using} ]"' || true
-            docker exec traefik-traefik-1 sh -lc 'curl -sf http://127.0.0.1:8080/api/http/services | jq "[ .[] | {name,type,status,usedBy} ]"' || true
 
             echo; echo "== Curl from Traefik to app (proxy network) =="
             APP_CTN=$(docker ps --format '{{.Names}}' | grep -E '(_app_1|app-1)$' | head -1 || true)
