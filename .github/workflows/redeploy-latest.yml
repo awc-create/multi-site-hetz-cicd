@@ -12,6 +12,10 @@ on:
       domain:
         description: "Production domain (e.g. drcodezenna.com)"
         required: true
+      admin_domain:
+        description: "Optional admin host (e.g. admin.drcodezenna.com)"
+        required: false
+        default: ""
       port:
         description: "Internal app port"
         required: true
@@ -40,34 +44,40 @@ jobs:
           echo "IMAGE_REF=$IMAGE" >> $GITHUB_OUTPUT
           echo "SITE_ENV_KEY=SITE_ENV__${KEY}" >> $GITHUB_OUTPUT
 
-      - name: Redeploy on Hetzner
+      - name: Redeploy on Hetzner (HTTPS + redirect; wait routers)
         uses: appleboy/ssh-action@v1
         env:
-          SLUG:       ${{ inputs.slug }}
-          PORT:       ${{ inputs.port }}
-          DOMAIN:     ${{ inputs.domain }}
-          IMAGE_REF:  ${{ steps.meta.outputs.IMAGE_REF }}
-          SITE_ENV:   ${{ secrets[steps.meta.outputs.SITE_ENV_KEY] }}
-          GHCR_USER:  ${{ github.repository_owner }}
-          GHCR_TOKEN: ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
+          SLUG:         ${{ inputs.slug }}
+          PORT:         ${{ inputs.port }}
+          DOMAIN:       ${{ inputs.domain }}
+          ADMIN_DOMAIN: ${{ inputs.admin_domain }}
+          IMAGE_REF:    ${{ steps.meta.outputs.IMAGE_REF }}
+          SITE_ENV:     ${{ secrets[steps.meta.outputs.SITE_ENV_KEY] }}
+          GHCR_USER:    ${{ github.repository_owner }}
+          GHCR_TOKEN:   ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
         with:
           host: ${{ env.HETZNER_HOST }}
           username: ${{ env.HETZNER_USER || 'root' }}
           key: ${{ env.HETZNER_SSH_KEY }}
           script_stop: true
+          command_timeout: 15m
+          envs: SLUG,PORT,DOMAIN,ADMIN_DOMAIN,IMAGE_REF,SITE_ENV,GHCR_USER,GHCR_TOKEN
           script: |
             set -euo pipefail
-            docker network create proxy || true
-            docker network create core_db_net || true
+
+            docker network create proxy >/dev/null 2>&1 || true
+            docker network create core_db_net >/dev/null 2>&1 || true
             if [ -n "${GHCR_TOKEN:-}" ]; then
               echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             fi
+
             SITE_DIR="/opt/sites/${SLUG}"
             mkdir -p "$SITE_DIR"
             cd "$SITE_DIR"
-            echo "${SITE_ENV:-}" | sed 's/\r$//' > .env
+            printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//' > .env
+
+            WWW_DOMAIN="www.${DOMAIN}"
             cat > docker-compose.yml <<YAML
-            version: '3.8'
             services:
               app:
                 image: ${IMAGE_REF}
@@ -76,13 +86,64 @@ jobs:
                 networks: [proxy, core_db_net]
                 labels:
                   - traefik.enable=true
-                  - traefik.http.routers.${SLUG}.rule=Host(\`${DOMAIN}\`)
+                  - traefik.docker.network=proxy
+
+                  # HTTPS router (root + www)
+                  - traefik.http.routers.${SLUG}.rule=Host(\`${DOMAIN}\`) || Host(\`${WWW_DOMAIN}\`)
                   - traefik.http.routers.${SLUG}.entrypoints=websecure
                   - traefik.http.routers.${SLUG}.tls.certresolver=le
+                  - traefik.http.routers.${SLUG}.service=${SLUG}
                   - traefik.http.services.${SLUG}.loadbalancer.server.port=${PORT}
+
+                  # HTTP -> HTTPS (no content on port 80)
+                  - traefik.http.routers.${SLUG}-http.rule=Host(\`${DOMAIN}\`) || Host(\`${WWW_DOMAIN}\`)
+                  - traefik.http.routers.${SLUG}-http.entrypoints=web
+                  - traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redirect
+                  - traefik.http.routers.${SLUG}-http.service=${SLUG}
+                  - traefik.http.middlewares.${SLUG}-redirect.redirectscheme.scheme=https
             networks:
-              proxy: { external: true }
-              core_db_net: { external: true }
+              proxy:      { external: true }
+              core_db_net:{ external: true }
             YAML
+
+            # Optional admin host over HTTPS (+ HTTP redirect)
+            if [ -n "${ADMIN_DOMAIN:-}" ]; then
+              awk -v s="${SLUG}" -v d="${ADMIN_DOMAIN}" '
+                /- traefik\.http\.services\..*loadbalancer\.server\.port=/ {
+                  print; 
+                  print "                  - traefik.http.routers." s "-admin.rule=Host(`" d "`)";
+                  print "                  - traefik.http.routers." s "-admin.entrypoints=websecure";
+                  print "                  - traefik.http.routers." s "-admin.tls.certresolver=le";
+                  print "                  - traefik.http.routers." s "-admin.service=" s;
+                  print "                  - traefik.http.routers." s "-admin-http.rule=Host(`" d "`)";
+                  print "                  - traefik.http.routers." s "-admin-http.entrypoints=web";
+                  print "                  - traefik.http.routers." s "-admin-http.middlewares=" s "-redirect";
+                  print "                  - traefik.http.routers." s "-admin-http.service=" s;
+                  next
+                } {print}
+              ' docker-compose.yml > docker-compose.tmp && mv docker-compose.tmp docker-compose.yml
+            fi
+
             docker compose pull || true
             docker compose up -d --remove-orphans
+
+            # Wait for routers to register in Traefik (local API)
+            for i in $(seq 1 60); do
+              if docker exec traefik-traefik-1 sh -lc 'apk add --no-cache curl >/dev/null 2>&1 || true; curl -sf http://127.0.0.1:8080/api/version >/dev/null'; then break; fi
+              sleep 2
+            done
+            hosts=("${DOMAIN}" "www.${DOMAIN}")
+            [ -n "${ADMIN_DOMAIN:-}" ] && hosts+=("${ADMIN_DOMAIN}")
+            for h in "${hosts[@]}"; do
+              for i in $(seq 1 60); do
+                json="$(docker exec traefik-traefik-1 sh -lc 'curl -sf http://127.0.0.1:8080/api/http/routers' || true)"
+                if printf '%s' "$json" | grep -F "Host(\`$h\`)" >/dev/null \
+                   && printf '%s' "$json" | grep -F '"entryPoints":["websecure"]' >/dev/null; then
+                  echo "✅ Router ready for $h"; break
+                fi
+                sleep 2
+              done
+            done
+
+            # Quick external health (best-effort)
+            curl -k -fsSL "https://${DOMAIN}/api/healthz" >/dev/null || true

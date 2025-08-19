@@ -41,7 +41,6 @@ jobs:
           PORT="3000"
           DOMAIN_PROD=""
           DOMAIN_ADMIN=""
-
           if [ -f ".cicd-config.yml" ]; then
             get_val(){ grep -E "^$1:" .cicd-config.yml | head -1 | awk -F': *' '{print $2}' | tr -d "\"'"; }
             SLUG=$(get_val slug || echo "$SLUG")
@@ -50,7 +49,6 @@ jobs:
             DOMAIN_PROD="$(printf '%s\n' "$DOM_BLOCK" | awk '/prod:/{print $2}' | tr -d "\"'")"
             DOMAIN_ADMIN="$(printf '%s\n' "$DOM_BLOCK" | awk '/admin:/{print $2}' | tr -d "\"'")"
           fi
-
           echo "SLUG=$SLUG" >> $GITHUB_OUTPUT
           echo "PORT=$PORT" >> $GITHUB_OUTPUT
           echo "DOMAIN_PROD=$DOMAIN_PROD" >> $GITHUB_OUTPUT
@@ -63,7 +61,6 @@ jobs:
           exit 0
 
       - name: Guard required secrets
-        if: steps.p.outputs.branch == 'main-hetz'
         run: |
           test -n "${{ secrets.HZ_HOST }}"            || { echo "❌ Missing secret: HZ_HOST"; exit 1; }
           test -n "${{ secrets.HZ_SSH_KEY }}"         || { echo "❌ Missing secret: HZ_SSH_KEY"; exit 1; }
@@ -71,7 +68,6 @@ jobs:
           test -n "${{ secrets.CF_API_TOKEN }}"       || { echo "❌ Missing secret: CF_API_TOKEN"; exit 1; }
 
       - name: Derive image coordinates
-        if: steps.p.outputs.branch == 'main-hetz'
         id: meta
         shell: bash
         run: |
@@ -83,11 +79,9 @@ jobs:
           echo "ref=$IMAGE:$SHORT" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
-        if: steps.p.outputs.branch == 'main-hetz'
         uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR (push)
-        if: steps.p.outputs.branch == 'main-hetz'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -95,7 +89,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build & push site image
-        if: steps.p.outputs.branch == 'main-hetz'
         uses: docker/build-push-action@v6
         with:
           context: site
@@ -105,7 +98,6 @@ jobs:
             ${{ steps.meta.outputs.image }}:latest
 
       - name: Compute site env secret key (multiline .env)
-        if: steps.p.outputs.branch == 'main-hetz'
         id: k
         shell: bash
         run: |
@@ -114,8 +106,7 @@ jobs:
           echo "SITE_ENV_KEY=SITE_ENV__${KEY}" >> $GITHUB_OUTPUT
           echo "Resolved env secret key: SITE_ENV__${KEY}"
 
-      - name: Deploy over SSH (Traefik + DB + app; safe env write)
-        if: steps.p.outputs.branch == 'main-hetz'
+      - name: Deploy over SSH (Traefik + DB + app; HTTPS + redirect; local API)
         uses: appleboy/ssh-action@v1
         env:
           SLUG:         ${{ steps.cfg.outputs.SLUG }}
@@ -137,7 +128,6 @@ jobs:
           command_timeout: 20m
           envs: SLUG,PORT,DOMAIN,ADMIN_DOMAIN,IMAGE_REF,SITE_ENV,GHCR_USER,GHCR_TOKEN,ACME_EMAIL,CF_API_TOKEN
           script: |
-            # POSIX sh
             set -e
 
             case "${ACME_EMAIL}" in ""|*example.com*) echo "❌ TRAEFIK_ACME_EMAIL must be a real email"; exit 1;; esac
@@ -145,11 +135,10 @@ jobs:
 
             echo "Deploying ${SLUG} → https://${DOMAIN} (image: ${IMAGE_REF})"
 
-            # --- Networks (idempotent) ---
             docker network create proxy >/dev/null 2>&1 || true
             docker network create core_db_net >/dev/null 2>&1 || true
 
-            # --- Traefik (DNS-01 via Cloudflare) ---
+            # Traefik (with local dashboard/API for CI polling)
             TDIR="/opt/services/traefik"
             mkdir -p "$TDIR/letsencrypt"
             [ -f "$TDIR/letsencrypt/acme.json" ] || install -m 600 /dev/null "$TDIR/letsencrypt/acme.json"
@@ -158,7 +147,6 @@ jobs:
             CLOUDFLARE_DNS_API_TOKEN=${CF_API_TOKEN}
             CF_DNS_API_TOKEN=${CF_API_TOKEN}
             EOF
-
             cat > "$TDIR/docker-compose.yml" <<'YAML'
             services:
               traefik:
@@ -174,9 +162,12 @@ jobs:
                   - --certificatesresolvers.le.acme.dnschallenge.provider=cloudflare
                   - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
                   - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+                  - --api.dashboard=true
+                  - --api.insecure=true
                 ports:
                   - 80:80
                   - 443:443
+                  - 127.0.0.1:8080:8080
                 volumes:
                   - /var/run/docker.sock:/var/run/docker.sock:ro
                   - ./letsencrypt:/letsencrypt
@@ -187,26 +178,20 @@ jobs:
                 name: proxy
             YAML
             (cd "$TDIR" && docker compose up -d)
-            docker logs --since=2m traefik-traefik-1 | egrep -i 'acme|lego|dns-01|certificate|error' || true
 
-            # --- GHCR login (pulls) ---
             if [ -n "${GHCR_TOKEN:-}" ]; then
               echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             fi
 
-            # --- App secrets file (avoid $ expansion) ---
             SITE_DIR="/opt/sites/${SLUG}"
             mkdir -p "$SITE_DIR"
             cd "$SITE_DIR"
             printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//' > .app-env
-            : > .env
 
-            # --- DB stack (Postgres + PgBouncer) ---
+            # DB stack
             DB_DIR="/opt/services/postgres"
             mkdir -p "$DB_DIR"
             awk -F= '/^POSTGRES_PASSWORD=/{print "POSTGRES_PASSWORD="$2}' .app-env > "${DB_DIR}/.env"
-            if [ -s "${DB_DIR}/.env" ]; then set -a; . "${DB_DIR}/.env"; set +a; fi
-
             cat > "${DB_DIR}/docker-compose.yml" <<'DBYAML'
             services:
               postgres:
@@ -225,7 +210,6 @@ jobs:
                   timeout: 5s
                   retries: 10
                 networks: [core_db_net]
-
               pgbouncer:
                 image: edoburu/pgbouncer
                 restart: always
@@ -235,18 +219,16 @@ jobs:
                   DB_PASSWORD: ${POSTGRES_PASSWORD:-change_me_now}
                   DB_HOST: postgres
                   DB_NAME: drcode
-                  AUTH_TYPE: plain
                   POOL_MODE: transaction
                   MAX_CLIENT_CONN: 200
                   DEFAULT_POOL_SIZE: 20
+                  AUTH_TYPE: plain
                 depends_on:
                   postgres:
                     condition: service_healthy
                 networks: [core_db_net]
-
             volumes:
               pg_data:
-
             networks:
               core_db_net:
                 external: true
@@ -254,14 +236,7 @@ jobs:
             DBYAML
             (cd "${DB_DIR}" && docker compose up -d)
 
-            # keep admin role in sync with current password (best effort)
-            if [ -n "${POSTGRES_PASSWORD:-}" ]; then
-              docker compose -f "${DB_DIR}/docker-compose.yml" exec -T postgres \
-                sh -lc "PGPASSWORD='${POSTGRES_PASSWORD}' psql -U admin -d postgres -v ON_ERROR_STOP=1 \
-                  -c \"ALTER ROLE admin WITH PASSWORD '${POSTGRES_PASSWORD}';\"" || true
-            fi
-
-            # --- App stack behind Traefik (HTTPS + HTTP→HTTPS redirect) ---
+            # App stack (HTTPS + HTTP→HTTPS redirect)
             WWW_DOMAIN="www.${DOMAIN}"
             cat > docker-compose.yml <<YAML
             services:
@@ -272,48 +247,37 @@ jobs:
                 labels:
                   - traefik.enable=true
                   - traefik.docker.network=proxy
-
-                  # Main site (HTTPS)
                   - traefik.http.routers.${SLUG}.rule=Host(\`${DOMAIN}\`) || Host(\`${WWW_DOMAIN}\`)
                   - traefik.http.routers.${SLUG}.entrypoints=websecure
                   - traefik.http.routers.${SLUG}.tls.certresolver=le
                   - traefik.http.routers.${SLUG}.service=${SLUG}
                   - traefik.http.services.${SLUG}.loadbalancer.server.port=${PORT}
-
-                  # Main site (HTTP -> HTTPS)
                   - traefik.http.routers.${SLUG}-http.rule=Host(\`${DOMAIN}\`) || Host(\`${WWW_DOMAIN}\`)
                   - traefik.http.routers.${SLUG}-http.entrypoints=web
-                  - traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redir
+                  - traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redirect
                   - traefik.http.routers.${SLUG}-http.service=${SLUG}
-                  - traefik.http.middlewares.${SLUG}-redir.redirectscheme.scheme=https
-                networks:
-                  - proxy
-                  - core_db_net
+                  - traefik.http.middlewares.${SLUG}-redirect.redirectscheme.scheme=https
+                networks: [proxy, core_db_net]
             networks:
-              proxy:
-                external: true
-                name: proxy
-              core_db_net:
-                external: true
-                name: core_db_net
+              proxy:      { external: true, name: proxy }
+              core_db_net:{ external: true, name: core_db_net }
             YAML
 
-            # Optional admin host (HTTPS + HTTP redirect)
+            # Optional dedicated admin host — HTTPS only + HTTP→HTTPS
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
               awk -v s="${SLUG}" -v d="${ADMIN_DOMAIN}" '
                 /- traefik\.http\.services\..*loadbalancer\.server\.port=/ {
-                  print;
+                  print; 
                   print "                  - traefik.http.routers." s "-admin.rule=Host(`" d "`)";
                   print "                  - traefik.http.routers." s "-admin.entrypoints=websecure";
                   print "                  - traefik.http.routers." s "-admin.tls.certresolver=le";
                   print "                  - traefik.http.routers." s "-admin.service=" s;
                   print "                  - traefik.http.routers." s "-admin-http.rule=Host(`" d "`)";
                   print "                  - traefik.http.routers." s "-admin-http.entrypoints=web";
-                  print "                  - traefik.http.routers." s "-admin-http.middlewares=" s "-redir";
+                  print "                  - traefik.http.routers." s "-admin-http.middlewares=" s "-redirect";
                   print "                  - traefik.http.routers." s "-admin-http.service=" s;
                   next
-                }
-                {print}
+                } {print}
               ' docker-compose.yml > docker-compose.tmp && mv docker-compose.tmp docker-compose.yml
             fi
 
@@ -323,13 +287,47 @@ jobs:
             # Prisma migrations (best-effort)
             docker compose exec -T app sh -lc "npx prisma migrate deploy || true"
 
-            # Quick routing sanity (HTTP should 301/307)
-            curl -sS -I -H "Host: ${DOMAIN}"         http://127.0.0.1 || true
-            curl -sS -I -H "Host: ${WWW_DOMAIN}"      http://127.0.0.1 || true
-            [ -n "${ADMIN_DOMAIN:-}" ] && curl -sS -I -H "Host: ${ADMIN_DOMAIN}" http://127.0.0.1 || true
+      - name: Wait for Traefik routers (HTTPS)
+        uses: appleboy/ssh-action@v1
+        env:
+          DOMAIN:       ${{ steps.cfg.outputs.DOMAIN_PROD }}
+          ADMIN_DOMAIN: ${{ steps.cfg.outputs.DOMAIN_ADMIN }}
+        with:
+          host: ${{ secrets.HZ_HOST }}
+          username: ${{ secrets.HZ_USER || 'root' }}
+          key: ${{ secrets.HZ_SSH_KEY }}
+          port: 22
+          timeout: 60s
+          command_timeout: 10m
+          envs: DOMAIN,ADMIN_DOMAIN
+          script: |
+            set -euo pipefail
+            need_hosts=()
+            [ -n "${DOMAIN:-}" ] && need_hosts+=("$DOMAIN" "www.${DOMAIN}")
+            [ -n "${ADMIN_DOMAIN:-}" ] && need_hosts+=("${ADMIN_DOMAIN}")
+            echo "Waiting for Traefik API..."
+            for i in $(seq 1 60); do
+              if docker exec traefik-traefik-1 sh -lc 'apk add --no-cache curl >/dev/null 2>&1 || true; curl -sf http://127.0.0.1:8080/api/version >/dev/null'; then
+                echo "Traefik API is up"; break
+              fi
+              echo "  api not ready ($i)"; sleep 2
+            done
+            wait_host() {
+              host="$1"; echo "→ waiting router for $host"
+              for i in $(seq 1 60); do
+                json="$(docker exec traefik-traefik-1 sh -lc 'curl -sf http://127.0.0.1:8080/api/http/routers' || true)"
+                if printf '%s' "$json" | grep -F "Host(\`$host\`)" >/dev/null \
+                   && printf '%s' "$json" | grep -F '"entryPoints":["websecure"]' >/dev/null \
+                   && printf '%s' "$json" | grep -F '"status":"enabled"' >/dev/null; then
+                  echo "✅ router ready for $host"; return 0
+                fi
+                sleep 3
+              done
+              echo "❌ timeout waiting for router $host"; printf '%s\n' "$json" | head -c 2000 || true; exit 1
+            }
+            for h in "${need_hosts[@]}"; do wait_host "$h"; done
 
       - name: In-container health check (no DNS needed)
-        if: steps.p.outputs.branch == 'main-hetz'
         uses: appleboy/ssh-action@v1
         env:
           SLUG: ${{ steps.cfg.outputs.SLUG }}
@@ -342,65 +340,66 @@ jobs:
           timeout: 60s
           command_timeout: 10m
           envs: SLUG,DOMAIN
-        # note: steps run in-order; concurrent dispatches are serialized by the concurrency.group above
           script: |
             set -e
             cd "/opt/sites/${SLUG}"
             PORT="$(docker compose exec -T app sh -lc 'printf "%s" "${PORT:-3000}"')"
             echo "Detected app PORT=$PORT"
-
             ok=0
             for path in /api/healthz /api/healthz/ /app/api/healthz /app/api/healthz/; do
               echo "Probing http://127.0.0.1:${PORT}${path}"
-              for i in 1 2 3 4 5 6 7 8 9 10; do
+              for i in {1..20}; do
                 if docker compose exec -T app node -e "const http=require('http');http.get({host:'127.0.0.1',port:${PORT},path:'${path}',headers:{'x-forwarded-proto':'https','host':'${DOMAIN:-localhost}'}},r=>process.exit(r.statusCode<400?0:1)).on('error',()=>process.exit(1))"; then
-                  echo "✅ ${path} OK"; ok=1; break
-                fi
+                  echo "✅ ${path} OK"; ok=1; break; fi
                 echo "retry $i"; sleep 3
               done
               [ "$ok" -eq 1 ] && break
             done
-
-            if [ "$ok" -ne 1 ]; then
-              echo "❌ Health failed. Recent app logs:"
-              docker compose logs --no-color --tail=200 app || true
-              exit 1
-            fi
-
+            [ "$ok" -eq 1 ] || { echo "❌ Internal health failed"; docker compose logs --no-color --tail=200 app || true; exit 1; }
             echo "✅ App healthy inside container"
 
       - name: Public health check (through Traefik/Cloudflare)
-        if: steps.p.outputs.branch == 'main-hetz'
+        env:
+          DOMAIN: ${{ steps.cfg.outputs.DOMAIN_PROD }}
         run: |
           set -e
-          dom="${{ steps.cfg.outputs.DOMAIN_PROD }}"
-          adm="${{ steps.cfg.outputs.DOMAIN_ADMIN }}"
-          [ -n "$dom" ] || { echo "❌ DOMAIN_PROD not set in .cicd-config.yml"; exit 1; }
-
+          urls=("https://${DOMAIN}/api/healthz" "https://${DOMAIN}/api/healthz/")
           ok=0
-          try_domain () {
-            host="$1"
-            for path in /api/healthz /api/healthz/ /; do
-              for i in {1..24}; do
-                code=$(curl -k -sS -o /tmp/body.$$ -w "%{http_code}" "https://${host}${path}")
-                if [[ "$code" =~ ^(200|204|301|302|307|308)$ ]]; then
-                  echo "✅ Public ${host}${path} OK ($code)"; ok=1; return 0
-                fi
-                echo "retry $i (got $code on ${host}${path})"; sleep 5
-              done
+          for i in {1..48}; do
+            for u in "${urls[@]}"; do
+              code=$(curl -k -L -sS -D >(tee /dev/stderr) -o /tmp/health_body -w "%{http_code}" "$u" || true)
+              echo "GET $u -> HTTP $code"
+              if [[ "$code" =~ ^(200|204|301|302|307|308)$ ]]; then
+                echo "✅ Public health OK ($code) at $u"; ok=1; break
+              fi
+              if grep -q "404 page not found" /tmp/health_body 2>/dev/null; then
+                echo "Traefik 404 (router warming or path) — retrying…"
+              else
+                echo "Body (first 200 bytes):"; head -c 200 /tmp/health_body || true; echo
+              fi
             done
-            return 1
-          }
+            [ $ok -eq 1 ] && break
+            sleep 5
+          done
+          [ $ok -eq 1 ] || { echo "❌ Public health failed"; exit 1; }
 
-          try_domain "$dom" || true
-          if [ $ok -ne 1 ] && [ -n "$adm" ]; then
-            try_domain "$adm" || true
-          fi
-
-          if [ $ok -ne 1 ]; then
-            echo "---- Body sample ----"
-            head -c 400 /tmp/body.$$ || true
-            echo
-            echo "❌ Public healthcheck failed"
-            exit 1
-          fi
+      - name: Diagnostics (only on failure)
+        if: failure()
+        uses: appleboy/ssh-action@v1
+        env:
+          SLUG:   ${{ steps.cfg.outputs.SLUG }}
+          DOMAIN: ${{ steps.cfg.outputs.DOMAIN_PROD }}
+        with:
+          host: ${{ secrets.HZ_HOST }}
+          username: ${{ secrets.HZ_USER || 'root' }}
+          key: ${{ secrets.HZ_SSH_KEY }}
+          port: 22
+          timeout: 60s
+          command_timeout: 15m
+          envs: SLUG,DOMAIN
+          script: |
+            set -euo pipefail
+            echo "== Traefik recent logs =="; docker logs --since=5m traefik-traefik-1 | tail -n 300 || true
+            echo; echo "== Routers (API) =="; docker exec traefik-traefik-1 sh -lc 'apk add --no-cache curl jq >/dev/null 2>&1 || true; curl -sf http://127.0.0.1:8080/api/http/routers | jq "[ .[] | {name,rule,entryPoints,status} ]"' || true
+            echo; echo "== Services (API) =="; docker exec traefik-traefik-1 sh -lc 'curl -sf http://127.0.0.1:8080/api/http/services | jq "[ .[] | {name,type,usedBy} ]"' || true
+            echo; echo "== App logs (last 200) =="; cd /opt/sites/${SLUG}; docker compose logs --no-color --tail=200 app || true
