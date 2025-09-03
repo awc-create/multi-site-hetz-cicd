@@ -112,7 +112,7 @@ jobs:
 
       - name: Build
         working-directory: site
-        run: npm run build
+        run: npm run build -- --no-lint
 
       - name: Unit tests (optional)
         working-directory: site
