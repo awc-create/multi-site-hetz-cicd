@@ -94,19 +94,6 @@ jobs:
           ref: ${{ needs.detect.outputs.branch }}
           path: site
 
-      - name: Select Vercel IDs for this site
-        run: |
-          case "${{ needs.detect.outputs.repository_name }}" in
-            drcodezenna)
-              echo "VERCEL_ORG_ID=${{ secrets.DRCODEZENNA_VERCEL_ORG_ID }}" >> $GITHUB_ENV
-              echo "VERCEL_PROJECT_ID=${{ secrets.DRCODEZENNA_VERCEL_PROJECT_ID }}" >> $GITHUB_ENV
-              ;;
-            *)
-              echo "VERCEL_ORG_ID=" >> $GITHUB_ENV
-              echo "VERCEL_PROJECT_ID=" >> $GITHUB_ENV
-              ;;
-          esac
-
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -156,22 +143,56 @@ jobs:
           repository: ${{ needs.detect.outputs.repository }}
           ref: ${{ needs.detect.outputs.branch }}
           path: site
+
+      # === Dynamic SITE_ENV loader & Vercel ID export ===
+      - name: Derive REPO_KEY (UPPERCASE, '-' -> '_')
+        id: repokey
+        run: |
+          NAME="${{ needs.detect.outputs.repository_name }}"
+          KEY_UPPER="$(echo "$NAME" | tr '[:lower:]-' '[:upper:]_')"
+          echo "KEY_UPPER=$KEY_UPPER" >> $GITHUB_OUTPUT
+
+      - name: Load SITE_ENV__{REPO_KEY} and export Vercel IDs
+        env:
+          SITE_ENV: ${{ secrets[format('SITE_ENV__{0}', steps.repokey.outputs.KEY_UPPER)] }}
+        working-directory: site
+        run: |
+          [ -n "${SITE_ENV:-}" ] || { echo "❌ Missing secret SITE_ENV__${{ steps.repokey.outputs.KEY_UPPER }}"; exit 1; }
+          printf "%s\n" "$SITE_ENV" | sed 's/\r$//' > .site_env
+          ORG="$(awk -F= '/^VERCEL_ORG_ID=/{print $2}' .site_env | tail -1)"
+          PRJ="$(awk -F= '/^VERCEL_PROJECT_ID=/{print $2}' .site_env | tail -1)"
+
+          if [ -z "$ORG" ] || [ -z "$PRJ" ]; then
+            echo "ℹ️ Vercel IDs not found in SITE_ENV; trying .vercel/project.json"
+            if [ -f ".vercel/project.json" ]; then
+              ORG="$(jq -r '.orgId' .vercel/project.json)"
+              PRJ="$(jq -r '.projectId' .vercel/project.json)"
+            fi
+          fi
+
+          [ -n "$ORG" ] && echo "VERCEL_ORG_ID=$ORG" >> $GITHUB_ENV || { echo "❌ VERCEL_ORG_ID missing"; exit 1; }
+          [ -n "$PRJ" ] && echo "VERCEL_PROJECT_ID=$PRJ" >> $GITHUB_ENV || { echo "❌ VERCEL_PROJECT_ID missing"; exit 1; }
+
       - name: Guard Vercel secrets
         id: guard
         run: |
           if [ -z "${{ env.VERCEL_TOKEN }}" ] || [ -z "${{ env.VERCEL_ORG_ID }}" ] || [ -z "${{ env.VERCEL_PROJECT_ID }}" ]; then
             echo "SKIP=1" >> $GITHUB_ENV
-            echo "⚠️ Missing Vercel secrets; skipping Vercel preview."
+            echo "⚠️ Missing Vercel token/org/project; skipping Vercel preview."
           fi
+
       - if: env.SKIP != '1'
         working-directory: site
         run: npm i -g vercel
+
       - if: env.SKIP != '1'
         working-directory: site
         run: vercel pull --yes --environment=preview --token="${{ env.VERCEL_TOKEN }}" --scope="$VERCEL_ORG_ID"
+
       - if: env.SKIP != '1'
         working-directory: site
         run: vercel build --token="${{ env.VERCEL_TOKEN }}"
+
       - if: env.SKIP != '1'
         working-directory: site
         run: vercel deploy --prebuilt --token="${{ env.VERCEL_TOKEN }}"
@@ -188,22 +209,53 @@ jobs:
           repository: ${{ needs.detect.outputs.repository }}
           ref: ${{ needs.detect.outputs.branch }}
           path: site
+
+      # === Dynamic SITE_ENV loader & Vercel ID export ===
+      - name: Derive REPO_KEY (UPPERCASE, '-' -> '_')
+        id: repokey
+        run: |
+          NAME="${{ needs.detect.outputs.repository_name }}"
+          KEY_UPPER="$(echo "$NAME" | tr '[:lower:]-' '[:upper:]_')"
+          echo "KEY_UPPER=$KEY_UPPER" >> $GITHUB_OUTPUT
+
+      - name: Load SITE_ENV__{REPO_KEY} and export Vercel IDs
+        env:
+          SITE_ENV: ${{ secrets[format('SITE_ENV__{0}', steps.repokey.outputs.KEY_UPPER)] }}
+        working-directory: site
+        run: |
+          [ -n "${SITE_ENV:-}" ] || { echo "❌ Missing secret SITE_ENV__${{ steps.repokey.outputs.KEY_UPPER }}"; exit 1; }
+          printf "%s\n" "$SITE_ENV" | sed 's/\r$//' > .site_env
+          ORG="$(awk -F= '/^VERCEL_ORG_ID=/{print $2}' .site_env | tail -1)"
+          PRJ="$(awk -F= '/^VERCEL_PROJECT_ID=/{print $2}' .site_env | tail -1)"
+          if [ -z "$ORG" ] || [ -z "$PRJ" ]; then
+            if [ -f ".vercel/project.json" ]; then
+              ORG="$(jq -r '.orgId' .vercel/project.json)"
+              PRJ="$(jq -r '.projectId' .vercel/project.json)"
+            fi
+          fi
+          [ -n "$ORG" ] && echo "VERCEL_ORG_ID=$ORG" >> $GITHUB_ENV || { echo "❌ VERCEL_ORG_ID missing"; exit 1; }
+          [ -n "$PRJ" ] && echo "VERCEL_PROJECT_ID=$PRJ" >> $GITHUB_ENV || { echo "❌ VERCEL_PROJECT_ID missing"; exit 1; }
+
       - name: Guard Vercel secrets
         id: guard
         run: |
           if [ -z "${{ env.VERCEL_TOKEN }}" ] || [ -z "${{ env.VERCEL_ORG_ID }}" ] || [ -z "${{ env.VERCEL_PROJECT_ID }}" ]; then
             echo "SKIP=1" >> $GITHUB_ENV
-            echo "⚠️ Missing Vercel secrets; skipping Vercel prod."
+            echo "⚠️ Missing Vercel token/org/project; skipping Vercel prod."
           fi
+
       - if: env.SKIP != '1'
         working-directory: site
         run: npm i -g vercel
+
       - if: env.SKIP != '1'
         working-directory: site
         run: vercel pull --yes --environment=production --token="${{ env.VERCEL_TOKEN }}" --scope="$VERCEL_ORG_ID"
+
       - if: env.SKIP != '1'
         working-directory: site
         run: vercel build --prod --token="${{ env.VERCEL_TOKEN }}"
+
       - if: env.SKIP != '1'
         working-directory: site
         run: vercel deploy --prebuilt --prod --token="${{ env.VERCEL_TOKEN }}"
@@ -277,25 +329,23 @@ jobs:
     if: needs.detect.outputs.project_type == 'node' && needs.detect.outputs.branch == 'main-hetz'
     runs-on: ubuntu-latest
     steps:
-      - name: Map SITE_ENV secret to env (per repo)
-        id: siteenv
-        env:
-          REPO: ${{ needs.detect.outputs.repository_name }}
-          SITE_ENV__DRCODEZENNA: ${{ secrets.SITE_ENV__DRCODEZENNA }}
-          SITE_ENV_PrinceFoods:  ${{ secrets.SITE_ENV_PrinceFoods }}
+      - name: Derive REPO_KEY (UPPERCASE, '-' -> '_')
+        id: repokey
         run: |
-          case "$REPO" in
-            drcodezenna)  SECRET="$SITE_ENV__DRCODEZENNA" ;;
-            PrinceFoods|princefoods|prince-foods) SECRET="$SITE_ENV_PrinceFoods" ;;
-            *) echo "❌ No SITE_ENV secret mapping for repo '$REPO'"; exit 1 ;;
-          esac
-          [ -n "${SECRET:-}" ] || { echo "❌ SITE_ENV for $REPO is empty"; exit 1; }
+          NAME="${{ needs.detect.outputs.repository_name }}"
+          KEY_UPPER="$(echo "$NAME" | tr '[:lower:]-' '[:upper:]_')"
+          echo "KEY_UPPER=$KEY_UPPER" >> $GITHUB_OUTPUT
+
+      - name: Load SITE_ENV__{REPO_KEY} to env
+        env:
+          SITE_ENV_SECRET: ${{ secrets[format('SITE_ENV__{0}', steps.repokey.outputs.KEY_UPPER)] }}
+        run: |
+          [ -n "${SITE_ENV_SECRET:-}" ] || { echo "❌ Missing secret SITE_ENV__${{ steps.repokey.outputs.KEY_UPPER }}"; exit 1; }
           {
             echo 'SITE_ENV<<EOF'
-            printf '%s\n' "$SECRET"
+            printf '%s\n' "$SITE_ENV_SECRET"
             echo 'EOF'
           } >> "$GITHUB_ENV"
-          echo "mapped=1" >> $GITHUB_OUTPUT
 
       - name: Sanity check required SSH secrets
         env:
@@ -331,7 +381,6 @@ jobs:
             docker network create proxy >/dev/null 2>&1 || true
             docker network create core_db_net >/dev/null 2>&1 || true
 
-            # Traefik with Cloudflare DNS-01 (secrets come from SITE_ENV)
             SITE_ENV_NORM="$(printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//')"
             ACME_EMAIL="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^ACME_EMAIL=/{print $2}' | tail -1)"
             CF_API_TOKEN="$(
@@ -381,12 +430,10 @@ jobs:
             YAML
             (cd "$TDIR" && docker compose up -d)
 
-            # GHCR login for pulls
             if [ -n "${GHCR_TOKEN:-}" ]; then
               echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             fi
 
-            # App env & DB stack
             SITE_DIR="/opt/sites/${SLUG}"
             mkdir -p "$SITE_DIR"
             cd "$SITE_DIR"
@@ -444,7 +491,6 @@ jobs:
             DBYAML
             (cd "${DB_DIR}" && docker compose up -d)
 
-            # Compose (single file). We write two variants to avoid YAML surgery.
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
               cat > docker-compose.yml <<YAML
             services:
@@ -455,21 +501,15 @@ jobs:
                 labels:
                   - traefik.enable=true
                   - traefik.docker.network=proxy
-
-                  # Main site (HTTPS)
                   - traefik.http.routers.${SLUG}.rule=Host(\`${DOMAIN}\`) || Host(\`www.${DOMAIN}\`)
                   - traefik.http.routers.${SLUG}.entrypoints=websecure
                   - traefik.http.routers.${SLUG}.tls.certresolver=le
                   - traefik.http.routers.${SLUG}.service=${SLUG}
                   - traefik.http.services.${SLUG}.loadbalancer.server.port=${PORT}
-
-                  # Admin host (HTTPS)
                   - traefik.http.routers.${SLUG}-admin.rule=Host(\`${ADMIN_DOMAIN}\`)
                   - traefik.http.routers.${SLUG}-admin.entrypoints=websecure
                   - traefik.http.routers.${SLUG}-admin.tls.certresolver=le
                   - traefik.http.routers.${SLUG}-admin.service=${SLUG}
-
-                  # HTTP -> HTTPS (no content on 80)
                   - traefik.http.routers.${SLUG}-http.rule=Host(\`${DOMAIN}\`) || Host(\`www.${DOMAIN}\`)
                   - traefik.http.routers.${SLUG}-http.entrypoints=web
                   - traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redirect
@@ -494,15 +534,11 @@ jobs:
                 labels:
                   - traefik.enable=true
                   - traefik.docker.network=proxy
-
-                  # Main site (HTTPS)
                   - traefik.http.routers.${SLUG}.rule=Host(\`${DOMAIN}\`) || Host(\`www.${DOMAIN}\`)
                   - traefik.http.routers.${SLUG}.entrypoints=websecure
                   - traefik.http.routers.${SLUG}.tls.certresolver=le
                   - traefik.http.routers.${SLUG}.service=${SLUG}
                   - traefik.http.services.${SLUG}.loadbalancer.server.port=${PORT}
-
-                  # HTTP -> HTTPS (no content on 80)
                   - traefik.http.routers.${SLUG}-http.rule=Host(\`${DOMAIN}\`) || Host(\`www.${DOMAIN}\`)
                   - traefik.http.routers.${SLUG}-http.entrypoints=web
                   - traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redirect
@@ -519,11 +555,8 @@ jobs:
             YAML
             fi
 
-            # Bring up
             docker compose pull || true
             docker compose up -d --remove-orphans
-
-            # Prisma migrations (best-effort)
             docker compose exec -T app sh -lc "npx prisma migrate deploy || true"
 
       - name: In-container health check (bypasses DNS/SSL)
@@ -732,7 +765,7 @@ jobs:
       - name: Static public check
         run: |
           for i in {1..36}; do
-            if curl -fsSL "https://${{ needs.detect.outputs.domain_prod }}/" >/dev/null; then
+            if curl -fsSL "https://${{ needs.detect.outputs.domain_prod }}/" >/devnull; then
               echo "✅ Site up"; exit 0; fi
             echo "retry $i"; sleep 5
           done
