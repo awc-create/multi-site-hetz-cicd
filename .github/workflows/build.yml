@@ -110,6 +110,29 @@ jobs:
           if [ -f package.json ] && jq -e '.scripts.lint' package.json >/dev/null 2>&1; then \
             npm run lint || true; else echo "no lint script"; fi
 
+      # ⬇⬇⬇ NEW: load env into .env BEFORE build so Prisma/Resend work at build time
+      - name: Derive REPO_KEY (UPPERCASE, '-' -> '_')
+        id: repokey
+        run: |
+          NAME="${{ needs.detect.outputs.repository_name }}"
+          KEY_UPPER="$(echo "$NAME" | tr '[:lower:]-' '[:upper:]_')"
+          echo "KEY_UPPER=$KEY_UPPER" >> $GITHUB_OUTPUT
+
+      - name: Load SITE_ENV__{REPO_KEY} into .env for build
+        env:
+          SITE_ENV: ${{ secrets[format('SITE_ENV__{0}', steps.repokey.outputs.KEY_UPPER)] }}
+        working-directory: site
+        run: |
+          [ -n "${SITE_ENV:-}" ] || { echo "❌ Missing secret SITE_ENV__${{ steps.repokey.outputs.KEY_UPPER }}"; exit 1; }
+          printf "%s\n" "$SITE_ENV" | sed 's/\r$//' > .env
+          # hard-guard critical vars used by Prisma/Resend
+          grep -q '^DATABASE_URL=' .env        || { echo "❌ DATABASE_URL missing"; exit 1; }
+          # DIRECT_DATABASE_URL is optional
+          if ! grep -q '^RESEND_API_KEY=' .env; then
+            echo "⚠️ RESEND_API_KEY missing (email features may be disabled during build)"
+          fi
+      # ⬆⬆⬆ NEW
+
       - name: Build
         working-directory: site
         run: npm run build -- --no-lint
@@ -157,12 +180,10 @@ jobs:
         run: |
           [ -n "${SITE_ENV:-}" ] || { echo "❌ Missing secret SITE_ENV__${{ steps.repokey.outputs.KEY_UPPER }}"; exit 1; }
           printf "%s\n" "$SITE_ENV" | sed 's/\r$//' > .site_env
-          # Prefer uppercase keys; fallback to lowercase project.json-like keys
           ORG="$(awk -F= '/^VERCEL_ORG_ID=/{print $2}' .site_env | tail -1)"
           PRJ="$(awk -F= '/^VERCEL_PROJECT_ID=/{print $2}' .site_env | tail -1)"
           [ -n "$ORG" ] || ORG="$(awk -F= '/^orgId=/{print $2}' .site_env | tail -1)"
           [ -n "$PRJ" ] || PRJ="$(awk -F= '/^projectId=/{print $2}' .site_env | tail -1)"
-
           if [ -z "$ORG" ] || [ -z "$PRJ" ]; then
             echo "ℹ️ Vercel IDs not found in SITE_ENV; trying .vercel/project.json"
             if [ -f ".vercel/project.json" ]; then
@@ -170,17 +191,11 @@ jobs:
               PRJ="$(jq -r '.projectId' .vercel/project.json)"
             fi
           fi
-
           [ -n "$ORG" ] && echo "VERCEL_ORG_ID=$ORG" >> $GITHUB_ENV || { echo "❌ VERCEL_ORG_ID missing"; exit 1; }
           [ -n "$PRJ" ] && echo "VERCEL_PROJECT_ID=$PRJ" >> $GITHUB_ENV || { echo "❌ VERCEL_PROJECT_ID missing"; exit 1; }
 
-      - name: Guard Vercel secrets
-        id: guard
-        run: |
-          if [ -z "${{ env.VERCEL_TOKEN }}" ] || [ -z "${{ env.VERCEL_ORG_ID }}" ] || [ -z "${{ env.VERCEL_PROJECT_ID }}" ]; then
-            echo "SKIP=1" >> $GITHUB_ENV
-            echo "⚠️ Missing Vercel token/org/project; skipping Vercel preview."
-          fi
+      - if: env.VERCEL_TOKEN == ''
+        run: echo "⚠️ Missing Vercel token/org/project; skipping Vercel preview." && echo "SKIP=1" >> $GITHUB_ENV
 
       - if: env.SKIP != '1'
         working-directory: site
@@ -238,13 +253,8 @@ jobs:
           [ -n "$ORG" ] && echo "VERCEL_ORG_ID=$ORG" >> $GITHUB_ENV || { echo "❌ VERCEL_ORG_ID missing"; exit 1; }
           [ -n "$PRJ" ] && echo "VERCEL_PROJECT_ID=$PRJ" >> $GITHUB_ENV || { echo "❌ VERCEL_PROJECT_ID missing"; exit 1; }
 
-      - name: Guard Vercel secrets
-        id: guard
-        run: |
-          if [ -z "${{ env.VERCEL_TOKEN }}" ] || [ -z "${{ env.VERCEL_ORG_ID }}" ] || [ -z "${{ env.VERCEL_PROJECT_ID }}" ]; then
-            echo "SKIP=1" >> $GITHUB_ENV
-            echo "⚠️ Missing Vercel token/org/project; skipping Vercel prod."
-          fi
+      - if: env.VERCEL_TOKEN == ''
+        run: echo "⚠️ Missing Vercel token/org/project; skipping Vercel prod." && echo "SKIP=1" >> $GITHUB_ENV
 
       - if: env.SKIP != '1'
         working-directory: site
@@ -397,7 +407,7 @@ jobs:
             POSTGRES_PASSWORD_VAL="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^POSTGRES_PASSWORD=/{print $2}' | tail -1)"
             [ -n "$POSTGRES_PASSWORD_VAL" ] || { echo "❌ POSTGRES_PASSWORD missing in SITE_ENV"; exit 1; }
 
-            # === Traefik (HTTP-01, no Cloudflare needed) ===
+            # === Traefik
             TDIR="/opt/services/traefik"
             mkdir -p "$TDIR/letsencrypt"
             [ -f "$TDIR/letsencrypt/acme.json" ] || install -m 600 /dev/null "$TDIR/letsencrypt/acme.json"
