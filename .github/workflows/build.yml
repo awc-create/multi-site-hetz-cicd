@@ -97,6 +97,10 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
+      - name: Clean npm lock (use Yarn only)
+        working-directory: site
+        run: rm -f package-lock.json
+
       - name: Install deps
         working-directory: site
         run: |
@@ -110,7 +114,7 @@ jobs:
           if [ -f package.json ] && jq -e '.scripts.lint' package.json >/dev/null 2>&1; then \
             npm run lint || true; else echo "no lint script"; fi
 
-      # ⬇⬇⬇ NEW: load env into .env BEFORE build so Prisma/Resend work at build time
+      # Load env to .env so Next/Prisma/Resend have vars at build time
       - name: Derive REPO_KEY (UPPERCASE, '-' -> '_')
         id: repokey
         run: |
@@ -125,13 +129,14 @@ jobs:
         run: |
           [ -n "${SITE_ENV:-}" ] || { echo "❌ Missing secret SITE_ENV__${{ steps.repokey.outputs.KEY_UPPER }}"; exit 1; }
           printf "%s\n" "$SITE_ENV" | sed 's/\r$//' > .env
-          # hard-guard critical vars used by Prisma/Resend
-          grep -q '^DATABASE_URL=' .env        || { echo "❌ DATABASE_URL missing"; exit 1; }
-          # DIRECT_DATABASE_URL is optional
+          grep -q '^DATABASE_URL=' .env || { echo "❌ DATABASE_URL missing"; exit 1; }
           if ! grep -q '^RESEND_API_KEY=' .env; then
             echo "⚠️ RESEND_API_KEY missing (email features may be disabled during build)"
           fi
-      # ⬆⬆⬆ NEW
+
+      - name: Prisma generate (for Next build)
+        working-directory: site
+        run: npx prisma generate
 
       - name: Build
         working-directory: site
@@ -184,26 +189,24 @@ jobs:
           PRJ="$(awk -F= '/^VERCEL_PROJECT_ID=/{print $2}' .site_env | tail -1)"
           [ -n "$ORG" ] || ORG="$(awk -F= '/^orgId=/{print $2}' .site_env | tail -1)"
           [ -n "$PRJ" ] || PRJ="$(awk -F= '/^projectId=/{print $2}' .site_env | tail -1)"
-          if [ -z "$ORG" ] || [ -z "$PRJ" ]; then
-            echo "ℹ️ Vercel IDs not found in SITE_ENV; trying .vercel/project.json"
-            if [ -f ".vercel/project.json" ]; then
-              ORG="$(jq -r '.orgId' .vercel/project.json)"
-              PRJ="$(jq -r '.projectId' .vercel/project.json)"
-            fi
-          fi
           [ -n "$ORG" ] && echo "VERCEL_ORG_ID=$ORG" >> $GITHUB_ENV || { echo "❌ VERCEL_ORG_ID missing"; exit 1; }
           [ -n "$PRJ" ] && echo "VERCEL_PROJECT_ID=$PRJ" >> $GITHUB_ENV || { echo "❌ VERCEL_PROJECT_ID missing"; exit 1; }
 
       - if: env.VERCEL_TOKEN == ''
-        run: echo "⚠️ Missing Vercel token/org/project; skipping Vercel preview." && echo "SKIP=1" >> $GITHUB_ENV
+        run: echo "⚠️ Missing Vercel token; skipping Vercel preview." && echo "SKIP=1" >> $GITHUB_ENV
 
       - if: env.SKIP != '1'
         working-directory: site
         run: npm i -g vercel
 
+      # Important: remove --scope (it expects the team slug, not the orgId)
       - if: env.SKIP != '1'
         working-directory: site
-        run: vercel pull --yes --environment=preview --token="${{ env.VERCEL_TOKEN }}" --scope="$VERCEL_ORG_ID"
+        run: vercel pull --yes --environment=preview --token="${{ env.VERCEL_TOKEN }}"
+
+      - if: env.SKIP != '1'
+        working-directory: site
+        run: npx prisma generate
 
       - if: env.SKIP != '1'
         working-directory: site
@@ -244,25 +247,24 @@ jobs:
           PRJ="$(awk -F= '/^VERCEL_PROJECT_ID=/{print $2}' .site_env | tail -1)"
           [ -n "$ORG" ] || ORG="$(awk -F= '/^orgId=/{print $2}' .site_env | tail -1)"
           [ -n "$PRJ" ] || PRJ="$(awk -F= '/^projectId=/{print $2}' .site_env | tail -1)"
-          if [ -z "$ORG" ] || [ -z "$PRJ" ]; then
-            if [ -f ".vercel/project.json" ]; then
-              ORG="$(jq -r '.orgId' .vercel/project.json)"
-              PRJ="$(jq -r '.projectId' .vercel/project.json)"
-            fi
-          fi
           [ -n "$ORG" ] && echo "VERCEL_ORG_ID=$ORG" >> $GITHUB_ENV || { echo "❌ VERCEL_ORG_ID missing"; exit 1; }
           [ -n "$PRJ" ] && echo "VERCEL_PROJECT_ID=$PRJ" >> $GITHUB_ENV || { echo "❌ VERCEL_PROJECT_ID missing"; exit 1; }
 
       - if: env.VERCEL_TOKEN == ''
-        run: echo "⚠️ Missing Vercel token/org/project; skipping Vercel prod." && echo "SKIP=1" >> $GITHUB_ENV
+        run: echo "⚠️ Missing Vercel token; skipping Vercel prod." && echo "SKIP=1" >> $GITHUB_ENV
 
       - if: env.SKIP != '1'
         working-directory: site
         run: npm i -g vercel
 
+      # Important: remove --scope (it expects the team slug, not the orgId)
       - if: env.SKIP != '1'
         working-directory: site
-        run: vercel pull --yes --environment=production --token="${{ env.VERCEL_TOKEN }}" --scope="$VERCEL_ORG_ID"
+        run: vercel pull --yes --environment=production --token="${{ env.VERCEL_TOKEN }}"
+
+      - if: env.SKIP != '1'
+        working-directory: site
+        run: npx prisma generate
 
       - if: env.SKIP != '1'
         working-directory: site
@@ -395,11 +397,9 @@ jobs:
 
             SITE_ENV_NORM="$(printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//')"
 
-            # === ACME email (required) ===
             ACME_EMAIL="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^ACME_EMAIL=/{print $2}' | tail -1)"
             [ -n "$ACME_EMAIL" ] || { echo "❌ ACME_EMAIL missing in SITE_ENV"; exit 1; }
 
-            # === Dynamic DB name & password from env ===
             DB_NAME="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^POSTGRES_DB=/{print $2}' | tail -1)"
             [ -n "$DB_NAME" ] || DB_NAME="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^DB_NAME=/{print $2}' | tail -1)"
             [ -n "$DB_NAME" ] || DB_NAME="princefoods"
@@ -407,7 +407,6 @@ jobs:
             POSTGRES_PASSWORD_VAL="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^POSTGRES_PASSWORD=/{print $2}' | tail -1)"
             [ -n "$POSTGRES_PASSWORD_VAL" ] || { echo "❌ POSTGRES_PASSWORD missing in SITE_ENV"; exit 1; }
 
-            # === Traefik
             TDIR="/opt/services/traefik"
             mkdir -p "$TDIR/letsencrypt"
             [ -f "$TDIR/letsencrypt/acme.json" ] || install -m 600 /dev/null "$TDIR/letsencrypt/acme.json"
@@ -443,18 +442,15 @@ jobs:
             YAML
             (cd "$TDIR" && docker compose up -d)
 
-            # === GHCR login for pulls ===
             if [ -n "${GHCR_TOKEN:-}" ]; then
               echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             fi
 
-            # === App env ===
             SITE_DIR="/opt/sites/${SLUG}"
             mkdir -p "$SITE_DIR"
             cd "$SITE_DIR"
             printf "%s\n" "$SITE_ENV_NORM" > app.env
 
-            # === DB stack (dynamic) ===
             DB_DIR="/opt/services/postgres"
             mkdir -p "$DB_DIR"
             cat > "${DB_DIR}/.env" <<EOF
@@ -508,7 +504,6 @@ jobs:
             DBYAML
             (cd "${DB_DIR}" && docker compose up -d)
 
-            # === App compose (HTTPS + redirect; optional admin host) ===
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
               cat > docker-compose.yml <<YAML
             services:
@@ -519,21 +514,15 @@ jobs:
                 labels:
                   - traefik.enable=true
                   - traefik.docker.network=proxy
-
-                  # Main site (HTTPS)
                   - traefik.http.routers.${SLUG}.rule=Host(\`${DOMAIN}\`) || Host(\`www.${DOMAIN}\`)
                   - traefik.http.routers.${SLUG}.entrypoints=websecure
                   - traefik.http.routers.${SLUG}.tls.certresolver=le
                   - traefik.http.routers.${SLUG}.service=${SLUG}
                   - traefik.http.services.${SLUG}.loadbalancer.server.port=${PORT}
-
-                  # Admin host (HTTPS)
                   - traefik.http.routers.${SLUG}-admin.rule=Host(\`${ADMIN_DOMAIN}\`)
                   - traefik.http.routers.${SLUG}-admin.entrypoints=websecure
                   - traefik.http.routers.${SLUG}-admin.tls.certresolver=le
                   - traefik.http.routers.${SLUG}-admin.service=${SLUG}
-
-                  # HTTP -> HTTPS
                   - traefik.http.routers.${SLUG}-http.rule=Host(\`${DOMAIN}\`) || Host(\`www.${DOMAIN}\`)
                   - traefik.http.routers.${SLUG}-http.entrypoints=web
                   - traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redirect
@@ -554,15 +543,11 @@ jobs:
                 labels:
                   - traefik.enable=true
                   - traefik.docker.network=proxy
-
-                  # Main site (HTTPS)
                   - traefik.http.routers.${SLUG}.rule=Host(\`${DOMAIN}\`) || Host(\`www.${DOMAIN}\`)
                   - traefik.http.routers.${SLUG}.entrypoints=websecure
                   - traefik.http.routers.${SLUG}.tls.certresolver=le
                   - traefik.http.routers.${SLUG}.service=${SLUG}
                   - traefik.http.services.${SLUG}.loadbalancer.server.port=${PORT}
-
-                  # HTTP -> HTTPS
                   - traefik.http.routers.${SLUG}-http.rule=Host(\`${DOMAIN}\`) || Host(\`www.${DOMAIN}\`)
                   - traefik.http.routers.${SLUG}-http.entrypoints=web
                   - traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redirect
@@ -575,7 +560,6 @@ jobs:
             YAML
             fi
 
-            # Bring up & run migrations
             docker compose pull || true
             docker compose up -d --remove-orphans
             docker compose exec -T app sh -lc "npx prisma migrate deploy || true"
@@ -647,43 +631,6 @@ jobs:
             sleep 5
           done
           [ $ok -eq 1 ] || { echo "❌ Public health failed"; exit 1; }
-
-      - name: Diagnostics (only on failure)
-        if: failure()
-        uses: appleboy/ssh-action@v1
-        env:
-          SLUG:   ${{ needs.detect.outputs.slug }}
-          DOMAIN: ${{ needs.detect.outputs.domain_prod }}
-        with:
-          host: ${{ secrets.HZ_HOST }}
-          username: ${{ secrets.HZ_USER || 'root' }}
-          key: ${{ secrets.HZ_SSH_KEY }}
-          port: 22
-          timeout: 60s
-          command_timeout: 15m
-          envs: SLUG,DOMAIN
-          script: |
-            set -euo pipefail
-            echo "== Traefik recent logs =="
-            docker logs --since=5m traefik-traefik-1 | tail -n 300 || true
-
-            echo; echo "== Routers & services snapshot =="
-            docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
-            echo; docker inspect traefik-traefik-1 | grep -A2 -B2 '"entryPoints"' | head -n 100 || true
-
-            echo; echo "== Curl from Traefik to app (proxy network) =="
-            APP_CTN=$(docker ps --format '{{.Names}}' | grep -E '(_app_1|app-1)$' | head -1 || true)
-            if [ -n "${APP_CTN:-}" ]; then
-              APP_IP=$(docker inspect -f '{{ (index .NetworkSettings.Networks "proxy").IPAddress }}' "$APP_CTN" || true)
-              echo "APP_CTN=$APP_CTN APP_IP=$APP_IP"
-              docker exec traefik-traefik-1 sh -lc "apk add --no-cache curl >/dev/null 2>&1 || true; curl -svm 5 http://$APP_IP:$(docker inspect -f '{{ index .Config.Env }}' \"$APP_CTN\" | tr ' ' '\n' | awk -F= '/^PORT=/{print $2;f=1} END{if(!f)print 3000}')/api/healthz || true"
-            else
-              echo "App container not found."
-            fi
-
-            echo; echo "== App logs (last 200) =="
-            cd /opt/sites/${SLUG}
-            docker compose logs --no-color --tail=200 app || true
 
   hetzner_static:
     needs: [detect, build_test]
