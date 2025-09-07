@@ -122,6 +122,9 @@ jobs:
           KEY_UPPER="$(echo "$NAME" | tr '[:lower:]-' '[:upper:]_')"
           echo "KEY_UPPER=$KEY_UPPER" >> $GITHUB_OUTPUT
 
+      - name: Debug derived key
+        run: echo "REPO_KEY=${{ steps.repokey.outputs.KEY_UPPER }}"
+
       - name: Load SITE_ENV__{REPO_KEY} into .env for build
         env:
           SITE_ENV: ${{ secrets[format('SITE_ENV__{0}', steps.repokey.outputs.KEY_UPPER)] }}
@@ -133,6 +136,7 @@ jobs:
           if ! grep -q '^RESEND_API_KEY=' .env; then
             echo "⚠️ RESEND_API_KEY missing (email features may be disabled during build)"
           fi
+          echo "Preview of .env:" && sed -n '1,20p' .env || true
 
       - name: Prisma generate (for Next build)
         working-directory: site
@@ -178,6 +182,9 @@ jobs:
           KEY_UPPER="$(echo "$NAME" | tr '[:lower:]-' '[:upper:]_')"
           echo "KEY_UPPER=$KEY_UPPER" >> $GITHUB_OUTPUT
 
+      - name: Debug derived key
+        run: echo "REPO_KEY=${{ steps.repokey.outputs.KEY_UPPER }}"
+
       - name: Load SITE_ENV__{REPO_KEY} and export Vercel IDs
         env:
           SITE_ENV: ${{ secrets[format('SITE_ENV__{0}', steps.repokey.outputs.KEY_UPPER)] }}
@@ -199,10 +206,35 @@ jobs:
         working-directory: site
         run: npm i -g vercel
 
-      # Important: remove --scope (it expects the team slug, not the orgId)
+      # Pull preview env first
       - if: env.SKIP != '1'
         working-directory: site
         run: vercel pull --yes --environment=preview --token="${{ env.VERCEL_TOKEN }}"
+
+      # Merge pulled env with secret so base URLs are guaranteed
+      - if: env.SKIP != '1'
+        working-directory: site
+        run: |
+          : > .env
+          if [ -f ".vercel/.env.preview.local" ]; then
+            cat .vercel/.env.preview.local >> .env
+          elif [ -f ".vercel/.env.development.local" ]; then
+            cat .vercel/.env.development.local >> .env
+          fi
+
+          # Append only missing keys from .site_env (pulled values win)
+          while IFS='=' read -r k v; do
+            [ -z "$k" ] && continue
+            [ "${k#\#}" != "$k" ] && continue
+            if ! grep -qE "^${k}=" .env 2>/dev/null; then
+              echo "${k}=${v}" >> .env
+            fi
+          done < .site_env
+
+          # Final fallback for canonical base
+          grep -qE '^(NEXT_PUBLIC_SITE_URL|SITE_URL)=' .env || echo 'SITE_URL=https://example.com' >> .env
+
+          echo "Wrote .env for build (first lines):"; sed -n '1,20p' .env
 
       - if: env.SKIP != '1'
         working-directory: site
@@ -236,6 +268,9 @@ jobs:
           KEY_UPPER="$(echo "$NAME" | tr '[:lower:]-' '[:upper:]_')"
           echo "KEY_UPPER=$KEY_UPPER" >> $GITHUB_OUTPUT
 
+      - name: Debug derived key
+        run: echo "REPO_KEY=${{ steps.repokey.outputs.KEY_UPPER }}"
+
       - name: Load SITE_ENV__{REPO_KEY} and export Vercel IDs
         env:
           SITE_ENV: ${{ secrets[format('SITE_ENV__{0}', steps.repokey.outputs.KEY_UPPER)] }}
@@ -257,10 +292,30 @@ jobs:
         working-directory: site
         run: npm i -g vercel
 
-      # Important: remove --scope (it expects the team slug, not the orgId)
+      # Pull production env first
       - if: env.SKIP != '1'
         working-directory: site
         run: vercel pull --yes --environment=production --token="${{ env.VERCEL_TOKEN }}"
+
+      # Merge pulled env with secret so base URLs are guaranteed
+      - if: env.SKIP != '1'
+        working-directory: site
+        run: |
+          : > .env
+          if [ -f ".vercel/.env.production.local" ]; then
+            cat .vercel/.env.production.local >> .env
+          fi
+
+          while IFS='=' read -r k v; do
+            [ -z "$k" ] && continue
+            [ "${k#\#}" != "$k" ] && continue
+            if ! grep -qE "^${k}=" .env 2>/dev/null; then
+              echo "${k}=${v}" >> .env
+            fi
+          done < .site_env
+
+          grep -qE '^(NEXT_PUBLIC_SITE_URL|SITE_URL)=' .env || echo 'SITE_URL=https://example.com' >> .env
+          echo "Wrote .env for build (first lines):"; sed -n '1,20p' .env
 
       - if: env.SKIP != '1'
         working-directory: site
@@ -367,7 +422,7 @@ jobs:
           HZ_SSH_KEY: ${{ secrets.HZ_SSH_KEY }}
         run: |
           [ -n "${HZ_HOST:-}" ]    || { echo "❌ Missing secret: HZ_HOST"; exit 1; }
-          [ -n "${HZ_SSH_KEY:-}" ] || { echo "❌ Missing secret: HZ_SSH_KEY"; exit 1; }
+          [ -n "${H2_SSH_KEY:-$HZ_SSH_KEY}" ] || { echo "❌ Missing secret: HZ_SSH_KEY"; exit 1; }
 
       - name: Deploy over SSH (Traefik + DB + app; admin inline if provided)
         uses: appleboy/ssh-action@v1
@@ -655,7 +710,7 @@ jobs:
           FROM nginx:alpine
           COPY out/ /usr/share/nginx/html
           RUN adduser -D -g 'www' www \
-           && chown -R www:www /usr/share/nginx/html \
+           && chown - R www:www /usr/share/nginx/html \
            && sed -i 's/user  nginx;/user www;/' /etc/nginx/nginx.conf
           EXPOSE 80
           DOCKER
