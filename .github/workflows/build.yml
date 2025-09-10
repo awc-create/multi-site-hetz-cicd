@@ -114,7 +114,6 @@ jobs:
           if [ -f package.json ] && jq -e '.scripts.lint' package.json >/dev/null 2>&1; then \
             npm run lint || true; else echo "no lint script"; fi
 
-      # Load env to .env so Next/Prisma/Resend have vars at build time
       - name: Derive REPO_KEY (UPPERCASE, '-' -> '_')
         id: repokey
         run: |
@@ -206,12 +205,10 @@ jobs:
         working-directory: site
         run: npm i -g vercel
 
-      # Pull preview env first
       - if: env.SKIP != '1'
         working-directory: site
         run: vercel pull --yes --environment=preview --token="${{ env.VERCEL_TOKEN }}"
 
-      # Merge pulled env with secret so base URLs are guaranteed
       - if: env.SKIP != '1'
         working-directory: site
         run: |
@@ -221,8 +218,6 @@ jobs:
           elif [ -f ".vercel/.env.development.local" ]; then
             cat .vercel/.env.development.local >> .env
           fi
-
-          # Append only missing keys from .site_env (pulled values win)
           while IFS='=' read -r k v; do
             [ -z "$k" ] && continue
             [ "${k#\#}" != "$k" ] && continue
@@ -230,10 +225,7 @@ jobs:
               echo "${k}=${v}" >> .env
             fi
           done < .site_env
-
-          # Final fallback for canonical base
           grep -qE '^(NEXT_PUBLIC_SITE_URL|SITE_URL)=' .env || echo 'SITE_URL=https://example.com' >> .env
-
           echo "Wrote .env for build (first lines):"; sed -n '1,20p' .env
 
       - if: env.SKIP != '1'
@@ -292,12 +284,10 @@ jobs:
         working-directory: site
         run: npm i -g vercel
 
-      # Pull production env first
       - if: env.SKIP != '1'
         working-directory: site
         run: vercel pull --yes --environment=production --token="${{ env.VERCEL_TOKEN }}"
 
-      # Merge pulled env with secret so base URLs are guaranteed
       - if: env.SKIP != '1'
         working-directory: site
         run: |
@@ -305,7 +295,6 @@ jobs:
           if [ -f ".vercel/.env.production.local" ]; then
             cat .vercel/.env.production.local >> .env
           fi
-
           while IFS='=' read -r k v; do
             [ -z "$k" ] && continue
             [ "${k#\#}" != "$k" ] && continue
@@ -313,7 +302,6 @@ jobs:
               echo "${k}=${v}" >> .env
             fi
           done < .site_env
-
           grep -qE '^(NEXT_PUBLIC_SITE_URL|SITE_URL)=' .env || echo 'SITE_URL=https://example.com' >> .env
           echo "Wrote .env for build (first lines):"; sed -n '1,20p' .env
 
@@ -355,6 +343,31 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      - name: Derive REPO_KEY (UPPERCASE, '-' -> '_')
+        id: repokey
+        run: |
+          NAME="${{ needs.detect.outputs.repository_name }}"
+          KEY_UPPER="$(echo "$NAME" | tr '[:lower:]-' '[:upper:]_')"
+          echo "KEY_UPPER=$KEY_UPPER" >> $GITHUB_OUTPUT
+
+      - name: Export base URLs from SITE_ENV secret
+        id: envparse
+        env:
+          SITE_ENV_SECRET: ${{ secrets[format('SITE_ENV__{0}', steps.repokey.outputs.KEY_UPPER)] }}
+          DOMAIN: ${{ needs.detect.outputs.domain_prod }}
+          ADMIN_DOMAIN: ${{ needs.detect.outputs.domain_admin }}
+        run: |
+          [ -n "${SITE_ENV_SECRET:-}" ] || { echo "❌ Missing SITE_ENV secret"; exit 1; }
+          printf "%s\n" "$SITE_ENV_SECRET" | sed 's/\r$//' > .site_env
+          get(){ awk -F= -v k="$1" '$1==k{print $2}' .site_env | tail -1; }
+          NPU="$(get NEXT_PUBLIC_SITE_URL)";   [ -n "$NPU" ] || NPU="https://${DOMAIN}"
+          NPA="$(get NEXT_PUBLIC_ADMIN_URL)";  [ -n "$NPA" ] || { [ -n "${ADMIN_DOMAIN:-}" ] && NPA="https://${ADMIN_DOMAIN}" || NPA=""; }
+          SU="$(get SITE_URL)";                [ -n "$SU" ]  || SU="https://${DOMAIN}"
+          echo "NEXT_PUBLIC_SITE_URL=$NPU"  >> $GITHUB_OUTPUT
+          echo "NEXT_PUBLIC_ADMIN_URL=$NPA" >> $GITHUB_OUTPUT
+          echo "SITE_URL=$SU"               >> $GITHUB_OUTPUT
+          echo "Using base URLs:"; echo "$NPU"; echo "$NPA"; echo "$SU"
+
       - name: Check Docker Hub creds (optional)
         id: dh
         env:
@@ -392,6 +405,10 @@ jobs:
           tags: |
             ${{ steps.meta.outputs.ref }}
             ${{ steps.meta.outputs.image }}:latest
+          build-args: |
+            NEXT_PUBLIC_SITE_URL=${{ steps.envparse.outputs.NEXT_PUBLIC_SITE_URL }}
+            NEXT_PUBLIC_ADMIN_URL=${{ steps.envparse.outputs.NEXT_PUBLIC_ADMIN_URL }}
+            SITE_URL=${{ steps.envparse.outputs.SITE_URL }}
 
   hetzner_node:
     needs: [detect, image_build_push]
