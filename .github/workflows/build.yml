@@ -506,7 +506,8 @@ jobs:
                 volumes:
                   - /var/run/docker.sock:/var/run/docker.sock:ro
                   - ./letsencrypt:/letsencrypt
-                networks: [proxy]
+                networks:
+                  - proxy
             networks:
               proxy:
                 external: true
@@ -550,7 +551,8 @@ jobs:
                   interval: 10s
                   timeout: 5s
                   retries: 10
-                networks: [core_db_net]
+                networks:
+                  - core_db_net
 
               pgbouncer:
                 image: edoburu/pgbouncer
@@ -564,7 +566,8 @@ jobs:
                 depends_on:
                   postgres:
                     condition: service_healthy
-                networks: [core_db_net]
+                networks:
+                  - core_db_net
 
             volumes:
               pg_data:
@@ -582,28 +585,36 @@ jobs:
               app:
                 image: ${IMAGE_REF}
                 restart: unless-stopped
-                env_file: [app.env]
+                env_file:
+                  - app.env
                 labels:
-                  - traefik.enable=true
-                  - traefik.docker.network=proxy
-                  - traefik.http.routers.${SLUG}.rule=Host(\`${DOMAIN}\`) || Host(\`www.${DOMAIN}\`)
-                  - traefik.http.routers.${SLUG}.entrypoints=websecure
-                  - traefik.http.routers.${SLUG}.tls.certresolver=le
-                  - traefik.http.routers.${SLUG}.service=${SLUG}
-                  - traefik.http.services.${SLUG}.loadbalancer.server.port=${PORT}
-                  - traefik.http.routers.${SLUG}-admin.rule=Host(\`${ADMIN_DOMAIN}\`)
-                  - traefik.http.routers.${SLUG}-admin.entrypoints=websecure
-                  - traefik.http.routers.${SLUG}-admin.tls.certresolver=le
-                  - traefik.http.routers.${SLUG}-admin.service=${SLUG}
-                  - traefik.http.routers.${SLUG}-http.rule=Host(\`${DOMAIN}\`) || Host(\`www.${DOMAIN}\`)
-                  - traefik.http.routers.${SLUG}-http.entrypoints=web
-                  - traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redirect
-                  - traefik.http.routers.${SLUG}-http.service=${SLUG}
-                  - traefik.http.middlewares.${SLUG}-redirect.redirectscheme.scheme=https
-                networks: [proxy, core_db_net]
+                  - "traefik.enable=true"
+                  - "traefik.docker.network=proxy"
+                  - "traefik.http.routers.${SLUG}.rule=Host(\\\`${DOMAIN}\\\`) || Host(\\\`www.${DOMAIN}\\\`)"
+                  - "traefik.http.routers.${SLUG}.entrypoints=websecure"
+                  - "traefik.http.routers.${SLUG}.tls.certresolver=le"
+                  - "traefik.http.routers.${SLUG}.service=${SLUG}"
+                  - "traefik.http.services.${SLUG}.loadbalancer.server.port=${PORT}"
+                  - "traefik.http.routers.${SLUG}-admin.rule=Host(\\\`${ADMIN_DOMAIN}\\\`)"
+                  - "traefik.http.routers.${SLUG}-admin.entrypoints=websecure"
+                  - "traefik.http.routers.${SLUG}-admin.tls.certresolver=le"
+                  - "traefik.http.routers.${SLUG}-admin.service=${SLUG}"
+                  - "traefik.http.routers.${SLUG}-http.rule=Host(\\\`${DOMAIN}\\\`) || Host(\\\`www.${DOMAIN}\\\`)"
+                  - "traefik.http.routers.${SLUG}-http.entrypoints=web"
+                  - "traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redirect"
+                  - "traefik.http.routers.${SLUG}-http.service=${SLUG}"
+                  - "traefik.http.middlewares.${SLUG}-redirect.redirectscheme.scheme=https"
+                networks:
+                  - proxy
+                  - core_db_net
+
             networks:
-              proxy:      { external: true, name: proxy }
-              core_db_net:{ external: true, name: core_db_net }
+              proxy:
+                external: true
+                name: proxy
+              core_db_net:
+                external: true
+                name: core_db_net
             YAML
             else
               cat > docker-compose.yml <<YAML
@@ -611,24 +622,32 @@ jobs:
               app:
                 image: ${IMAGE_REF}
                 restart: unless-stopped
-                env_file: [app.env]
+                env_file:
+                  - app.env
                 labels:
-                  - traefik.enable=true
-                  - traefik.docker.network=proxy
-                  - traefik.http.routers.${SLUG}.rule=Host(\`${DOMAIN}\`) || Host(\`www.${DOMAIN}\`)
-                  - traefik.http.routers.${SLUG}.entrypoints=websecure
-                  - traefik.http.routers.${SLUG}.tls.certresolver=le
-                  - traefik.http.routers.${SLUG}.service=${SLUG}
-                  - traefik.http.services.${SLUG}.loadbalancer.server.port=${PORT}
-                  - traefik.http.routers.${SLUG}-http.rule=Host(\`${DOMAIN}\`) || Host(\`www.${DOMAIN}\`)
-                  - traefik.http.routers.${SLUG}-http.entrypoints=web
-                  - traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redirect
-                  - traefik.http.routers.${SLUG}-http.service=${SLUG}
-                  - traefik.http.middlewares.${SLUG}-redirect.redirectscheme.scheme=https
-                networks: [proxy, core_db_net]
+                  - "traefik.enable=true"
+                  - "traefik.docker.network=proxy"
+                  - "traefik.http.routers.${SLUG}.rule=Host(\\\`${DOMAIN}\\\`) || Host(\\\`www.${DOMAIN}\\\`)"
+                  - "traefik.http.routers.${SLUG}.entrypoints=websecure"
+                  - "traefik.http.routers.${SLUG}.tls.certresolver=le"
+                  - "traefik.http.routers.${SLUG}.service=${SLUG}"
+                  - "traefik.http.services.${SLUG}.loadbalancer.server.port=${PORT}"
+                  - "traefik.http.routers.${SLUG}-http.rule=Host(\\\`${DOMAIN}\\\`) || Host(\\\`www.${DOMAIN}\\\`)"
+                  - "traefik.http.routers.${SLUG}-http.entrypoints=web"
+                  - "traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redirect"
+                  - "traefik.http.routers.${SLUG}-http.service=${SLUG}"
+                  - "traefik.http.middlewares.${SLUG}-redirect.redirectscheme.scheme=https"
+                networks:
+                  - proxy
+                  - core_db_net
+
             networks:
-              proxy:      { external: true, name: proxy }
-              core_db_net:{ external: true, name: core_db_net }
+              proxy:
+                external: true
+                name: proxy
+              core_db_net:
+                external: true
+                name: core_db_net
             YAML
             fi
 
@@ -649,28 +668,28 @@ jobs:
           timeout: 60s
           command_timeout: 10m
           envs: SLUG,DOMAIN
-          script: |
-            set -euo pipefail
-            cd /opt/sites/${SLUG}
-            PORT=$(docker compose exec -T app sh -lc 'printf "%s" "${PORT:-3000}"')
-            echo "Detected PORT=$PORT"
-            ok=0
-            for path in /api/healthz /api/healthz/ /app/api/healthz /app/api/healthz/; do
-              echo "Probing http://127.0.0.1:${PORT}${path}"
-              for i in $(seq 1 20); do
-                if docker compose exec -T app node -e "const http=require('http');http.get({host:'127.0.0.1',port:${PORT},path:'${path}',headers:{'x-forwarded-proto':'https','host':'${DOMAIN:-localhost}'}},r=>process.exit(r.statusCode<400?0:1)).on('error',()=>process.exit(1))"; then
-                  echo "✅ ${path} OK"
-                  ok=1; break
-                fi
-                echo "  retry $i"; sleep 3
-              done
-              [ $ok -eq 1 ] && break
+        script: |
+          set -euo pipefail
+          cd /opt/sites/${SLUG}
+          PORT=$(docker compose exec -T app sh -lc 'printf "%s" "${PORT:-3000}"')
+          echo "Detected PORT=$PORT"
+          ok=0
+          for path in /api/healthz /api/healthz/ /app/api/healthz /app/api/healthz/; do
+            echo "Probing http://127.0.0.1:${PORT}${path}"
+            for i in $(seq 1 20); do
+              if docker compose exec -T app node -e "const http=require('http');http.get({host:'127.0.0.1',port:${PORT},path:'${path}',headers:{'x-forwarded-proto':'https','host':'${DOMAIN:-localhost}'}},r=>process.exit(r.statusCode<400?0:1)).on('error',()=>process.exit(1))"; then
+                echo "✅ ${path} OK"
+                ok=1; break
+              fi
+              echo "  retry $i"; sleep 3
             done
-            if [ $ok -ne 1 ]; then
-              echo "❌ App not healthy internally. Recent logs:" && docker compose logs --no-color --tail=200 app || true
-              exit 1
-            fi
-            echo "✅ App healthy inside container"
+            [ $ok -eq 1 ] && break
+          done
+          if [ $ok -ne 1 ]; then
+            echo "❌ App not healthy internally. Recent logs:" && docker compose logs --no-color --tail=200 app || true
+            exit 1
+          fi
+          echo "✅ App healthy inside container"
 
       - name: Short settle (first issue of certificates, etc.)
         run: sleep 10
@@ -727,7 +746,7 @@ jobs:
           FROM nginx:alpine
           COPY out/ /usr/share/nginx/html
           RUN adduser -D -g 'www' www \
-           && chown - R www:www /usr/share/nginx/html \
+           && chown -R www:www /usr/share/nginx/html \
            && sed -i 's/user  nginx;/user www;/' /etc/nginx/nginx.conf
           EXPOSE 80
           DOCKER
@@ -782,18 +801,19 @@ jobs:
                 image: ${IMAGE_REF}
                 restart: unless-stopped
                 labels:
-                  - traefik.enable=true
-                  - traefik.docker.network=proxy
-                  - traefik.http.routers.${SLUG}.rule=Host(\`${DOMAIN}\`)
-                  - traefik.http.routers.${SLUG}.entrypoints=websecure
-                  - traefik.http.routers.${SLUG}.tls.certresolver=le
-                  - traefik.http.services.${SLUG}.loadbalancer.server.port=80
-                  - traefik.http.routers.${SLUG}-http.rule=Host(\`${DOMAIN}\`)
-                  - traefik.http.routers.${SLUG}-http.entrypoints=web
-                  - traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redirect
-                  - traefik.http.routers.${SLUG}-http.service=${SLUG}
-                  - traefik.http.middlewares.${SLUG}-redirect.redirectscheme.scheme=https
-                networks: [proxy]
+                  - "traefik.enable=true"
+                  - "traefik.docker.network=proxy"
+                  - "traefik.http.routers.${SLUG}.rule=Host(\\\`${DOMAIN}\\\`)"
+                  - "traefik.http.routers.${SLUG}.entrypoints=websecure"
+                  - "traefik.http.routers.${SLUG}.tls.certresolver=le"
+                  - "traefik.http.services.${SLUG}.loadbalancer.server.port=80"
+                  - "traefik.http.routers.${SLUG}-http.rule=Host(\\\`${DOMAIN}\\\`)"
+                  - "traefik.http.routers.${SLUG}-http.entrypoints=web"
+                  - "traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redirect"
+                  - "traefik.http.routers.${SLUG}-http.service=${SLUG}"
+                  - "traefik.http.middlewares.${SLUG}-redirect.redirectscheme.scheme=https"
+                networks:
+                  - proxy
             networks:
               proxy:
                 external: true
