@@ -452,6 +452,7 @@ jobs:
           SITE_ENV:     ${{ env.SITE_ENV }}
           GHCR_USER:    ${{ github.repository_owner }}
           GHCR_TOKEN:   ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
+          CF_DNS_API_TOKEN: ${{ secrets.CF_DNS_API_TOKEN }}   # Cloudflare token (DNS-01)
         with:
           host: ${{ secrets.HZ_HOST }}
           username: ${{ secrets.HZ_USER || 'root' }}
@@ -459,7 +460,7 @@ jobs:
           port: 22
           timeout: 60s
           command_timeout: 25m
-          envs: SLUG,PORT,DOMAIN,ADMIN_DOMAIN,IMAGE_REF,SITE_ENV,GHCR_USER,GHCR_TOKEN
+          envs: SLUG,PORT,DOMAIN,ADMIN_DOMAIN,IMAGE_REF,SITE_ENV,GHCR_USER,GHCR_TOKEN,CF_DNS_API_TOKEN
           script: |
             set -euo pipefail
             [ -n "${SLUG:-}" ] && [ -n "${DOMAIN:-}" ] && [ -n "${IMAGE_REF:-}" ] || { echo "❌ Missing SLUG/DOMAIN/IMAGE_REF"; exit 1; }
@@ -479,12 +480,14 @@ jobs:
             POSTGRES_PASSWORD_VAL="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^POSTGRES_PASSWORD=/{print $2}' | tail -1)"
             [ -n "$POSTGRES_PASSWORD_VAL" ] || { echo "❌ POSTGRES_PASSWORD missing in SITE_ENV"; exit 1; }
 
-            # --- Traefik (unchanged; uses .env for compose-time substitution) ---
+            # --- Traefik with DNS-01 (Cloudflare) ---
             TDIR="/opt/services/traefik"
             mkdir -p "$TDIR/letsencrypt"
             [ -f "$TDIR/letsencrypt/acme.json" ] || install -m 600 /dev/null "$TDIR/letsencrypt/acme.json"
             cat > "$TDIR/.env" <<EOF
             ACME_EMAIL=${ACME_EMAIL}
+            CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
+            CLOUDFLARE_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
             EOF
             cat > "$TDIR/docker-compose.yml" <<'YAML'
             services:
@@ -499,8 +502,12 @@ jobs:
                   - --entrypoints.websecure.address=:443
                   - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
                   - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
-                  - --certificatesresolvers.le.acme.httpchallenge=true
-                  - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+                  - --certificatesresolvers.le.acme.dnschallenge=true
+                  - --certificatesresolvers.le.acme.dnschallenge.provider=cloudflare
+                  - --certificatesresolvers.le.acme.dnschallenge.delaybeforecheck=10
+                environment:
+                  CF_DNS_API_TOKEN: ${CF_DNS_API_TOKEN}
+                  CLOUDFLARE_DNS_API_TOKEN: ${CLOUDFLARE_DNS_API_TOKEN}
                 ports:
                   - 80:80
                   - 443:443
@@ -583,6 +590,11 @@ jobs:
             (cd "${DB_DIR}" && docker compose up -d)
 
             # --- App compose (template + envsubst to avoid YAML escape issues) ---
+            # ensure envsubst exists
+            if ! command -v envsubst >/dev/null 2>&1; then
+              apt-get update -y && apt-get install -y --no-install-recommends gettext-base
+            fi
+
             TEMPLATE="docker-compose.yml.tpl"
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
               cat > "$TEMPLATE" <<'YAML'
@@ -705,7 +717,7 @@ jobs:
           ok=0
           for i in {1..36}; do
             for u in "${urls[@]}"; do
-              code=$(curl -k -L -sS -o /tmp/health_body -w "%{http_code}" "$u" || true)
+              code=$(curl -L -sS -o /tmp/health_body -w "%{http_code}" "$u" || true)
               echo "GET $u -> HTTP $code"
               if [[ "$code" =~ ^(200|204|301|302|307|308)$ ]]; then
                 echo "✅ Public health OK ($code) at $u"; ok=1; break
@@ -794,7 +806,6 @@ jobs:
             mkdir -p "$SITE_DIR"
             cd "$SITE_DIR"
 
-            # write template (avoid backtick/escape issues), then envsubst
             cat > docker-compose.yml.tpl <<'YAML'
             services:
               web:
@@ -820,6 +831,9 @@ jobs:
                 name: proxy
             YAML
             export IMAGE_REF SLUG DOMAIN
+            if ! command -v envsubst >/dev/null 2>&1; then
+              apt-get update -y && apt-get install -y --no-install-recommends gettext-base
+            fi
             envsubst '$IMAGE_REF $SLUG $DOMAIN' < docker-compose.yml.tpl > docker-compose.yml
 
             docker compose pull || true
@@ -828,7 +842,7 @@ jobs:
       - name: Static public check
         run: |
           for i in {1..36}; do
-            if curl -fsSL "https://${{ needs.detect.outputs.domain_prod }}/" >/dev/null; then
+            if curl -L -sS "https://${{ needs.detect.outputs.domain_prod }}/" >/dev/null; then
               echo "✅ Site up"; exit 0; fi
             echo "retry $i"; sleep 5
           done
