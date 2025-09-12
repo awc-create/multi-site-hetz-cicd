@@ -609,12 +609,14 @@ jobs:
             grep -q '^DATABASE_URL=' app.env || echo "DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@pgbouncer:5432/${DB_NAME}?pgbouncer=true&connection_limit=1&connect_timeout=5" >> app.env
             grep -q '^DIRECT_DATABASE_URL=' app.env || echo "DIRECT_DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@postgres:5432/${DB_NAME}?connect_timeout=5" >> app.env
 
-            cat > docker-compose.yml.tpl <<'YAML'
+            if [ -n "${ADMIN_DOMAIN:-}" ]; then
+              cat > docker-compose.yml.tpl <<'YAML'
             services:
               app:
                 image: ${IMAGE_REF}
                 restart: unless-stopped
-                env_file: [ app.env ]
+                env_file:
+                  - app.env
                 labels:
                   - 'traefik.enable=true'
                   - 'traefik.docker.network=proxy'
@@ -628,7 +630,11 @@ jobs:
                   - 'traefik.http.routers.${SLUG_SAFE}-http.middlewares=${SLUG_SAFE}-redirect'
                   - 'traefik.http.routers.${SLUG_SAFE}-http.service=${SLUG_SAFE}'
                   - 'traefik.http.middlewares.${SLUG_SAFE}-redirect.redirectscheme.scheme=https'
-                  - ${ADMIN_RULE}
+                  # admin host (separate router, same service)
+                  - 'traefik.http.routers.${SLUG_SAFE}-admin.rule=Host("${ADMIN_DOMAIN}")'
+                  - 'traefik.http.routers.${SLUG_SAFE}-admin.entrypoints=websecure'
+                  - 'traefik.http.routers.${SLUG_SAFE}-admin.tls.certresolver=le'
+                  - 'traefik.http.routers.${SLUG_SAFE}-admin.service=${SLUG_SAFE}'
                 networks:
                   - proxy
                   - ${DB_NET}
@@ -636,26 +642,48 @@ jobs:
               proxy:   { external: true, name: proxy }
               ${DB_NET}: { external: true, name: ${DB_NET} }
             YAML
-
-            if [ -n "${ADMIN_DOMAIN:-}" ]; then
-              ADMIN_RULE="'traefik.http.routers.${SLUG_SAFE}-admin.rule=Host(\"${ADMIN_DOMAIN}\")','traefik.http.routers.${SLUG_SAFE}-admin.entrypoints=websecure','traefik.http.routers.${SLUG_SAFE}-admin.tls.certresolver=le','traefik.http.routers.${SLUG_SAFE}-admin.service=${SLUG_SAFE}'"
             else
-              ADMIN_RULE="''"
+              cat > docker-compose.yml.tpl <<'YAML'
+            services:
+              app:
+                image: ${IMAGE_REF}
+                restart: unless-stopped
+                env_file:
+                  - app.env
+                labels:
+                  - 'traefik.enable=true'
+                  - 'traefik.docker.network=proxy'
+                  - 'traefik.http.routers.${SLUG_SAFE}.rule=Host("${DOMAIN}") || Host("www.${DOMAIN}")'
+                  - 'traefik.http.routers.${SLUG_SAFE}.entrypoints=websecure'
+                  - 'traefik.http.routers.${SLUG_SAFE}.tls.certresolver=le'
+                  - 'traefik.http.routers.${SLUG_SAFE}.service=${SLUG_SAFE}'
+                  - 'traefik.http.services.${SLUG_SAFE}.loadbalancer.server.port=${PORT}'
+                  - 'traefik.http.routers.${SLUG_SAFE}-http.rule=Host("${DOMAIN}") || Host("www.${DOMAIN}")'
+                  - 'traefik.http.routers.${SLUG_SAFE}-http.entrypoints=web'
+                  - 'traefik.http.routers.${SLUG_SAFE}-http.middlewares=${SLUG_SAFE}-redirect'
+                  - 'traefik.http.routers.${SLUG_SAFE}-http.service=${SLUG_SAFE}'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-redirect.redirectscheme.scheme=https'
+                networks:
+                  - proxy
+                  - ${DB_NET}
+            networks:
+              proxy:   { external: true, name: proxy }
+              ${DB_NET}: { external: true, name: ${DB_NET} }
+            YAML
             fi
 
-            export IMAGE_REF SLUG_SAFE DOMAIN ADMIN_DOMAIN PORT DB_NET ADMIN_RULE
+            export IMAGE_REF SLUG_SAFE DOMAIN ADMIN_DOMAIN PORT DB_NET
             sed -e "s|\${IMAGE_REF}|${IMAGE_REF}|g" \
                 -e "s|\${SLUG_SAFE}|${SLUG_SAFE}|g" \
                 -e "s|\${DOMAIN}|${DOMAIN}|g" \
                 -e "s|\${PORT}|${PORT}|g" \
                 -e "s|\${DB_NET}|${DB_NET}|g" \
-                -e "s|\${ADMIN_RULE}|${ADMIN_RULE}|g" \
               docker-compose.yml.tpl > docker-compose.yml
 
             docker compose pull || true
             docker compose up -d --remove-orphans
-
             docker compose exec -T app sh -lc 'npx prisma migrate deploy || true'
+
 
       - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@v1
