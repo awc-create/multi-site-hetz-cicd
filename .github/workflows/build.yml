@@ -29,8 +29,8 @@ jobs:
       project_type:     ${{ steps.detect.outputs.PROJECT_TYPE }}
       slug:             ${{ steps.cfg.outputs.SLUG }}
       port:             ${{ steps.cfg.outputs.PORT }}
-      domain_prod:      ${{ steps.cfg.outputs.DOMAIN_PROD }}
-      domain_admin:     ${{ steps.cfg.outputs.DOMAIN_ADMIN }}
+      domain_prod:      ${{ steps.dom.outputs.DOMAIN_PROD }}
+      domain_admin:     ${{ steps.dom.outputs.DOMAIN_ADMIN }}
     steps:
       - name: Extract payload (repo/branch)
         id: p
@@ -62,16 +62,16 @@ jobs:
           DOMAIN_ADMIN=""
           if [ -f ".cicd-config.yml" ]; then
             get_val(){ grep -E "^$1:" .cicd-config.yml | head -1 | awk -F': *' '{print $2}' | tr -d "\"'"; }
-            SLUG=$(get_val slug || echo "$SLUG")
-            PORT=$(get_val port || echo "$PORT")
+            SLUG="$(get_val slug || echo "$SLUG")"
+            PORT="$(get_val port || echo "$PORT")"
             DOM_BLOCK="$(awk '/^domains:/{f=1;next} f && /^[^ ]/{f=0} f{print}' .cicd-config.yml)"
             DOMAIN_PROD="$(printf '%s\n' "$DOM_BLOCK" | awk '/prod:/{print $2}' | tr -d "\"'")"
             DOMAIN_ADMIN="$(printf '%s\n' "$DOM_BLOCK" | awk '/admin:/{print $2}' | tr -d "\"'")"
           fi
           echo "SLUG=$SLUG" >> $GITHUB_OUTPUT
           echo "PORT=$PORT" >> $GITHUB_OUTPUT
-          echo "DOMAIN_PROD=$DOMAIN_PROD" >> $GITHUB_OUTPUT
-          echo "DOMAIN_ADMIN=$DOMAIN_ADMIN" >> $GITHUB_OUTPUT
+          echo "DOMAIN_PROD_RAW=$DOMAIN_PROD" >> $GITHUB_OUTPUT
+          echo "DOMAIN_ADMIN_RAW=$DOMAIN_ADMIN" >> $GITHUB_OUTPUT
 
       - name: Detect project type
         id: detect
@@ -82,6 +82,21 @@ jobs:
             PT="static"
           fi
           echo "PROJECT_TYPE=$PT" >> $GITHUB_OUTPUT
+
+      - name: Finalize domains (default admin=admin.prod)
+        id: dom
+        run: |
+          PROD="${{ steps.cfg.outputs.DOMAIN_PROD_RAW }}"
+          ADMIN="${{ steps.cfg.outputs.DOMAIN_ADMIN_RAW }}"
+          if [ -z "$PROD" ]; then
+            echo "❌ DOMAIN_PROD missing (set it in .cicd-config.yml -> domains.prod)"; exit 1;
+          fi
+          if [ -z "$ADMIN" ]; then
+            ADMIN="admin.${PROD}"
+          fi
+          echo "DOMAIN_PROD=$PROD"  >> $GITHUB_OUTPUT
+          echo "DOMAIN_ADMIN=$ADMIN" >> $GITHUB_OUTPUT
+          echo "Using domains: PROD=$PROD ADMIN=$ADMIN"
 
   build_test:
     runs-on: ubuntu-latest
@@ -441,7 +456,7 @@ jobs:
           [ -n "${HZ_HOST:-}" ]    || { echo "❌ Missing secret: HZ_HOST"; exit 1; }
           [ -n "${HZ_SSH_KEY:-}" ] || { echo "❌ Missing secret: HZ_SSH_KEY"; exit 1; }
 
-      - name: Deploy over SSH (Traefik + DB + app; admin inline if provided)
+      - name: Deploy over SSH (Traefik + per-project DB + app)
         uses: appleboy/ssh-action@v1
         env:
           SLUG:         ${{ needs.detect.outputs.slug }}
@@ -452,7 +467,7 @@ jobs:
           SITE_ENV:     ${{ env.SITE_ENV }}
           GHCR_USER:    ${{ github.repository_owner }}
           GHCR_TOKEN:   ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
-          CF_DNS_API_TOKEN: ${{ secrets.CF_DNS_API_TOKEN }}   # Cloudflare token (DNS-01)
+          CF_DNS_API_TOKEN: ${{ secrets.CF_DNS_API_TOKEN }}
         with:
           host: ${{ secrets.HZ_HOST }}
           username: ${{ secrets.HZ_USER || 'root' }}
@@ -463,24 +478,30 @@ jobs:
           envs: SLUG,PORT,DOMAIN,ADMIN_DOMAIN,IMAGE_REF,SITE_ENV,GHCR_USER,GHCR_TOKEN,CF_DNS_API_TOKEN
           script: |
             set -euo pipefail
+
             [ -n "${SLUG:-}" ] && [ -n "${DOMAIN:-}" ] && [ -n "${IMAGE_REF:-}" ] || { echo "❌ Missing SLUG/DOMAIN/IMAGE_REF"; exit 1; }
 
+            SLUG_SAFE="$(printf '%s' "${SLUG}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
+            [ -n "$SLUG_SAFE" ] || { echo "❌ Bad SLUG"; exit 1; }
+            DB_NET="${SLUG_SAFE}_db_net"
+            DB_DIR="/opt/services/postgres-${SLUG_SAFE}"
+            SITE_DIR="/opt/sites/${SLUG_SAFE}"
+
             docker network create proxy >/dev/null 2>&1 || true
-            docker network create core_db_net >/dev/null 2>&1 || true
+            docker network create "${DB_NET}" >/dev/null 2>&1 || true
 
             SITE_ENV_NORM="$(printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//')"
-
             ACME_EMAIL="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^ACME_EMAIL=/{print $2}' | tail -1)"
             [ -n "$ACME_EMAIL" ] || { echo "❌ ACME_EMAIL missing in SITE_ENV"; exit 1; }
 
-            DB_NAME="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^POSTGRES_DB=/{print $2}' | tail -1)"
-            [ -n "$DB_NAME" ] || DB_NAME="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^DB_NAME=/{print $2}' | tail -1)"
-            [ -n "$DB_NAME" ] || DB_NAME="princefoods"
+            DB_NAME="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_DB|DB_NAME)=/{print $2}' | tail -1)"
+            [ -n "$DB_NAME" ] || DB_NAME="${SLUG_SAFE}"
+            DB_USER="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_USER|DB_USER)=/{print $2}' | tail -1)"
+            [ -n "$DB_USER" ] || DB_USER="${SLUG_SAFE}_admin"
+            DB_PASS="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_PASSWORD|DB_PASSWORD)=/{print $2}' | tail -1)"
+            [ -n "$DB_PASS" ] || { echo "❌ POSTGRES_PASSWORD/DB_PASSWORD missing in SITE_ENV"; exit 1; }
 
-            POSTGRES_PASSWORD_VAL="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^POSTGRES_PASSWORD=/{print $2}' | tail -1)"
-            [ -n "$POSTGRES_PASSWORD_VAL" ] || { echo "❌ POSTGRES_PASSWORD missing in SITE_ENV"; exit 1; }
-
-            # --- Traefik with DNS-01 (Cloudflare) ---
+            # --- Traefik (shared) ---
             TDIR="/opt/services/traefik"
             mkdir -p "$TDIR/letsencrypt"
             [ -f "$TDIR/letsencrypt/acme.json" ] || install -m 600 /dev/null "$TDIR/letsencrypt/acme.json"
@@ -508,14 +529,11 @@ jobs:
                 environment:
                   CF_DNS_API_TOKEN: ${CF_DNS_API_TOKEN}
                   CLOUDFLARE_DNS_API_TOKEN: ${CLOUDFLARE_DNS_API_TOKEN}
-                ports:
-                  - 80:80
-                  - 443:443
+                ports: [ "80:80", "443:443" ]
                 volumes:
                   - /var/run/docker.sock:/var/run/docker.sock:ro
                   - ./letsencrypt:/letsencrypt
-                networks:
-                  - proxy
+                networks: [ proxy ]
             networks:
               proxy:
                 external: true
@@ -528,147 +546,121 @@ jobs:
               echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             fi
 
-            # --- DB stack ---
-            SITE_DIR="/opt/sites/${SLUG}"
-            mkdir -p "$SITE_DIR"
-            cd "$SITE_DIR"
-            printf "%s\n" "$SITE_ENV_NORM" > app.env
-
-            DB_DIR="/opt/services/postgres"
-            mkdir -p "$DB_DIR"
+            # --- Per-project DB stack ---
+            mkdir -p "${DB_DIR}"
             cat > "${DB_DIR}/.env" <<EOF
-            POSTGRES_USER=admin
-            POSTGRES_PASSWORD=${POSTGRES_PASSWORD_VAL}
+            POSTGRES_USER=${DB_USER}
+            POSTGRES_PASSWORD=${DB_PASS}
             POSTGRES_DB=${DB_NAME}
-            DB_USER=admin
-            DB_PASSWORD=${POSTGRES_PASSWORD_VAL}
-            DB_HOST=postgres
+            DB_USER=${DB_USER}
+            DB_PASSWORD=${DB_PASS}
             DB_NAME=${DB_NAME}
             EOF
 
-            cat > "${DB_DIR}/docker-compose.yml" <<'DBYAML'
+            cat > "${DB_DIR}/docker-compose.yml" <<DBYAML
             services:
               postgres:
                 image: postgres:15
-                restart: always
+                restart: unless-stopped
                 env_file: .env
                 environment:
                   POSTGRES_INITDB_ARGS: "--auth=scram-sha-256"
-                volumes:
-                  - pg_data:/var/lib/postgresql/data
                 healthcheck:
                   test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
                   interval: 10s
                   timeout: 5s
-                  retries: 10
-                networks:
-                  - core_db_net
+                  retries: 30
+                volumes:
+                  - pg_data_${SLUG_SAFE}:/var/lib/postgresql/data
+                networks: [ ${DB_NET} ]
 
               pgbouncer:
                 image: edoburu/pgbouncer
-                restart: always
+                restart: unless-stopped
                 env_file: .env
                 environment:
                   POOL_MODE: transaction
                   MAX_CLIENT_CONN: 200
                   DEFAULT_POOL_SIZE: 20
-                  AUTH_TYPE: plain
+                  AUTH_TYPE: scram-sha-256
+                  DB_HOST: postgres
+                  DB_USER: \${POSTGRES_USER}
+                  DB_PASSWORD: \${POSTGRES_PASSWORD}
                 depends_on:
                   postgres:
                     condition: service_healthy
-                networks:
-                  - core_db_net
+                networks: [ ${DB_NET} ]
 
             volumes:
-              pg_data:
+              pg_data_${SLUG_SAFE}:
 
             networks:
-              core_db_net:
+              ${DB_NET}:
                 external: true
-                name: core_db_net
+                name: ${DB_NET}
             DBYAML
             (cd "${DB_DIR}" && docker compose up -d)
 
-            # --- App compose (template + envsubst to avoid YAML escape issues) ---
-            # ensure envsubst exists
-            if ! command -v envsubst >/dev/null 2>&1; then
-              apt-get update -y && apt-get install -y --no-install-recommends gettext-base
-            fi
+            # --- App deploy (NO NEXTAUTH_URL; rely on AUTH_TRUST_HOST) ---
+            mkdir -p "${SITE_DIR}"
+            cd "${SITE_DIR}"
+            printf "%s\n" "$SITE_ENV_NORM" > app.env
+            grep -q '^AUTH_TRUST_HOST=' app.env || echo 'AUTH_TRUST_HOST=true' >> app.env
+            grep -q '^DATABASE_URL=' app.env || echo "DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@pgbouncer:5432/${DB_NAME}?pgbouncer=true&connection_limit=1&connect_timeout=5" >> app.env
+            grep -q '^DIRECT_DATABASE_URL=' app.env || echo "DIRECT_DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@postgres:5432/${DB_NAME}?connect_timeout=5" >> app.env
 
-            TEMPLATE="docker-compose.yml.tpl"
+            cat > docker-compose.yml.tpl <<'YAML'
+            services:
+              app:
+                image: ${IMAGE_REF}
+                restart: unless-stopped
+                env_file: [ app.env ]
+                labels:
+                  - 'traefik.enable=true'
+                  - 'traefik.docker.network=proxy'
+                  - 'traefik.http.routers.${SLUG_SAFE}.rule=Host("${DOMAIN}") || Host("www.${DOMAIN}")'
+                  - 'traefik.http.routers.${SLUG_SAFE}.entrypoints=websecure'
+                  - 'traefik.http.routers.${SLUG_SAFE}.tls.certresolver=le'
+                  - 'traefik.http.routers.${SLUG_SAFE}.service=${SLUG_SAFE}'
+                  - 'traefik.http.services.${SLUG_SAFE}.loadbalancer.server.port=${PORT}'
+                  - 'traefik.http.routers.${SLUG_SAFE}-http.rule=Host("${DOMAIN}") || Host("www.${DOMAIN}")'
+                  - 'traefik.http.routers.${SLUG_SAFE}-http.entrypoints=web'
+                  - 'traefik.http.routers.${SLUG_SAFE}-http.middlewares=${SLUG_SAFE}-redirect'
+                  - 'traefik.http.routers.${SLUG_SAFE}-http.service=${SLUG_SAFE}'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-redirect.redirectscheme.scheme=https'
+                  - ${ADMIN_RULE}
+                networks:
+                  - proxy
+                  - ${DB_NET}
+            networks:
+              proxy:   { external: true, name: proxy }
+              ${DB_NET}: { external: true, name: ${DB_NET} }
+            YAML
+
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
-              cat > "$TEMPLATE" <<'YAML'
-            services:
-              app:
-                image: ${IMAGE_REF}
-                restart: unless-stopped
-                env_file:
-                  - app.env
-                labels:
-                  - 'traefik.enable=true'
-                  - 'traefik.docker.network=proxy'
-                  - 'traefik.http.routers.${SLUG}.rule=Host("${DOMAIN}") || Host("www.${DOMAIN}")'
-                  - 'traefik.http.routers.${SLUG}.entrypoints=websecure'
-                  - 'traefik.http.routers.${SLUG}.tls.certresolver=le'
-                  - 'traefik.http.routers.${SLUG}.service=${SLUG}'
-                  - 'traefik.http.services.${SLUG}.loadbalancer.server.port=${PORT}'
-                  - 'traefik.http.routers.${SLUG}-admin.rule=Host("${ADMIN_DOMAIN}")'
-                  - 'traefik.http.routers.${SLUG}-admin.entrypoints=websecure'
-                  - 'traefik.http.routers.${SLUG}-admin.tls.certresolver=le'
-                  - 'traefik.http.routers.${SLUG}-admin.service=${SLUG}'
-                  - 'traefik.http.routers.${SLUG}-http.rule=Host("${DOMAIN}") || Host("www.${DOMAIN}")'
-                  - 'traefik.http.routers.${SLUG}-http.entrypoints=web'
-                  - 'traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redirect'
-                  - 'traefik.http.routers.${SLUG}-http.service=${SLUG}'
-                  - 'traefik.http.middlewares.${SLUG}-redirect.redirectscheme.scheme=https'
-                networks:
-                  - proxy
-                  - core_db_net
-            networks:
-              proxy: { external: true, name: proxy }
-              core_db_net: { external: true, name: core_db_net }
-            YAML
+              ADMIN_RULE="'traefik.http.routers.${SLUG_SAFE}-admin.rule=Host(\"${ADMIN_DOMAIN}\")','traefik.http.routers.${SLUG_SAFE}-admin.entrypoints=websecure','traefik.http.routers.${SLUG_SAFE}-admin.tls.certresolver=le','traefik.http.routers.${SLUG_SAFE}-admin.service=${SLUG_SAFE}'"
             else
-              cat > "$TEMPLATE" <<'YAML'
-            services:
-              app:
-                image: ${IMAGE_REF}
-                restart: unless-stopped
-                env_file:
-                  - app.env
-                labels:
-                  - 'traefik.enable=true'
-                  - 'traefik.docker.network=proxy'
-                  - 'traefik.http.routers.${SLUG}.rule=Host("${DOMAIN}") || Host("www.${DOMAIN}")'
-                  - 'traefik.http.routers.${SLUG}.entrypoints=websecure'
-                  - 'traefik.http.routers.${SLUG}.tls.certresolver=le'
-                  - 'traefik.http.routers.${SLUG}.service=${SLUG}'
-                  - 'traefik.http.services.${SLUG}.loadbalancer.server.port=${PORT}'
-                  - 'traefik.http.routers.${SLUG}-http.rule=Host("${DOMAIN}") || Host("www.${DOMAIN}")'
-                  - 'traefik.http.routers.${SLUG}-http.entrypoints=web'
-                  - 'traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redirect'
-                  - 'traefik.http.routers.${SLUG}-http.service=${SLUG}'
-                  - 'traefik.http.middlewares.${SLUG}-redirect.redirectscheme.scheme=https'
-                networks:
-                  - proxy
-                  - core_db_net
-            networks:
-              proxy: { external: true, name: proxy }
-              core_db_net: { external: true, name: core_db_net }
-            YAML
+              ADMIN_RULE="''"
             fi
 
-            export IMAGE_REF SLUG DOMAIN ADMIN_DOMAIN PORT
-            envsubst '$IMAGE_REF $SLUG $DOMAIN $ADMIN_DOMAIN $PORT' < "$TEMPLATE" > docker-compose.yml
+            export IMAGE_REF SLUG_SAFE DOMAIN ADMIN_DOMAIN PORT DB_NET ADMIN_RULE
+            sed -e "s|\${IMAGE_REF}|${IMAGE_REF}|g" \
+                -e "s|\${SLUG_SAFE}|${SLUG_SAFE}|g" \
+                -e "s|\${DOMAIN}|${DOMAIN}|g" \
+                -e "s|\${PORT}|${PORT}|g" \
+                -e "s|\${DB_NET}|${DB_NET}|g" \
+                -e "s|\${ADMIN_RULE}|${ADMIN_RULE}|g" \
+              docker-compose.yml.tpl > docker-compose.yml
 
             docker compose pull || true
             docker compose up -d --remove-orphans
-            docker compose exec -T app sh -lc "npx prisma migrate deploy || true"
+
+            docker compose exec -T app sh -lc 'npx prisma migrate deploy || true'
 
       - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@v1
         env:
-          SLUG:   ${{ needs.detect.outputs.slug }}
+          SLUG: ${{ needs.detect.outputs.slug }}
           DOMAIN: ${{ needs.detect.outputs.domain_prod }}
         with:
           host: ${{ secrets.HZ_HOST }}
@@ -680,7 +672,8 @@ jobs:
           envs: SLUG,DOMAIN
           script: |
             set -euo pipefail
-            cd /opt/sites/${SLUG}
+            SLUG_SAFE="$(printf '%s' "${SLUG}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
+            cd /opt/sites/${SLUG_SAFE}
             PORT=$(docker compose exec -T app sh -lc 'printf "%s" "${PORT:-3000}"')
             echo "Detected PORT=$PORT"
             ok=0
@@ -688,20 +681,15 @@ jobs:
               echo "Probing http://127.0.0.1:${PORT}${path}"
               for i in $(seq 1 20); do
                 if docker compose exec -T app node -e "const http=require('http');http.get({host:'127.0.0.1',port:${PORT},path:'${path}',headers:{'x-forwarded-proto':'https','host':'${DOMAIN:-localhost}'}},r=>process.exit(r.statusCode<400?0:1)).on('error',()=>process.exit(1))"; then
-                  echo "✅ ${path} OK"
-                  ok=1; break
+                  echo '✅ OK'; ok=1; break
                 fi
                 echo "  retry $i"; sleep 3
               done
               [ $ok -eq 1 ] && break
             done
-            if [ $ok -ne 1 ]; then
-              echo "❌ App not healthy internally. Recent logs:" && docker compose logs --no-color --tail=200 app || true
-              exit 1
-            fi
-            echo "✅ App healthy inside container"
+            [ $ok -eq 1 ] || { echo "❌ App not healthy internally"; docker compose logs --no-color --tail=200 app || true; exit 1; }
 
-      - name: Short settle (first issue of certificates, etc.)
+      - name: Short settle
         run: sleep 10
 
       - name: Public health check (through Traefik)
@@ -709,29 +697,13 @@ jobs:
           DOMAIN: ${{ needs.detect.outputs.domain_prod }}
         run: |
           set -e
-          urls=(
-            "https://${DOMAIN}/api/healthz"
-            "https://${DOMAIN}/api/healthz/"
-            "https://${DOMAIN}/"
-          )
-          ok=0
           for i in {1..36}; do
-            for u in "${urls[@]}"; do
-              code=$(curl -L -sS -o /tmp/health_body -w "%{http_code}" "$u" || true)
-              echo "GET $u -> HTTP $code"
-              if [[ "$code" =~ ^(200|204|301|302|307|308)$ ]]; then
-                echo "✅ Public health OK ($code) at $u"; ok=1; break
-              fi
-              if grep -q "404 page not found" /tmp/health_body 2>/dev/null; then
-                echo "Traefik 404 (router warming or path) — retrying…"
-              else
-                echo "Body (first 400 bytes):"; head -c 400 /tmp/health_body || true; echo
-              fi
-            done
-            [ $ok -eq 1 ] && break
+            code=$(curl -L -sS -o /tmp/health_body -w "%{http_code}" "https://${DOMAIN}/api/healthz" || true)
+            echo "GET https://${DOMAIN}/api/healthz -> $code"
+            [[ "$code" =~ ^(200|204|301|302|307|308)$ ]] && { echo "✅ Public health OK"; exit 0; }
             sleep 5
           done
-          [ $ok -eq 1 ] || { echo "❌ Public health failed"; exit 1; }
+          echo "❌ Public health failed"; exit 1
 
   hetzner_static:
     needs: [detect, build_test]
