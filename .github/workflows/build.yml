@@ -684,7 +684,6 @@ jobs:
             docker compose up -d --remove-orphans
             docker compose exec -T app sh -lc 'npx prisma migrate deploy || true'
 
-
       - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@v1
         env:
@@ -705,7 +704,7 @@ jobs:
             PORT=$(docker compose exec -T app sh -lc 'printf "%s" "${PORT:-3000}"')
             echo "Detected PORT=$PORT"
             ok=0
-            for path in /api/healthz /api/healthz/ /app/api/healthz /app/api/healthz/; do
+            for path in /api/healthz /api/healthz/ /; do
               echo "Probing http://127.0.0.1:${PORT}${path}"
               for i in $(seq 1 20); do
                 if docker compose exec -T app node -e "const http=require('http');http.get({host:'127.0.0.1',port:${PORT},path:'${path}',headers:{'x-forwarded-proto':'https','host':'${DOMAIN:-localhost}'}},r=>process.exit(r.statusCode<400?0:1)).on('error',()=>process.exit(1))"; then
@@ -725,13 +724,21 @@ jobs:
           DOMAIN: ${{ needs.detect.outputs.domain_prod }}
         run: |
           set -e
+          urls=("https://${DOMAIN}/api/healthz" "https://${DOMAIN}/")
+          ok=0
           for i in {1..36}; do
-            code=$(curl -L -sS -o /tmp/health_body -w "%{http_code}" "https://${DOMAIN}/api/healthz" || true)
-            echo "GET https://${DOMAIN}/api/healthz -> $code"
-            [[ "$code" =~ ^(200|204|301|302|307|308)$ ]] && { echo "✅ Public health OK"; exit 0; }
+            for u in "${urls[@]}"; do
+              code=$(curl -L -sS -o /tmp/health_body -w "%{http_code}" "$u" || true)
+              echo "GET $u -> HTTP $code"
+              if grep -q "404 page not found" /tmp/health_body 2>/dev/null; then
+                echo "Traefik 404 (router warming/rule) — retrying…"
+              fi
+              [[ "$code" =~ ^(200|204|301|302|307|308)$ ]] && { echo "✅ Public health OK ($code)"; ok=1; break; }
+            done
+            [ $ok -eq 1 ] && break
             sleep 5
           done
-          echo "❌ Public health failed"; exit 1
+          [ $ok -eq 1 ] || { echo "❌ Public health failed"; exit 1; }
 
   hetzner_static:
     needs: [detect, build_test]
@@ -802,7 +809,8 @@ jobs:
             if [ -n "${GHCR_TOKEN:-}" ]; then
               echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             fi
-            SITE_DIR="/opt/sites/${SLUG}"
+            SLUG_SAFE="$(printf '%s' "${SLUG}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
+            SITE_DIR="/opt/sites/${SLUG_SAFE}"
             mkdir -p "$SITE_DIR"
             cd "$SITE_DIR"
 
@@ -814,15 +822,15 @@ jobs:
                 labels:
                   - 'traefik.enable=true'
                   - 'traefik.docker.network=proxy'
-                  - 'traefik.http.routers.${SLUG}.rule=Host("${DOMAIN}")'
-                  - 'traefik.http.routers.${SLUG}.entrypoints=websecure'
-                  - 'traefik.http.routers.${SLUG}.tls.certresolver=le'
-                  - 'traefik.http.services.${SLUG}.loadbalancer.server.port=80'
-                  - 'traefik.http.routers.${SLUG}-http.rule=Host("${DOMAIN}")'
-                  - 'traefik.http.routers.${SLUG}-http.entrypoints=web'
-                  - 'traefik.http.routers.${SLUG}-http.middlewares=${SLUG}-redirect'
-                  - 'traefik.http.routers.${SLUG}-http.service=${SLUG}'
-                  - 'traefik.http.middlewares.${SLUG}-redirect.redirectscheme.scheme=https'
+                  - 'traefik.http.routers.${SLUG_SAFE}.rule=Host("${DOMAIN}")'
+                  - 'traefik.http.routers.${SLUG_SAFE}.entrypoints=websecure'
+                  - 'traefik.http.routers.${SLUG_SAFE}.tls.certresolver=le'
+                  - 'traefik.http.services.${SLUG_SAFE}.loadbalancer.server.port=80'
+                  - 'traefik.http.routers.${SLUG_SAFE}-http.rule=Host("${DOMAIN}")'
+                  - 'traefik.http.routers.${SLUG_SAFE}-http.entrypoints=web'
+                  - 'traefik.http.routers.${SLUG_SAFE}-http.middlewares=${SLUG_SAFE}-redirect'
+                  - 'traefik.http.routers.${SLUG_SAFE}-http.service=${SLUG_SAFE}'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-redirect.redirectscheme.scheme=https'
                 networks:
                   - proxy
             networks:
@@ -830,11 +838,11 @@ jobs:
                 external: true
                 name: proxy
             YAML
-            export IMAGE_REF SLUG DOMAIN
+            export IMAGE_REF SLUG_SAFE DOMAIN
             if ! command -v envsubst >/dev/null 2>&1; then
               apt-get update -y && apt-get install -y --no-install-recommends gettext-base
             fi
-            envsubst '$IMAGE_REF $SLUG $DOMAIN' < docker-compose.yml.tpl > docker-compose.yml
+            envsubst '$IMAGE_REF $SLUG_SAFE $DOMAIN' < docker-compose.yml.tpl > docker-compose.yml
 
             docker compose pull || true
             docker compose up -d --remove-orphans
