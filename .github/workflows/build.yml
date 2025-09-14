@@ -458,25 +458,41 @@ jobs:
             echo 'EOF'
           } >> "$GITHUB_ENV"
 
-      - name: Sanity check required SSH & pgAdmin & CF secrets
+      - name: Parse values from SITE_ENV (pgAdmin + Cloudflare)
+        env:
+          CF_SECRET_DIRECT: ${{ secrets.CF_DNS_API_TOKEN }}
+        run: |
+          printf "%s\n" "$SITE_ENV" | sed 's/\r$//' > .site_env
+          # pgAdmin
+          PGADMIN_EMAIL="$(awk -F= '/^PGADMIN_EMAIL=/{print $2}' .site_env | tail -1)"
+          PGADMIN_PASSWORD="$(awk -F= '/^PGADMIN_PASSWORD=/{print $2}' .site_env | tail -1)"
+          [ -n "$PGADMIN_EMAIL" ]    || { echo "❌ PGADMIN_EMAIL missing in SITE_ENV"; exit 1; }
+          [ -n "$PGADMIN_PASSWORD" ] || { echo "❌ PGADMIN_PASSWORD missing in SITE_ENV"; exit 1; }
+          echo "PGADMIN_EMAIL=$PGADMIN_EMAIL"       >> $GITHUB_ENV
+          echo "PGADMIN_PASSWORD=$PGADMIN_PASSWORD" >> $GITHUB_ENV
+          # Cloudflare token: prefer GH secret, else fall back to SITE_ENV (CLOUDFLARE_DNS_API_TOKEN or CF_DNS_API_TOKEN)
+          if [ -n "${CF_SECRET_DIRECT:-}" ]; then
+            echo "CF_DNS_API_TOKEN=${CF_SECRET_DIRECT}" >> $GITHUB_ENV
+          else
+            CF_FROM_ENV="$(awk -F= '/^(CLOUDFLARE_DNS_API_TOKEN|CF_DNS_API_TOKEN)=/{print $2}' .site_env | tail -1)"
+            [ -n "$CF_FROM_ENV" ] || { echo "❌ Cloudflare DNS token missing (set CF_DNS_API_TOKEN secret or add CLOUDFLARE_DNS_API_TOKEN to SITE_ENV)"; exit 1; }
+            echo "CF_DNS_API_TOKEN=$CF_FROM_ENV" >> $GITHUB_ENV
+          fi
+
+      - name: Sanity check required SSH & parsed vars
         env:
           HZ_HOST:    ${{ secrets.HZ_HOST }}
           HZ_SSH_KEY: ${{ secrets.HZ_SSH_KEY }}
-          PGADMIN_EMAIL:    ${{ secrets.PGADMIN_EMAIL }}
-          PGADMIN_PASSWORD: ${{ secrets.PGADMIN_PASSWORD }}
-          CF_DNS_API_TOKEN: ${{ secrets.CF_DNS_API_TOKEN }}
         run: |
-          [ -n "${HZ_HOST:-}" ]          || { echo "❌ Missing secret: HZ_HOST"; exit 1; }
-          [ -n "${HZ_SSH_KEY:-}" ]       || { echo "❌ Missing secret: HZ_SSH_KEY"; exit 1; }
-          [ -n "${PGADMIN_EMAIL:-}" ]    || { echo "❌ Missing secret: PGADMIN_EMAIL"; exit 1; }
-          [ -n "${PGADMIN_PASSWORD:-}" ] || { echo "❌ Missing secret: PGADMIN_PASSWORD"; exit 1; }
-          [ -n "${CF_DNS_API_TOKEN:-}" ] || { echo "❌ Missing secret: CF_DNS_API_TOKEN"; exit 1; }
+          [ -n "${HZ_HOST:-}" ]            || { echo "❌ Missing secret: HZ_HOST"; exit 1; }
+          [ -n "${HZ_SSH_KEY:-}" ]         || { echo "❌ Missing secret: HZ_SSH_KEY"; exit 1; }
+          [ -n "${PGADMIN_EMAIL:-}" ]      || { echo "❌ PGADMIN_EMAIL not exported"; exit 1; }
+          [ -n "${PGADMIN_PASSWORD:-}" ]   || { echo "❌ PGADMIN_PASSWORD not exported"; exit 1; }
+          [ -n "${CF_DNS_API_TOKEN:-}" ]   || { echo "❌ CF_DNS_API_TOKEN not available"; exit 1; }
 
       - name: Discover Hetzner public IP (via SSH)
         id: hostip
         uses: appleboy/ssh-action@v1
-        env:
-          SLUG: ${{ needs.detect.outputs.slug }}
         with:
           host: ${{ secrets.HZ_HOST }}
           username: ${{ secrets.HZ_USER || 'root' }}
@@ -490,7 +506,7 @@ jobs:
 
       - name: Ensure Cloudflare DNS (root, www, admin, pgadmin)
         env:
-          CF_TOKEN:   ${{ secrets.CF_DNS_API_TOKEN }}
+          CF_TOKEN:   ${{ env.CF_DNS_API_TOKEN }}
           ROOT:       ${{ needs.detect.outputs.domain_prod }}
           ADMIN:      ${{ needs.detect.outputs.domain_admin }}
           PGADMIN:    ${{ needs.detect.outputs.domain_pgadmin }}
@@ -498,13 +514,11 @@ jobs:
         run: |
           set -euo pipefail
           api(){ curl -sS -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" "$@"; }
-
+          # resolve base zone
           ZONE_NAME="$ROOT"
-          # strip first label to get zone (example.com from foo.example.com) if user provided subdomain by mistake
           if [ "$(echo "$ZONE_NAME" | awk -F. '{print NF}')" -gt 2 ]; then
             ZONE_NAME="$(echo "$ZONE_NAME" | awk -F. '{print $(NF-1)"."$NF}')"
           fi
-
           ZID=$(api "https://api.cloudflare.com/client/v4/zones?name=${ZONE_NAME}" | jq -r '.result[0].id')
           [ "$ZID" != "null" ] && [ -n "$ZID" ] || { echo "❌ Zone ${ZONE_NAME} not found in Cloudflare"; exit 1; }
 
@@ -522,10 +536,8 @@ jobs:
             fi
           }
 
-          # root and www
           upsert_a "${ROOT}" "$IP4" true
           upsert_a "www.${ROOT}" "$IP4" true
-          # admin and pgadmin
           upsert_a "${ADMIN}" "$IP4" true
           upsert_a "${PGADMIN}" "$IP4" true
 
@@ -543,9 +555,9 @@ jobs:
           SITE_ENV:     ${{ env.SITE_ENV }}
           GHCR_USER:    ${{ github.repository_owner }}
           GHCR_TOKEN:   ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
-          CF_DNS_API_TOKEN: ${{ secrets.CF_DNS_API_TOKEN }}
-          PGADMIN_EMAIL:    ${{ secrets.PGADMIN_EMAIL }}
-          PGADMIN_PASSWORD: ${{ secrets.PGADMIN_PASSWORD }}
+          CF_DNS_API_TOKEN: ${{ env.CF_DNS_API_TOKEN }}
+          PGADMIN_EMAIL:    ${{ env.PGADMIN_EMAIL }}
+          PGADMIN_PASSWORD: ${{ env.PGADMIN_PASSWORD }}
         with:
           host: ${{ secrets.HZ_HOST }}
           username: ${{ secrets.HZ_USER || 'root' }}
@@ -821,7 +833,7 @@ jobs:
           username: ${{ secrets.HZ_USER || 'root' }}
           key: ${{ secrets.HZ_SSH_KEY }}
           port: 22
-        # (health-check script same as your original)
+          command_timeout: 10m
           script: |
             set -euo pipefail
             SLUG_SAFE="$(printf '%s' "${SLUG}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
