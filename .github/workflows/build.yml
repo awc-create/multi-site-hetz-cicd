@@ -716,7 +716,7 @@ jobs:
                 environment:
                   PGADMIN_LISTEN_PORT: "8080"
                   PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "True"
-                  PGADMIN_CONFIG_LOGIN_BANNER: "Authorized staff only."
+                  PGADMIN_CONFIG_LOGIN_BANNER: "\"Authorized staff only.\""
                 volumes:
                   - ./pgadmin-servers.json:/pgadmin4/servers.json:ro
                   - pgadmin_data_${SLUG_SAFE}:/var/lib/pgadmin
