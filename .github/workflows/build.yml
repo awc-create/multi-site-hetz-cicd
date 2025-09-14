@@ -470,12 +470,12 @@ jobs:
           [ -n "$PGADMIN_PASSWORD" ] || { echo "❌ PGADMIN_PASSWORD missing in SITE_ENV"; exit 1; }
           echo "PGADMIN_EMAIL=$PGADMIN_EMAIL"       >> $GITHUB_ENV
           echo "PGADMIN_PASSWORD=$PGADMIN_PASSWORD" >> $GITHUB_ENV
-          # Cloudflare token: prefer GH secret, else fall back to SITE_ENV (CLOUDFLARE_DNS_API_TOKEN or CF_DNS_API_TOKEN)
+          # Cloudflare token
           if [ -n "${CF_SECRET_DIRECT:-}" ]; then
             echo "CF_DNS_API_TOKEN=${CF_SECRET_DIRECT}" >> $GITHUB_ENV
           else
             CF_FROM_ENV="$(awk -F= '/^(CLOUDFLARE_DNS_API_TOKEN|CF_DNS_API_TOKEN)=/{print $2}' .site_env | tail -1)"
-            [ -n "$CF_FROM_ENV" ] || { echo "❌ Cloudflare DNS token missing (set CF_DNS_API_TOKEN secret or add CLOUDFLARE_DNS_API_TOKEN to SITE_ENV)"; exit 1; }
+            [ -n "$CF_FROM_ENV" ] || { echo "❌ Cloudflare DNS token missing"; exit 1; }
             echo "CF_DNS_API_TOKEN=$CF_FROM_ENV" >> $GITHUB_ENV
           fi
 
@@ -490,7 +490,6 @@ jobs:
           [ -n "${PGADMIN_PASSWORD:-}" ]   || { echo "❌ PGADMIN_PASSWORD not exported"; exit 1; }
           [ -n "${CF_DNS_API_TOKEN:-}" ]   || { echo "❌ CF_DNS_API_TOKEN not available"; exit 1; }
 
-            # NEW: resolve IPv4 of the target host on the runner (no SSH)
       - name: Resolve Hetzner public IPv4
         id: ipresolve
         env:
@@ -518,7 +517,7 @@ jobs:
           ROOT:       ${{ needs.detect.outputs.domain_prod }}
           ADMIN:      ${{ needs.detect.outputs.domain_admin }}
           PGADMIN:    ${{ needs.detect.outputs.domain_pgadmin }}
-          IP4:        ${{ steps.ipresolve.outputs.PUBLIC_IPV4 }}   # <-- updated
+          IP4:        ${{ steps.ipresolve.outputs.PUBLIC_IPV4 }}
         run: |
           set -euo pipefail
           api(){ curl -sS -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" "$@"; }
@@ -675,7 +674,7 @@ jobs:
             }
             JSON
 
-            cat > "${DB_DIR}/docker-compose.yml" <<DBYAML
+            cat > "${DB_DIR}/docker-compose.yml" <<'DBYAML'
             services:
               postgres:
                 image: postgres:15
@@ -684,7 +683,7 @@ jobs:
                 environment:
                   POSTGRES_INITDB_ARGS: "--auth=scram-sha-256"
                 healthcheck:
-                  test: ["CMD-SHELL", "pg_isready -U \$\$POSTGRES_USER -d \$\$POSTGRES_DB"]
+                  test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
                   interval: 10s
                   timeout: 5s
                   retries: 30
@@ -702,8 +701,8 @@ jobs:
                   DEFAULT_POOL_SIZE: 20
                   AUTH_TYPE: scram-sha-256
                   DB_HOST: postgres
-                  DB_USER: \${POSTGRES_USER}
-                  DB_PASSWORD: \${POSTGRES_PASSWORD}
+                  DB_USER: ${POSTGRES_USER}
+                  DB_PASSWORD: ${POSTGRES_PASSWORD}
                 depends_on:
                   postgres:
                     condition: service_healthy
@@ -715,7 +714,13 @@ jobs:
                 env_file: .env
                 environment:
                   PGADMIN_LISTEN_PORT: "8080"
-                  PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "True"
+                  # --- Proxy/CF-safe settings to prevent spinner/302 on static ---
+                  PGADMIN_CONFIG_ENABLE_PROXY_FIX: "True"
+                  PGADMIN_CONFIG_SESSION_COOKIE_SECURE: "True"
+                  PGADMIN_CONFIG_SESSION_COOKIE_SAMESITE: "None"
+                  PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "False"
+                  PGADMIN_CONFIG_WTF_CSRF_CHECK_DEFAULT: "False"
+                  PGADMIN_CONFIG_CONSOLE_LOG_LEVEL: "10"
                   PGADMIN_CONFIG_LOGIN_BANNER: "\"Authorized staff only.\""
                 volumes:
                   - ./pgadmin-servers.json:/pgadmin4/servers.json:ro
@@ -842,7 +847,7 @@ jobs:
           port: 22
           timeout: 60s
           command_timeout: 10m
-          envs: SLUG,DOMAIN   # <-- REQUIRED: pass env to remote session
+          envs: SLUG,DOMAIN
           script: |
             set -euo pipefail
             : "${SLUG:?missing SLUG}"
@@ -862,11 +867,11 @@ jobs:
                   echo '✅ OK'; ok=1; break
                 fi
                 echo "  retry $i"; sleep 3
-              done
+              end
               [ $ok -eq 1 ] && break
             done
             [ $ok -eq 1 ] || { echo "❌ App not healthy internally"; docker compose logs --no-color --tail=200 app || true; exit 1; }
-           
+
       - name: Short settle
         run: sleep 10
 
@@ -990,7 +995,7 @@ jobs:
                 name: proxy
             YAML
             export IMAGE_REF SLUG_SAFE DOMAIN
-            if ! command -v envsubst >/dev/null 2>&1; then
+            if ! command -v envsubst >/dev/null 21>&1; then
               apt-get update -y && apt-get install -y --no-install-recommends gettext-base
             fi
             envsubst '$IMAGE_REF $SLUG_SAFE $DOMAIN' < docker-compose.yml.tpl > docker-compose.yml
