@@ -490,19 +490,65 @@ jobs:
           [ -n "${PGADMIN_PASSWORD:-}" ]   || { echo "❌ PGADMIN_PASSWORD not exported"; exit 1; }
           [ -n "${CF_DNS_API_TOKEN:-}" ]   || { echo "❌ CF_DNS_API_TOKEN not available"; exit 1; }
 
-      - name: Discover Hetzner public IP (via SSH)
-        id: hostip
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.HZ_HOST }}
-          username: ${{ secrets.HZ_USER || 'root' }}
-          key: ${{ secrets.HZ_SSH_KEY }}
-          script: |
-            set -e
-            IP4=$(curl -4 -s ifconfig.me || curl -4 -s ipinfo.io/ip || true)
-            [ -n "$IP4" ] || { echo "No IPv4 detected"; exit 1; }
-            echo "PUBLIC_IPV4=$IP4"
-            echo "PUBLIC_IPV4=$IP4" >> $GITHUB_OUTPUT
+            # NEW: resolve IPv4 of the target host on the runner (no SSH)
+      - name: Resolve Hetzner public IPv4
+        id: ipresolve
+        env:
+          HOST: ${{ secrets.HZ_HOST }}
+        run: |
+          set -euo pipefail
+          H="$HOST"
+          ip_re='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+          if [[ "$H" =~ $ip_re ]]; then
+            IP4="$H"
+          else
+            IP4="$(getent ahostsv4 "$H" | awk '{print $1; exit}' || true)"
+            [ -n "$IP4" ] || IP4="$(dig +short A "$H" | head -1 || true)"
+            if [ -z "$IP4" ] && command -v nslookup >/dev/null 2>&1; then
+              IP4="$(nslookup -type=A "$H" 2>/dev/null | awk '/Address: /{print $2; exit}' || true)"
+            fi
+          fi
+          [ -n "${IP4:-}" ] || { echo "❌ Could not resolve IPv4 for $H"; exit 1; }
+          echo "PUBLIC_IPV4=$IP4" >> "$GITHUB_OUTPUT"
+          echo "Resolved IPv4: $IP4"
+
+      - name: Ensure Cloudflare DNS (root, www, admin, pgadmin)
+        env:
+          CF_TOKEN:   ${{ env.CF_DNS_API_TOKEN }}
+          ROOT:       ${{ needs.detect.outputs.domain_prod }}
+          ADMIN:      ${{ needs.detect.outputs.domain_admin }}
+          PGADMIN:    ${{ needs.detect.outputs.domain_pgadmin }}
+          IP4:        ${{ steps.ipresolve.outputs.PUBLIC_IPV4 }}   # <-- updated
+        run: |
+          set -euo pipefail
+          api(){ curl -sS -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" "$@"; }
+          ZONE_NAME="$ROOT"
+          if [ "$(echo "$ZONE_NAME" | awk -F. '{print NF}')" -gt 2 ]; then
+            ZONE_NAME="$(echo "$ZONE_NAME" | awk -F. '{print $(NF-1)"."$NF}')"
+          fi
+          ZID=$(api "https://api.cloudflare.com/client/v4/zones?name=${ZONE_NAME}" | jq -r '.result[0].id')
+          [ "$ZID" != "null" ] && [ -n "$ZID" ] || { echo "❌ Zone ${ZONE_NAME} not found in Cloudflare"; exit 1; }
+
+          upsert_a(){
+            local name="$1"; local ip="$2"; local proxied="${3:-true}"
+            local rid=$(api "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records?type=A&name=${name}" | jq -r '.result[0].id')
+            if [ "$rid" = "null" ] || [ -z "$rid" ]; then
+              echo "Create A ${name} -> ${ip}"
+              api -X POST "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records" \
+                --data "{\"type\":\"A\",\"name\":\"${name}\",\"content\":\"${ip}\",\"ttl\":120,\"proxied\":${proxied}}" >/dev/null
+            else
+              echo "Update A ${name} -> ${ip}"
+              api -X PUT "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records/${rid}" \
+                --data "{\"type\":\"A\",\"name\":\"${name}\",\"content\":\"${ip}\",\"ttl\":120,\"proxied\":${proxied}}" >/dev/null
+            fi
+          }
+
+          upsert_a "${ROOT}"      "$IP4" true
+          upsert_a "www.${ROOT}"  "$IP4" true
+          upsert_a "${ADMIN}"     "$IP4" true
+          upsert_a "${PGADMIN}"   "$IP4" true
+
+          echo "✅ DNS records ensured for ${ROOT}, www.${ROOT}, ${ADMIN}, ${PGADMIN}"
 
       - name: Ensure Cloudflare DNS (root, www, admin, pgadmin)
         env:
