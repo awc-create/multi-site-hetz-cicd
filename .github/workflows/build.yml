@@ -550,45 +550,6 @@ jobs:
 
           echo "✅ DNS records ensured for ${ROOT}, www.${ROOT}, ${ADMIN}, ${PGADMIN}"
 
-      - name: Ensure Cloudflare DNS (root, www, admin, pgadmin)
-        env:
-          CF_TOKEN:   ${{ env.CF_DNS_API_TOKEN }}
-          ROOT:       ${{ needs.detect.outputs.domain_prod }}
-          ADMIN:      ${{ needs.detect.outputs.domain_admin }}
-          PGADMIN:    ${{ needs.detect.outputs.domain_pgadmin }}
-          IP4:        ${{ steps.hostip.outputs.PUBLIC_IPV4 }}
-        run: |
-          set -euo pipefail
-          api(){ curl -sS -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" "$@"; }
-          # resolve base zone
-          ZONE_NAME="$ROOT"
-          if [ "$(echo "$ZONE_NAME" | awk -F. '{print NF}')" -gt 2 ]; then
-            ZONE_NAME="$(echo "$ZONE_NAME" | awk -F. '{print $(NF-1)"."$NF}')"
-          fi
-          ZID=$(api "https://api.cloudflare.com/client/v4/zones?name=${ZONE_NAME}" | jq -r '.result[0].id')
-          [ "$ZID" != "null" ] && [ -n "$ZID" ] || { echo "❌ Zone ${ZONE_NAME} not found in Cloudflare"; exit 1; }
-
-          upsert_a(){
-            local name="$1"; local ip="$2"; local proxied="${3:-true}"
-            local rid=$(api "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records?type=A&name=${name}" | jq -r '.result[0].id')
-            if [ "$rid" = "null" ] || [ -z "$rid" ]; then
-              echo "Create A ${name} -> ${ip}"
-              api -X POST "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records" \
-                --data "{\"type\":\"A\",\"name\":\"${name}\",\"content\":\"${ip}\",\"ttl\":120,\"proxied\":${proxied}}" >/dev/null
-            else
-              echo "Update A ${name} -> ${ip}"
-              api -X PUT "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records/${rid}" \
-                --data "{\"type\":\"A\",\"name\":\"${name}\",\"content\":\"${ip}\",\"ttl\":120,\"proxied\":${proxied}}" >/dev/null
-            fi
-          }
-
-          upsert_a "${ROOT}" "$IP4" true
-          upsert_a "www.${ROOT}" "$IP4" true
-          upsert_a "${ADMIN}" "$IP4" true
-          upsert_a "${PGADMIN}" "$IP4" true
-
-          echo "✅ DNS records ensured for ${ROOT}, www.${ROOT}, ${ADMIN}, ${PGADMIN}"
-
       - name: Deploy over SSH (Traefik + per-project DB + app + pgAdmin)
         uses: appleboy/ssh-action@v1
         env:
