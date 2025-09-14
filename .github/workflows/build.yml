@@ -625,7 +625,9 @@ jobs:
                 environment:
                   CF_DNS_API_TOKEN: ${CF_DNS_API_TOKEN}
                   CLOUDFLARE_DNS_API_TOKEN: ${CLOUDFLARE_DNS_API_TOKEN}
-                ports: [ "80:80", "443:443" ]
+                ports:
+                  - "80:80"
+                  - "443:443"ß
                 volumes:
                   - /var/run/docker.sock:/var/run/docker.sock:ro
                   - ./letsencrypt:/letsencrypt
@@ -867,7 +869,7 @@ jobs:
                   echo '✅ OK'; ok=1; break
                 fi
                 echo "  retry $i"; sleep 3
-              end
+              done
               [ $ok -eq 1 ] && break
             done
             [ $ok -eq 1 ] || { echo "❌ App not healthy internally"; docker compose logs --no-color --tail=200 app || true; exit 1; }
