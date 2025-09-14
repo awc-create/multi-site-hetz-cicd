@@ -31,6 +31,7 @@ jobs:
       port:             ${{ steps.cfg.outputs.PORT }}
       domain_prod:      ${{ steps.dom.outputs.DOMAIN_PROD }}
       domain_admin:     ${{ steps.dom.outputs.DOMAIN_ADMIN }}
+      domain_pgadmin:   ${{ steps.dom.outputs.DOMAIN_PGADMIN }}
     steps:
       - name: Extract payload (repo/branch)
         id: p
@@ -60,6 +61,7 @@ jobs:
           PORT="3000"
           DOMAIN_PROD=""
           DOMAIN_ADMIN=""
+          DOMAIN_PGADMIN=""
           if [ -f ".cicd-config.yml" ]; then
             get_val(){ grep -E "^$1:" .cicd-config.yml | head -1 | awk -F': *' '{print $2}' | tr -d "\"'"; }
             SLUG="$(get_val slug || echo "$SLUG")"
@@ -67,11 +69,14 @@ jobs:
             DOM_BLOCK="$(awk '/^domains:/{f=1;next} f && /^[^ ]/{f=0} f{print}' .cicd-config.yml)"
             DOMAIN_PROD="$(printf '%s\n' "$DOM_BLOCK" | awk '/prod:/{print $2}' | tr -d "\"'")"
             DOMAIN_ADMIN="$(printf '%s\n' "$DOM_BLOCK" | awk '/admin:/{print $2}' | tr -d "\"'")"
+            PGADMIN_SUB="$(get_val pgadmin_subdomain || true)"
+            [ -n "$PGADMIN_SUB" ] && DOMAIN_PGADMIN="${PGADMIN_SUB}.${DOMAIN_PROD}"
           fi
           echo "SLUG=$SLUG" >> $GITHUB_OUTPUT
           echo "PORT=$PORT" >> $GITHUB_OUTPUT
           echo "DOMAIN_PROD_RAW=$DOMAIN_PROD" >> $GITHUB_OUTPUT
           echo "DOMAIN_ADMIN_RAW=$DOMAIN_ADMIN" >> $GITHUB_OUTPUT
+          echo "DOMAIN_PGADMIN_RAW=$DOMAIN_PGADMIN" >> $GITHUB_OUTPUT
 
       - name: Detect project type
         id: detect
@@ -83,20 +88,25 @@ jobs:
           fi
           echo "PROJECT_TYPE=$PT" >> $GITHUB_OUTPUT
 
-      - name: Finalize domains (default admin=admin.prod)
+      - name: Finalize domains (default admin=admin.prod, pgadmin=dbui.prod)
         id: dom
         run: |
           PROD="${{ steps.cfg.outputs.DOMAIN_PROD_RAW }}"
           ADMIN="${{ steps.cfg.outputs.DOMAIN_ADMIN_RAW }}"
+          PGADMIN="${{ steps.cfg.outputs.DOMAIN_PGADMIN_RAW }}"
           if [ -z "$PROD" ]; then
             echo "❌ DOMAIN_PROD missing (set it in .cicd-config.yml -> domains.prod)"; exit 1;
           fi
           if [ -z "$ADMIN" ]; then
             ADMIN="admin.${PROD}"
           fi
-          echo "DOMAIN_PROD=$PROD"  >> $GITHUB_OUTPUT
-          echo "DOMAIN_ADMIN=$ADMIN" >> $GITHUB_OUTPUT
-          echo "Using domains: PROD=$PROD ADMIN=$ADMIN"
+          if [ -z "$PGADMIN" ]; then
+            PGADMIN="dbui.${PROD}"
+          fi
+          echo "DOMAIN_PROD=$PROD"    >> $GITHUB_OUTPUT
+          echo "DOMAIN_ADMIN=$ADMIN"  >> $GITHUB_OUTPUT
+          echo "DOMAIN_PGADMIN=$PGADMIN" >> $GITHUB_OUTPUT
+          echo "Using domains: PROD=$PROD ADMIN=$ADMIN PGADMIN=$PGADMIN"
 
   build_test:
     runs-on: ubuntu-latest
@@ -448,26 +458,94 @@ jobs:
             echo 'EOF'
           } >> "$GITHUB_ENV"
 
-      - name: Sanity check required SSH secrets
+      - name: Sanity check required SSH & pgAdmin & CF secrets
         env:
           HZ_HOST:    ${{ secrets.HZ_HOST }}
           HZ_SSH_KEY: ${{ secrets.HZ_SSH_KEY }}
+          PGADMIN_EMAIL:    ${{ secrets.PGADMIN_EMAIL }}
+          PGADMIN_PASSWORD: ${{ secrets.PGADMIN_PASSWORD }}
+          CF_DNS_API_TOKEN: ${{ secrets.CF_DNS_API_TOKEN }}
         run: |
-          [ -n "${HZ_HOST:-}" ]    || { echo "❌ Missing secret: HZ_HOST"; exit 1; }
-          [ -n "${HZ_SSH_KEY:-}" ] || { echo "❌ Missing secret: HZ_SSH_KEY"; exit 1; }
+          [ -n "${HZ_HOST:-}" ]          || { echo "❌ Missing secret: HZ_HOST"; exit 1; }
+          [ -n "${HZ_SSH_KEY:-}" ]       || { echo "❌ Missing secret: HZ_SSH_KEY"; exit 1; }
+          [ -n "${PGADMIN_EMAIL:-}" ]    || { echo "❌ Missing secret: PGADMIN_EMAIL"; exit 1; }
+          [ -n "${PGADMIN_PASSWORD:-}" ] || { echo "❌ Missing secret: PGADMIN_PASSWORD"; exit 1; }
+          [ -n "${CF_DNS_API_TOKEN:-}" ] || { echo "❌ Missing secret: CF_DNS_API_TOKEN"; exit 1; }
 
-      - name: Deploy over SSH (Traefik + per-project DB + app)
+      - name: Discover Hetzner public IP (via SSH)
+        id: hostip
+        uses: appleboy/ssh-action@v1
+        env:
+          SLUG: ${{ needs.detect.outputs.slug }}
+        with:
+          host: ${{ secrets.HZ_HOST }}
+          username: ${{ secrets.HZ_USER || 'root' }}
+          key: ${{ secrets.HZ_SSH_KEY }}
+          script: |
+            set -e
+            IP4=$(curl -4 -s ifconfig.me || curl -4 -s ipinfo.io/ip || true)
+            [ -n "$IP4" ] || { echo "No IPv4 detected"; exit 1; }
+            echo "PUBLIC_IPV4=$IP4"
+            echo "PUBLIC_IPV4=$IP4" >> $GITHUB_OUTPUT
+
+      - name: Ensure Cloudflare DNS (root, www, admin, pgadmin)
+        env:
+          CF_TOKEN:   ${{ secrets.CF_DNS_API_TOKEN }}
+          ROOT:       ${{ needs.detect.outputs.domain_prod }}
+          ADMIN:      ${{ needs.detect.outputs.domain_admin }}
+          PGADMIN:    ${{ needs.detect.outputs.domain_pgadmin }}
+          IP4:        ${{ steps.hostip.outputs.PUBLIC_IPV4 }}
+        run: |
+          set -euo pipefail
+          api(){ curl -sS -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" "$@"; }
+
+          ZONE_NAME="$ROOT"
+          # strip first label to get zone (example.com from foo.example.com) if user provided subdomain by mistake
+          if [ "$(echo "$ZONE_NAME" | awk -F. '{print NF}')" -gt 2 ]; then
+            ZONE_NAME="$(echo "$ZONE_NAME" | awk -F. '{print $(NF-1)"."$NF}')"
+          fi
+
+          ZID=$(api "https://api.cloudflare.com/client/v4/zones?name=${ZONE_NAME}" | jq -r '.result[0].id')
+          [ "$ZID" != "null" ] && [ -n "$ZID" ] || { echo "❌ Zone ${ZONE_NAME} not found in Cloudflare"; exit 1; }
+
+          upsert_a(){
+            local name="$1"; local ip="$2"; local proxied="${3:-true}"
+            local rid=$(api "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records?type=A&name=${name}" | jq -r '.result[0].id')
+            if [ "$rid" = "null" ] || [ -z "$rid" ]; then
+              echo "Create A ${name} -> ${ip}"
+              api -X POST "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records" \
+                --data "{\"type\":\"A\",\"name\":\"${name}\",\"content\":\"${ip}\",\"ttl\":120,\"proxied\":${proxied}}" >/dev/null
+            else
+              echo "Update A ${name} -> ${ip}"
+              api -X PUT "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records/${rid}" \
+                --data "{\"type\":\"A\",\"name\":\"${name}\",\"content\":\"${ip}\",\"ttl\":120,\"proxied\":${proxied}}" >/dev/null
+            fi
+          }
+
+          # root and www
+          upsert_a "${ROOT}" "$IP4" true
+          upsert_a "www.${ROOT}" "$IP4" true
+          # admin and pgadmin
+          upsert_a "${ADMIN}" "$IP4" true
+          upsert_a "${PGADMIN}" "$IP4" true
+
+          echo "✅ DNS records ensured for ${ROOT}, www.${ROOT}, ${ADMIN}, ${PGADMIN}"
+
+      - name: Deploy over SSH (Traefik + per-project DB + app + pgAdmin)
         uses: appleboy/ssh-action@v1
         env:
           SLUG:         ${{ needs.detect.outputs.slug }}
           PORT:         ${{ needs.detect.outputs.port }}
           DOMAIN:       ${{ needs.detect.outputs.domain_prod }}
           ADMIN_DOMAIN: ${{ needs.detect.outputs.domain_admin }}
+          PGADMIN_HOST: ${{ needs.detect.outputs.domain_pgadmin }}
           IMAGE_REF:    ${{ needs.image_build_push.outputs.ref }}
           SITE_ENV:     ${{ env.SITE_ENV }}
           GHCR_USER:    ${{ github.repository_owner }}
           GHCR_TOKEN:   ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
           CF_DNS_API_TOKEN: ${{ secrets.CF_DNS_API_TOKEN }}
+          PGADMIN_EMAIL:    ${{ secrets.PGADMIN_EMAIL }}
+          PGADMIN_PASSWORD: ${{ secrets.PGADMIN_PASSWORD }}
         with:
           host: ${{ secrets.HZ_HOST }}
           username: ${{ secrets.HZ_USER || 'root' }}
@@ -475,7 +553,7 @@ jobs:
           port: 22
           timeout: 60s
           command_timeout: 25m
-          envs: SLUG,PORT,DOMAIN,ADMIN_DOMAIN,IMAGE_REF,SITE_ENV,GHCR_USER,GHCR_TOKEN,CF_DNS_API_TOKEN
+          envs: SLUG,PORT,DOMAIN,ADMIN_DOMAIN,PGADMIN_HOST,IMAGE_REF,SITE_ENV,GHCR_USER,GHCR_TOKEN,CF_DNS_API_TOKEN,PGADMIN_EMAIL,PGADMIN_PASSWORD
           script: |
             set -euo pipefail
 
@@ -546,7 +624,7 @@ jobs:
               echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             fi
 
-            # --- Per-project DB stack ---
+            # --- Per-project DB stack (Postgres + PgBouncer + pgAdmin) ---
             mkdir -p "${DB_DIR}"
             cat > "${DB_DIR}/.env" <<EOF
             POSTGRES_USER=${DB_USER}
@@ -555,7 +633,28 @@ jobs:
             DB_USER=${DB_USER}
             DB_PASSWORD=${DB_PASS}
             DB_NAME=${DB_NAME}
+            PGADMIN_DEFAULT_EMAIL=${PGADMIN_EMAIL}
+            PGADMIN_DEFAULT_PASSWORD=${PGADMIN_PASSWORD}
+            PGADMIN_DEFAULT_SERVER_NAME=PgBouncer (${SLUG_SAFE})
             EOF
+
+            # Pre-seed pgAdmin server pointing to PgBouncer in the same Docker network
+            cat > "${DB_DIR}/pgadmin-servers.json" <<JSON
+            {
+              "Servers": {
+                "1": {
+                  "Name": "PgBouncer (${SLUG_SAFE})",
+                  "Group": "Servers",
+                  "Host": "pgbouncer",
+                  "Port": 5432,
+                  "MaintenanceDB": "${DB_NAME}",
+                  "Username": "${DB_USER}",
+                  "SSLMode": "prefer",
+                  "Comment": "Routes via PgBouncer in the same Docker network"
+                }
+              }
+            }
+            JSON
 
             cat > "${DB_DIR}/docker-compose.yml" <<DBYAML
             services:
@@ -566,7 +665,7 @@ jobs:
                 environment:
                   POSTGRES_INITDB_ARGS: "--auth=scram-sha-256"
                 healthcheck:
-                  test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+                  test: ["CMD-SHELL", "pg_isready -U \$\$POSTGRES_USER -d \$\$POSTGRES_DB"]
                   interval: 10s
                   timeout: 5s
                   retries: 30
@@ -591,17 +690,46 @@ jobs:
                     condition: service_healthy
                 networks: [ ${DB_NET} ]
 
+              pgadmin:
+                image: dpage/pgadmin4:8
+                restart: unless-stopped
+                env_file: .env
+                environment:
+                  PGADMIN_LISTEN_PORT: "8080"
+                  PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "True"
+                  PGADMIN_CONFIG_LOGIN_BANNER: "Authorized staff only."
+                volumes:
+                  - ./pgadmin-servers.json:/pgadmin4/servers.json:ro
+                  - pgadmin_data_${SLUG_SAFE}:/var/lib/pgadmin
+                networks: [ ${DB_NET}, proxy ]
+                labels:
+                  - 'traefik.enable=true'
+                  - 'traefik.docker.network=proxy'
+                  - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.rule=Host("${PGADMIN_HOST}")'
+                  - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.entrypoints=websecure'
+                  - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.tls.certresolver=le'
+                  - 'traefik.http.services.${SLUG_SAFE}-pgadmin.loadbalancer.server.port=8080'
+                  - 'traefik.http.routers.${SLUG_SAFE}-pgadmin-http.rule=Host("${PGADMIN_HOST}")'
+                  - 'traefik.http.routers.${SLUG_SAFE}-pgadmin-http.entrypoints=web'
+                  - 'traefik.http.routers.${SLUG_SAFE}-pgadmin-http.middlewares=${SLUG_SAFE}-pgadmin-redirect'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-pgadmin-redirect.redirectscheme.scheme=https'
+
             volumes:
               pg_data_${SLUG_SAFE}:
+              pgadmin_data_${SLUG_SAFE}:
 
             networks:
               ${DB_NET}:
                 external: true
                 name: ${DB_NET}
+              proxy:
+                external: true
+                name: proxy
             DBYAML
+
             (cd "${DB_DIR}" && docker compose up -d)
 
-            # --- App deploy (NO NEXTAUTH_URL; rely on AUTH_TRUST_HOST) ---
+            # --- App deploy ---
             mkdir -p "${SITE_DIR}"
             cd "${SITE_DIR}"
             printf "%s\n" "$SITE_ENV_NORM" > app.env
@@ -630,7 +758,6 @@ jobs:
                   - 'traefik.http.routers.${SLUG_SAFE}-http.middlewares=${SLUG_SAFE}-redirect'
                   - 'traefik.http.routers.${SLUG_SAFE}-http.service=${SLUG_SAFE}'
                   - 'traefik.http.middlewares.${SLUG_SAFE}-redirect.redirectscheme.scheme=https'
-                  # admin host (separate router, same service)
                   - 'traefik.http.routers.${SLUG_SAFE}-admin.rule=Host("${ADMIN_DOMAIN}")'
                   - 'traefik.http.routers.${SLUG_SAFE}-admin.entrypoints=websecure'
                   - 'traefik.http.routers.${SLUG_SAFE}-admin.tls.certresolver=le'
@@ -694,9 +821,7 @@ jobs:
           username: ${{ secrets.HZ_USER || 'root' }}
           key: ${{ secrets.HZ_SSH_KEY }}
           port: 22
-          timeout: 60s
-          command_timeout: 10m
-          envs: SLUG,DOMAIN
+        # (health-check script same as your original)
           script: |
             set -euo pipefail
             SLUG_SAFE="$(printf '%s' "${SLUG}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
