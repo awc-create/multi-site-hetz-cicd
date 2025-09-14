@@ -872,20 +872,27 @@ jobs:
       - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@v1
         env:
-          SLUG: ${{ needs.detect.outputs.slug }}
+          SLUG:   ${{ needs.detect.outputs.slug }}
           DOMAIN: ${{ needs.detect.outputs.domain_prod }}
         with:
           host: ${{ secrets.HZ_HOST }}
           username: ${{ secrets.HZ_USER || 'root' }}
           key: ${{ secrets.HZ_SSH_KEY }}
           port: 22
+          timeout: 60s
           command_timeout: 10m
+          envs: SLUG,DOMAIN   # <-- REQUIRED: pass env to remote session
           script: |
             set -euo pipefail
+            : "${SLUG:?missing SLUG}"
+            : "${DOMAIN:?missing DOMAIN}"
+
             SLUG_SAFE="$(printf '%s' "${SLUG}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
-            cd /opt/sites/${SLUG_SAFE}
+            cd "/opt/sites/${SLUG_SAFE}"
+
             PORT=$(docker compose exec -T app sh -lc 'printf "%s" "${PORT:-3000}"')
             echo "Detected PORT=$PORT"
+
             ok=0
             for path in /api/healthz /api/healthz/ /; do
               echo "Probing http://127.0.0.1:${PORT}${path}"
@@ -898,7 +905,7 @@ jobs:
               [ $ok -eq 1 ] && break
             done
             [ $ok -eq 1 ] || { echo "❌ App not healthy internally"; docker compose logs --no-color --tail=200 app || true; exit 1; }
-
+           
       - name: Short settle
         run: sleep 10
 
