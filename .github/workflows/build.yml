@@ -627,11 +627,12 @@ jobs:
                   CLOUDFLARE_DNS_API_TOKEN: ${CLOUDFLARE_DNS_API_TOKEN}
                 ports:
                   - "80:80"
-                  - "443:443"ß
+                  - "443:443"
                 volumes:
                   - /var/run/docker.sock:/var/run/docker.sock:ro
                   - ./letsencrypt:/letsencrypt
-                networks: [ proxy ]
+                networks:
+                  - proxy
             networks:
               proxy:
                 external: true
@@ -676,7 +677,7 @@ jobs:
             }
             JSON
 
-            cat > "${DB_DIR}/docker-compose.yml" <<'DBYAML'
+            cat > "${DB_DIR}/docker-compose.yml" <<DBYAML
             services:
               postgres:
                 image: postgres:15
@@ -691,7 +692,8 @@ jobs:
                   retries: 30
                 volumes:
                   - pg_data_${SLUG_SAFE}:/var/lib/postgresql/data
-                networks: [ ${DB_NET} ]
+                networks:
+                  - ${DB_NET}
 
               pgbouncer:
                 image: edoburu/pgbouncer
@@ -703,12 +705,13 @@ jobs:
                   DEFAULT_POOL_SIZE: 20
                   AUTH_TYPE: scram-sha-256
                   DB_HOST: postgres
-                  DB_USER: ${POSTGRES_USER}
-                  DB_PASSWORD: ${POSTGRES_PASSWORD}
+                  DB_USER: \${POSTGRES_USER}
+                  DB_PASSWORD: \${POSTGRES_PASSWORD}
                 depends_on:
                   postgres:
                     condition: service_healthy
-                networks: [ ${DB_NET} ]
+                networks:
+                  - ${DB_NET}
 
               pgadmin:
                 image: dpage/pgadmin4:8
@@ -727,7 +730,9 @@ jobs:
                 volumes:
                   - ./pgadmin-servers.json:/pgadmin4/servers.json:ro
                   - pgadmin_data_${SLUG_SAFE}:/var/lib/pgadmin
-                networks: [ ${DB_NET}, proxy ]
+                networks:
+                  - ${DB_NET}
+                  - proxy
                 labels:
                   - 'traefik.enable=true'
                   - 'traefik.docker.network=proxy'
@@ -997,7 +1002,7 @@ jobs:
                 name: proxy
             YAML
             export IMAGE_REF SLUG_SAFE DOMAIN
-            if ! command -v envsubst >/dev/null 21>&1; then
+            if ! command -v envsubst >/dev/null 2>&1; then
               apt-get update -y && apt-get install -y --no-install-recommends gettext-base
             fi
             envsubst '$IMAGE_REF $SLUG_SAFE $DOMAIN' < docker-compose.yml.tpl > docker-compose.yml
