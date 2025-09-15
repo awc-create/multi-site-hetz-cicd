@@ -656,7 +656,7 @@ jobs:
             DB_NAME=${DB_NAME}
             PGADMIN_DEFAULT_EMAIL=${PGADMIN_EMAIL}
             PGADMIN_DEFAULT_PASSWORD=${PGADMIN_PASSWORD}
-            PGADMIN_DEFAULT_SERVER_NAME="PgBouncer (${SLUG_SAFE})"
+            PGADMIN_DEFAULT_SERVER_NAME=PgBouncer (${SLUG_SAFE})
             EOF
 
             # Pre-seed pgAdmin server pointing to PgBouncer in the same Docker network
@@ -847,61 +847,59 @@ jobs:
             docker compose pull || true
             docker compose up -d --remove-orphans
 
-            # --- DB migrate + Admin ensure (no tsx, no repo changes needed) ---
-            docker compose exec -T app sh -lc '
-                set -e
-                NODE_PATH=/app/node_modules npx prisma migrate deploy
+            # --- DB migrate + Admin ensure (robust heredocs; no YAML quoting issues) ---
+            docker compose exec -T app sh -s <<'SH'
+            set -e
+            NODE_PATH=/app/node_modules npx prisma migrate deploy
+            NODE_PATH=/app/node_modules node <<'EOF'
+            (async () => {
+              const { PrismaClient, Role, UserSource } = require("@prisma/client");
+              const bcrypt = require("bcryptjs");
+              const prisma = new PrismaClient();
 
-                cat << "EOF" | NODE_PATH=/app/node_modules node
-                (async () => {
-                  const { PrismaClient, Role, UserSource } = require("@prisma/client");
-                  const bcrypt = require("bcryptjs");
-                  const prisma = new PrismaClient();
+              try {
+                await prisma.$executeRawUnsafe(`ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "emailVerified" TIMESTAMP(3)`);
+              } catch (_) {}
 
-                  try {
-                    await prisma.$executeRawUnsafe(`ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "emailVerified" TIMESTAMP(3)`);
-                  } catch (_) {}
+              const email = (process.env.ADMIN_EMAIL || "admin@princefoods.com").toLowerCase();
+              const name  = process.env.ADMIN_NAME  || "Head Admin";
+              const plain = process.env.ADMIN_PASSWORD || process.env.ADMIN_PASSWORD_PLAINTEXT || "supersecurepassword";
+              const hashFromEnv = process.env.ADMIN_PASSWORD_HASH && String(process.env.ADMIN_PASSWORD_HASH).trim();
 
-                  const email = (process.env.ADMIN_EMAIL || "admin@princefoods.com").toLowerCase();
-                  const name  = process.env.ADMIN_NAME  || "Head Admin";
-                  const plain = process.env.ADMIN_PASSWORD || process.env.ADMIN_PASSWORD_PLAINTEXT || "supersecurepassword";
-                  const hashFromEnv = process.env.ADMIN_PASSWORD_HASH && String(process.env.ADMIN_PASSWORD_HASH).trim();
+              const firstName = (name.split(" ")[0] || null);
+              const lastName  = (name.split(" ").slice(1).join(" ") || null);
 
-                  const firstName = (name.split(" ")[0] || null);
-                  const lastName  = (name.split(" ").slice(1).join(" ") || null);
+              const existing = await prisma.user.findUnique({ where: { email } });
+              const passwordHash = hashFromEnv || (plain ? await bcrypt.hash(plain, 12) : undefined);
 
-                  const existing = await prisma.user.findUnique({ where: { email } });
-                  const passwordHash = hashFromEnv || (plain ? await bcrypt.hash(plain, 12) : undefined);
+              if (!existing) {
+                await prisma.user.create({
+                  data: {
+                    email, name, firstName, lastName,
+                    role: Role.HEAD, source: UserSource.LOCAL,
+                    ...(passwordHash ? { password: passwordHash } : {}),
+                    emailVerified: new Date(),
+                  },
+                });
+                console.log("✅ Created admin:", email);
+              } else {
+                const update = {
+                  name,
+                  role: Role.HEAD,
+                  source: UserSource.LOCAL,
+                  emailVerified: existing.emailVerified ?? new Date(),
+                };
+                if (firstName) update.firstName = firstName;
+                if (lastName !== null) update.lastName = lastName;
+                if (passwordHash) update.password = passwordHash;
 
-                  if (!existing) {
-                    await prisma.user.create({
-                      data: {
-                        email, name, firstName, lastName,
-                        role: Role.HEAD, source: UserSource.LOCAL,
-                        ...(passwordHash ? { password: passwordHash } : {}),
-                        emailVerified: new Date(),
-                      },
-                    });
-                    console.log("✅ Created admin:", email);
-                  } else {
-                    const update = {
-                      name,
-                      role: Role.HEAD,
-                      source: UserSource.LOCAL,
-                      emailVerified: existing.emailVerified ?? new Date(),
-                    };
-                    if (firstName) update.firstName = firstName;
-                    if (lastName !== null) update.lastName = lastName;
-                    if (passwordHash) update.password = passwordHash;
-
-                    await prisma.user.update({ where: { email }, data: update });
-                    console.log("✅ Ensured admin:", email, passwordHash ? "(password updated)" : "");
-                  }
-                  await prisma.$disconnect();
-                })().catch(e => { console.error("❌ seed-admin failed:", e); process.exit(1); });
-                EOF
-              '
-
+                await prisma.user.update({ where: { email }, data: update });
+                console.log("✅ Ensured admin:", email, passwordHash ? "(password updated)" : "");
+              }
+              await prisma.$disconnect();
+            })().catch(e => { console.error("❌ seed-admin failed:", e); process.exit(1); });
+            EOF
+            SH
 
       - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@v1
