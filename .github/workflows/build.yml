@@ -917,29 +917,29 @@ jobs:
           timeout: 60s
           command_timeout: 10m
           envs: SLUG,DOMAIN
-        script: |
-          set -euo pipefail
-          : "${SLUG:?missing SLUG}"
-          : "${DOMAIN:?missing DOMAIN}"
+          script: |
+            set -euo pipefail
+            : "${SLUG:?missing SLUG}"
+            : "${DOMAIN:?missing DOMAIN}"
 
-          SLUG_SAFE="$(printf '%s' "${SLUG}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
-          cd "/opt/sites/${SLUG_SAFE}"
+            SLUG_SAFE="$(printf '%s' "${SLUG}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
+            cd "/opt/sites/${SLUG_SAFE}"
 
-          PORT=$(docker compose exec -T app sh -lc 'printf "%s" "${PORT:-3000}"')
-          echo "Detected PORT=$PORT"
+            PORT=$(docker compose exec -T app sh -lc 'printf "%s" "${PORT:-3000}"')
+            echo "Detected PORT=$PORT"
 
-          ok=0
-          for path in /api/healthz /api/healthz/ /; do
-            echo "Probing http://127.0.0.1:${PORT}${path}"
-            for i in $(seq 1 20); do
-              if docker compose exec -T app node -e "const http=require('http');http.get({host:'127.0.0.1',port:${PORT},path:'${path}',headers:{'x-forwarded-proto':'https','host':'${DOMAIN:-localhost}'}},r=>process.exit(r.statusCode<400?0:1)).on('error',()=>process.exit(1))"; then
-                echo '✅ OK'; ok=1; break
-              fi
-              echo "  retry $i"; sleep 3
+            ok=0
+            for path in /api/healthz /api/healthz/ /; do
+              echo "Probing http://127.0.0.1:${PORT}${path}"
+              for i in $(seq 1 20); do
+                if docker compose exec -T app node -e "const http=require('http');http.get({host:'127.0.0.1',port:${PORT},path:'${path}',headers:{'x-forwarded-proto':'https','host':'${DOMAIN:-localhost}'}},r=>process.exit(r.statusCode<400?0:1)).on('error',()=>process.exit(1))"; then
+                  echo '✅ OK'; ok=1; break
+                fi
+                echo "  retry $i"; sleep 3
+              done
+              [ $ok -eq 1 ] && break
             done
-            [ $ok -eq 1 ] && break
-          done
-          [ $ok -eq 1 ] || { echo "❌ App not healthy internally"; docker compose logs --no-color --tail=200 app || true; exit 1; }
+            [ $ok -eq 1 ] || { echo "❌ App not healthy internally"; docker compose logs --no-color --tail=200 app || true; exit 1; }
 
       - name: Short settle
         run: sleep 10
