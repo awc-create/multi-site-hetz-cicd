@@ -656,7 +656,7 @@ jobs:
             DB_NAME=${DB_NAME}
             PGADMIN_DEFAULT_EMAIL=${PGADMIN_EMAIL}
             PGADMIN_DEFAULT_PASSWORD=${PGADMIN_PASSWORD}
-            PGADMIN_DEFAULT_SERVER_NAME=PgBouncer (${SLUG_SAFE})
+            PGADMIN_DEFAULT_SERVER_NAME="PgBouncer (${SLUG_SAFE})"
             EOF
 
             # Pre-seed pgAdmin server pointing to PgBouncer in the same Docker network
@@ -859,7 +859,7 @@ jobs:
                 const bcrypt = require("bcryptjs");
                 const prisma = new PrismaClient();
 
-                // Preflight: add column if schema expects it but DB lacks it
+                # Preflight: add column if schema expects it but DB lacks it
                 try {
                   await prisma.$executeRawUnsafe('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "emailVerified" TIMESTAMP(3)');
                 } catch (_) {}
