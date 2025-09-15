@@ -840,7 +840,7 @@ jobs:
 
             docker compose pull || true
             docker compose up -d --remove-orphans
-            docker compose exec -T app sh -lc 'npx prisma migrate deploy || true'
+            docker compose exec -T app sh -lc 'npm run db:deploy-and-seed || true'
 
       - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@v1
