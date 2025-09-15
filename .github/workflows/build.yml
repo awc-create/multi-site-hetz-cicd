@@ -719,7 +719,6 @@ jobs:
                 env_file: .env
                 environment:
                   PGADMIN_LISTEN_PORT: "8080"
-                  # --- Proxy/CF-safe settings to prevent spinner/302 on static ---
                   PGADMIN_CONFIG_ENABLE_PROXY_FIX: "True"
                   PGADMIN_CONFIG_SESSION_COOKIE_SECURE: "True"
                   PGADMIN_CONFIG_SESSION_COOKIE_SAMESITE: "None"
@@ -764,9 +763,15 @@ jobs:
             mkdir -p "${SITE_DIR}"
             cd "${SITE_DIR}"
             printf "%s\n" "$SITE_ENV_NORM" > app.env
+
+            # ensure core env fallbacks
             grep -q '^AUTH_TRUST_HOST=' app.env || echo 'AUTH_TRUST_HOST=true' >> app.env
             grep -q '^DATABASE_URL=' app.env || echo "DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@pgbouncer:5432/${DB_NAME}?pgbouncer=true&connection_limit=1&connect_timeout=5" >> app.env
             grep -q '^DIRECT_DATABASE_URL=' app.env || echo "DIRECT_DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@postgres:5432/${DB_NAME}?connect_timeout=5" >> app.env
+
+            # helpful admin defaults if not provided
+            if ! grep -q '^ADMIN_DOMAIN=' app.env; then echo "ADMIN_DOMAIN=${ADMIN_DOMAIN}" >> app.env; fi
+            if ! grep -q '^NEXTAUTH_URL=' app.env && [ -n "${ADMIN_DOMAIN:-}" ]; then echo "NEXTAUTH_URL=https://${ADMIN_DOMAIN}" >> app.env; fi
 
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
               cat > docker-compose.yml.tpl <<'YAML'
@@ -834,13 +839,70 @@ jobs:
             sed -e "s|\${IMAGE_REF}|${IMAGE_REF}|g" \
                 -e "s|\${SLUG_SAFE}|${SLUG_SAFE}|g" \
                 -e "s|\${DOMAIN}|${DOMAIN}|g" \
+                -e "s|\${ADMIN_DOMAIN}|${ADMIN_DOMAIN}|g" \
                 -e "s|\${PORT}|${PORT}|g" \
                 -e "s|\${DB_NET}|${DB_NET}|g" \
               docker-compose.yml.tpl > docker-compose.yml
 
             docker compose pull || true
             docker compose up -d --remove-orphans
-            docker compose exec -T app sh -lc 'npm run db:deploy-and-seed || true'
+
+            # --- DB migrate + Admin ensure (no tsx, no repo changes needed) ---
+            docker compose exec -T app sh -lc '
+              set -e
+              NODE_PATH=/app/node_modules npx prisma migrate deploy
+
+              # self-contained seeder:
+              NODE_PATH=/app/node_modules node - << "NODE"
+              (async () => {
+                const { PrismaClient, Role, UserSource } = require("@prisma/client");
+                const bcrypt = require("bcryptjs");
+                const prisma = new PrismaClient();
+
+                // Preflight: add column if schema expects it but DB lacks it
+                try {
+                  await prisma.$executeRawUnsafe('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "emailVerified" TIMESTAMP(3)');
+                } catch (_) {}
+
+                const email = (process.env.ADMIN_EMAIL || "admin@princefoods.com").toLowerCase();
+                const name  = process.env.ADMIN_NAME  || "Head Admin";
+                const plain = process.env.ADMIN_PASSWORD || process.env.ADMIN_PASSWORD_PLAINTEXT || "supersecurepassword";
+                const hashFromEnv = process.env.ADMIN_PASSWORD_HASH && String(process.env.ADMIN_PASSWORD_HASH).trim();
+
+                const firstName = (name.split(" ")[0] || null);
+                const lastName  = (name.split(" ").slice(1).join(" ") || null);
+
+                const existing = await prisma.user.findUnique({ where: { email } });
+                const passwordHash = hashFromEnv || (plain ? await bcrypt.hash(plain, 12) : undefined);
+
+                if (!existing) {
+                  await prisma.user.create({
+                    data: {
+                      email, name, firstName, lastName,
+                      role: Role.HEAD, source: UserSource.LOCAL,
+                      ...(passwordHash ? { password: passwordHash } : {}),
+                      emailVerified: new Date(),
+                    },
+                  });
+                  console.log("✅ Created admin:", email);
+                } else {
+                  const update = {
+                    name,
+                    role: Role.HEAD,
+                    source: UserSource.LOCAL,
+                    emailVerified: existing.emailVerified ?? new Date(),
+                  };
+                  if (firstName) update.firstName = firstName;
+                  if (lastName !== null) update.lastName = lastName;
+                  if (passwordHash) update.password = passwordHash;
+
+                  await prisma.user.update({ where: { email }, data: update });
+                  console.log("✅ Ensured admin:", email, passwordHash ? "(password updated)" : "");
+                }
+                await prisma.$disconnect();
+              })().catch(e => { console.error("❌ seed-admin failed:", e); process.exit(1); });
+              NODE
+            '
 
       - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@v1
@@ -855,29 +917,29 @@ jobs:
           timeout: 60s
           command_timeout: 10m
           envs: SLUG,DOMAIN
-          script: |
-            set -euo pipefail
-            : "${SLUG:?missing SLUG}"
-            : "${DOMAIN:?missing DOMAIN}"
+        script: |
+          set -euo pipefail
+          : "${SLUG:?missing SLUG}"
+          : "${DOMAIN:?missing DOMAIN}"
 
-            SLUG_SAFE="$(printf '%s' "${SLUG}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
-            cd "/opt/sites/${SLUG_SAFE}"
+          SLUG_SAFE="$(printf '%s' "${SLUG}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
+          cd "/opt/sites/${SLUG_SAFE}"
 
-            PORT=$(docker compose exec -T app sh -lc 'printf "%s" "${PORT:-3000}"')
-            echo "Detected PORT=$PORT"
+          PORT=$(docker compose exec -T app sh -lc 'printf "%s" "${PORT:-3000}"')
+          echo "Detected PORT=$PORT"
 
-            ok=0
-            for path in /api/healthz /api/healthz/ /; do
-              echo "Probing http://127.0.0.1:${PORT}${path}"
-              for i in $(seq 1 20); do
-                if docker compose exec -T app node -e "const http=require('http');http.get({host:'127.0.0.1',port:${PORT},path:'${path}',headers:{'x-forwarded-proto':'https','host':'${DOMAIN:-localhost}'}},r=>process.exit(r.statusCode<400?0:1)).on('error',()=>process.exit(1))"; then
-                  echo '✅ OK'; ok=1; break
-                fi
-                echo "  retry $i"; sleep 3
-              done
-              [ $ok -eq 1 ] && break
+          ok=0
+          for path in /api/healthz /api/healthz/ /; do
+            echo "Probing http://127.0.0.1:${PORT}${path}"
+            for i in $(seq 1 20); do
+              if docker compose exec -T app node -e "const http=require('http');http.get({host:'127.0.0.1',port:${PORT},path:'${path}',headers:{'x-forwarded-proto':'https','host':'${DOMAIN:-localhost}'}},r=>process.exit(r.statusCode<400?0:1)).on('error',()=>process.exit(1))"; then
+                echo '✅ OK'; ok=1; break
+              fi
+              echo "  retry $i"; sleep 3
             done
-            [ $ok -eq 1 ] || { echo "❌ App not healthy internally"; docker compose logs --no-color --tail=200 app || true; exit 1; }
+            [ $ok -eq 1 ] && break
+          done
+          [ $ok -eq 1 ] || { echo "❌ App not healthy internally"; docker compose logs --no-color --tail=200 app || true; exit 1; }
 
       - name: Short settle
         run: sleep 10
