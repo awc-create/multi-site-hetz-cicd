@@ -769,25 +769,29 @@ jobs:
             grep -q '^DATABASE_URL=' app.env || echo "DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@pgbouncer:5432/${DB_NAME}?pgbouncer=true&connection_limit=1&connect_timeout=5" >> app.env
             grep -q '^DIRECT_DATABASE_URL=' app.env || echo "DIRECT_DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@postgres:5432/${DB_NAME}?connect_timeout=5" >> app.env
 
-            ###################################################################
-            # NEW: Auth base-URLs (public + admin), NEXTAUTH_SECRET, email defaults
-            ###################################################################
+            # --- NextAuth v4 required/env niceties ---
             grep -q '^NEXTAUTH_URL_PUBLIC=' app.env || echo "NEXTAUTH_URL_PUBLIC=https://${DOMAIN}" >> app.env
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
               grep -q '^NEXTAUTH_URL_ADMIN=' app.env || echo "NEXTAUTH_URL_ADMIN=https://${ADMIN_DOMAIN}" >> app.env
             fi
-
-            # Primary NextAuth callback base (defaults to admin if present)
             if ! grep -q '^NEXTAUTH_URL=' app.env && [ -n "${ADMIN_DOMAIN:-}" ]; then
               echo "NEXTAUTH_URL=https://${ADMIN_DOMAIN}" >> app.env
             fi
-
-            # Ensure NEXTAUTH_SECRET exists
             if ! grep -q '^NEXTAUTH_SECRET=' app.env; then
               if command -v openssl >/dev/null 2>&1; then
                 echo "NEXTAUTH_SECRET=$(openssl rand -base64 32 | tr -d '\n')" >> app.env
               else
                 echo "NEXTAUTH_SECRET=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -d '\n')" >> app.env
+              fi
+            fi
+            # Cross-subdomain cookie (use ".apex.tld" or restrict to admin host)
+            if ! grep -q '^AUTH_COOKIE_DOMAIN=' app.env; then
+              # e.g. ROOT=prince-v.com -> .prince-v.com
+              ROOT_APEX="${DOMAIN#*.}"
+              if [ "$ROOT_APEX" = "$DOMAIN" ]; then
+                echo "AUTH_COOKIE_DOMAIN=${ADMIN_DOMAIN:-$DOMAIN}" >> app.env
+              else
+                echo "AUTH_COOKIE_DOMAIN=.${ROOT_APEX}" >> app.env
               fi
             fi
 
@@ -804,9 +808,6 @@ jobs:
               FROM_NOW="$(awk -F= '/^RESEND_FROM=/{print $2}' app.env | tail -1)"
               [ -n "${FROM_NOW:-}" ] && echo "EMAIL_FROM=${FROM_NOW}" >> app.env
             fi
-            ###################################################################
-            # END NEW
-            ###################################################################
 
             # helpful admin defaults if not provided
             if ! grep -q '^ADMIN_DOMAIN=' app.env; then echo "ADMIN_DOMAIN=${ADMIN_DOMAIN}" >> app.env; fi
@@ -941,7 +942,6 @@ jobs:
             EOF
             SH
 
-      
       - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@v1
         env:
