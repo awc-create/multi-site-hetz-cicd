@@ -146,46 +146,47 @@ jobs:
           KEY_UPPER="$(echo "$NAME" | tr '[:lower:]-' '[:upper:]_')"
           echo "KEY_UPPER=$KEY_UPPER" >> $GITHUB_OUTPUT
 
-      - name: Load SITE_ENV secret
-        id: loadenv
+      - name: Load SITE_ENV__{REPO_KEY} and normalize DB envs for this branch
         env:
           SITE_ENV: ${{ secrets[format('SITE_ENV__{0}', steps.repokey.outputs.KEY_UPPER)] }}
+          BRANCH: ${{ needs.detect.outputs.branch }}
         working-directory: site
         run: |
           [ -n "${SITE_ENV:-}" ] || { echo "❌ Missing secret SITE_ENV__${{ steps.repokey.outputs.KEY_UPPER }}"; exit 1; }
           printf "%s\n" "$SITE_ENV" | sed 's/\r$//' > .env
 
-      - name: Select DB by branch (Vercel for dev/feat/fix, Hetzner for main-hetz)
-        working-directory: site
-        run: |
-          BRANCH='${{ needs.detect.outputs.branch }}'
-          if [[ "$BRANCH" == "main-hetz" ]]; then
-            echo "Using HETZNER DB for main-hetz"
-            sed -i '/^DATABASE_URL=/d;/^DIRECT_DATABASE_URL=/d' .env
-            {
-              echo "DATABASE_URL=$(awk -F= '$1=="DATABASE_URL_HETZNER"{print $2}' .env | tail -1)"
-              echo "DIRECT_DATABASE_URL=$(awk -F= '$1=="DIRECT_DATABASE_URL_HETZNER"{print $2}' .env | tail -1)"
-            } >> .env
-          else
-            echo "Using VERCEL DB for $BRANCH"
-            sed -i '/^DATABASE_URL=/d;/^DIRECT_DATABASE_URL=/d' .env
-            {
-              echo "DATABASE_URL=$(awk -F= '$1=="DATABASE_URL_VERCEL"{print $2}' .env | tail -1)"
-              echo "DIRECT_DATABASE_URL=$(awk -F= '$1=="DIRECT_DATABASE_URL_VERCEL"{print $2}' .env | tail -1)"
-            } >> .env
+          # If DATABASE_URL/DIRECT_DATABASE_URL are not present, derive from suffix based on branch
+          have_db=$(grep -cE '^(DATABASE_URL|DIRECT_DATABASE_URL)=' .env || true)
+          if [ "$have_db" -lt 2 ]; then
+            if [ "$BRANCH" = "main-hetz" ]; then
+              HDB="$(awk -F= '$1=="DATABASE_URL_HETZNER"{print $2}' .env | tail -1)"
+              HDD="$(awk -F= '$1=="DIRECT_DATABASE_URL_HETZNER"{print $2}' .env | tail -1)"
+              [ -n "$HDB" ] && echo "DATABASE_URL=$HDB" >> .env
+              [ -n "$HDD" ] && echo "DIRECT_DATABASE_URL=$HDD" >> .env
+            else
+              VDB="$(awk -F= '$1=="DATABASE_URL_VERCEL"{print $2}' .env | tail -1)"
+              VDD="$(awk -F= '$1=="DIRECT_DATABASE_URL_VERCEL"{print $2}' .env | tail -1)"
+              [ -n "$VDB" ] && echo "DATABASE_URL=$VDB" >> .env
+              # If no explicit direct URL, mirror DATABASE_URL
+              if [ -n "$VDD" ]; then
+                echo "DIRECT_DATABASE_URL=$VDD" >> .env
+              else
+                echo "DIRECT_DATABASE_URL=${VDB}" >> .env
+              fi
+            fi
           fi
-          grep -q '^DATABASE_URL=' .env || { echo "❌ DATABASE_URL missing after selection"; exit 1; }
-          echo "Preview .env:" && sed -n '1,24p' .env || true
 
-      - name: Prisma generate
+          # Sanity check
+          echo "DB envs in use:"
+          grep -E '^(DATABASE_URL|DIRECT_DATABASE_URL)=' .env
+
+          # Optional: warn if still missing
+          grep -q '^DATABASE_URL=' .env || { echo "❌ DATABASE_URL still missing after normalization"; exit 1; }
+          grep -q '^DIRECT_DATABASE_URL=' .env || { echo "❌ DIRECT_DATABASE_URL still missing after normalization"; exit 1; }
+
+      - name: Prisma generate (for Next build)
         working-directory: site
         run: npx prisma generate
-
-      # Only run DB migrations in CI for Vercel branches
-      - name: Apply Prisma migrations (Vercel branches)
-        if: needs.detect.outputs.branch != 'main-hetz'
-        working-directory: site
-        run: npx prisma migrate deploy
 
       - name: Build
         working-directory: site
@@ -232,9 +233,12 @@ jobs:
           SITE_ENV: ${{ secrets[format('SITE_ENV__{0}', steps.repokey.outputs.KEY_UPPER)] }}
         working-directory: site
         run: |
+          [ -n "${SITE_ENV:-}" ] || { echo "❌ Missing secret SITE_ENV__${{ steps.repokey.outputs.KEY_UPPER }}"; exit 1; }
           printf "%s\n" "$SITE_ENV" | sed 's/\r$//' > .site_env
-          ORG="$(awk -F= '/^(VERCEL_ORG_ID|orgId)=/{print $2}' .site_env | tail -1)"
-          PRJ="$(awk -F= '/^(VERCEL_PROJECT_ID|projectId)=/{print $2}' .site_env | tail -1)"
+          ORG="$(awk -F= '/^VERCEL_ORG_ID=/{print $2}' .site_env | tail -1)"
+          PRJ="$(awk -F= '/^VERCEL_PROJECT_ID=/{print $2}' .site_env | tail -1)"
+          [ -n "$ORG" ] || ORG="$(awk -F= '/^orgId=/{print $2}' .site_env | tail -1)"
+          [ -n "$PRJ" ] || PRJ="$(awk -F= '/^projectId=/{print $2}' .site_env | tail -1)"
           [ -n "$ORG" ] && echo "VERCEL_ORG_ID=$ORG" >> $GITHUB_ENV || { echo "❌ VERCEL_ORG_ID missing"; exit 1; }
           [ -n "$PRJ" ] && echo "VERCEL_PROJECT_ID=$PRJ" >> $GITHUB_ENV || { echo "❌ VERCEL_PROJECT_ID missing"; exit 1; }
 
@@ -255,24 +259,43 @@ jobs:
           : > .env
           if [ -f ".vercel/.env.preview.local" ]; then
             cat .vercel/.env.preview.local >> .env
+          elif [ -f ".vercel/.env.development.local" ]; then
+            cat .vercel/.env.development.local >> .env
           fi
-          # also blend SITE_ENV defaults if key not present
+          # Blend in SITE_ENV defaults (without overwriting)
           while IFS='=' read -r k v; do
             [ -z "$k" ] && continue
             [ "${k#\#}" != "$k" ] && continue
-            grep -qE "^${k}=" .env || echo "${k}=${v}" >> .env
+            if ! grep -qE "^${k}=" .env 2>/dev/null; then
+              echo "${k}=${v}" >> .env
+            fi
           done < .site_env
-          echo "SITE_URL=https://example.com" >> .env
+          echo "Preview .env (first lines):"; sed -n '1,20p' .env
+
+      - name: Ensure DB vars (preview)
+        if: env.SKIP != '1'
+        working-directory: site
+        run: |
+          # Set DATABASE_URL if still missing
+          if ! grep -q '^DATABASE_URL=' .env; then
+            VDB="$(awk -F= '$1=="DATABASE_URL_VERCEL"{print $2}' .site_env | tail -1)"
+            [ -n "$VDB" ] && echo "DATABASE_URL=$VDB" >> .env
+          fi
+          # Ensure DIRECT_DATABASE_URL always exists
+          if ! grep -q '^DIRECT_DATABASE_URL=' .env; then
+            DDB="$(awk -F= '$1=="DIRECT_DATABASE_URL_VERCEL"{print $2}' .site_env | tail -1)"
+            if [ -n "$DDB" ]; then
+              echo "DIRECT_DATABASE_URL=$DDB" >> .env
+            else
+              DB="$(awk -F= '$1=="DATABASE_URL"{print $2}' .env | tail -1)"
+              echo "DIRECT_DATABASE_URL=$DB" >> .env
+            fi
+          fi
+          echo "Using DB envs:"; grep -E '^(DATABASE_URL|DIRECT_DATABASE_URL)=' .env
 
       - if: env.SKIP != '1'
         working-directory: site
         run: npx prisma generate
-
-      # Safe to run again (no-op if already applied)
-      - if: env.SKIP != '1'
-        name: Apply Prisma migrations (preview)
-        working-directory: site
-        run: npx prisma migrate deploy
 
       - if: env.SKIP != '1'
         working-directory: site
@@ -307,9 +330,12 @@ jobs:
           SITE_ENV: ${{ secrets[format('SITE_ENV__{0}', steps.repokey.outputs.KEY_UPPER)] }}
         working-directory: site
         run: |
+          [ -n "${SITE_ENV:-}" ] || { echo "❌ Missing secret SITE_ENV__${{ steps.repokey.outputs.KEY_UPPER }}"; exit 1; }
           printf "%s\n" "$SITE_ENV" | sed 's/\r$//' > .site_env
-          ORG="$(awk -F= '/^(VERCEL_ORG_ID|orgId)=/{print $2}' .site_env | tail -1)"
-          PRJ="$(awk -F= '/^(VERCEL_PROJECT_ID|projectId)=/{print $2}' .site_env | tail -1)"
+          ORG="$(awk -F= '/^VERCEL_ORG_ID=/{print $2}' .site_env | tail -1)"
+          PRJ="$(awk -F= '/^VERCEL_PROJECT_ID=/{print $2}' .site_env | tail -1)"
+          [ -n "$ORG" ] || ORG="$(awk -F= '/^orgId=/{print $2}' .site_env | tail -1)"
+          [ -n "$PRJ" ] || PRJ="$(awk -F= '/^projectId=/{print $2}' .site_env | tail -1)"
           [ -n "$ORG" ] && echo "VERCEL_ORG_ID=$ORG" >> $GITHUB_ENV || { echo "❌ VERCEL_ORG_ID missing"; exit 1; }
           [ -n "$PRJ" ] && echo "VERCEL_PROJECT_ID=$PRJ" >> $GITHUB_ENV || { echo "❌ VERCEL_PROJECT_ID missing"; exit 1; }
 
@@ -334,18 +360,34 @@ jobs:
           while IFS='=' read -r k v; do
             [ -z "$k" ] && continue
             [ "${k#\#}" != "$k" ] && continue
-            grep -qE "^${k}=" .env || echo "${k}=${v}" >> .env
+            if ! grep -qE "^${k}=" .env 2>/dev/null; then
+              echo "${k}=${v}" >> .env
+            fi
           done < .site_env
-          echo "SITE_URL=https://example.com" >> .env
+          echo "Prod .env (first lines):"; sed -n '1,20p' .env
+
+      - name: Ensure DB vars (prod)
+        if: env.SKIP != '1'
+        working-directory: site
+        run: |
+          if ! grep -q '^DATABASE_URL=' .env; then
+            VDB="$(awk -F= '$1=="DATABASE_URL_VERCEL"{print $2}' .site_env | tail -1)"
+            [ -n "$VDB" ] && echo "DATABASE_URL=$VDB" >> .env
+          fi
+          if ! grep -q '^DIRECT_DATABASE_URL=' .env; then
+            DDB="$(awk -F= '$1=="DIRECT_DATABASE_URL_VERCEL"{print $2}' .site_env | tail -1)"
+            if [ -n "$DDB" ]; then
+              echo "DIRECT_DATABASE_URL=$DDB" >> .env
+            else
+              DB="$(awk -F= '$1=="DATABASE_URL"{print $2}' .env | tail -1)"
+              echo "DIRECT_DATABASE_URL=$DB" >> .env
+            fi
+          fi
+          echo "Using DB envs:"; grep -E '^(DATABASE_URL|DIRECT_DATABASE_URL)=' .env
 
       - if: env.SKIP != '1'
         working-directory: site
         run: npx prisma generate
-
-      - if: env.SKIP != '1'
-        name: Apply Prisma migrations (prod)
-        working-directory: site
-        run: npx prisma migrate deploy
 
       - if: env.SKIP != '1'
         working-directory: site
@@ -355,7 +397,9 @@ jobs:
         working-directory: site
         run: vercel deploy --prebuilt --prod --token="${{ env.VERCEL_TOKEN }}"
 
-  # ----- Hetzner path (unchanged logic) -----
+  # ---------------------------
+  # Hetzner (unchanged logic)
+  # ---------------------------
   image_build_push:
     needs: [detect, build_test]
     if: needs.detect.outputs.project_type == 'node' && needs.detect.outputs.branch == 'main-hetz'
@@ -389,6 +433,24 @@ jobs:
           KEY_UPPER="$(echo "$NAME" | tr '[:lower:]-' '[:upper:]_')"
           echo "KEY_UPPER=$KEY_UPPER" >> $GITHUB_OUTPUT
 
+      - name: Export base URLs from SITE_ENV secret
+        id: envparse
+        env:
+          SITE_ENV_SECRET: ${{ secrets[format('SITE_ENV__{0}', steps.repokey.outputs.KEY_UPPER)] }}
+          DOMAIN: ${{ needs.detect.outputs.domain_prod }}
+          ADMIN_DOMAIN: ${{ needs.detect.outputs.domain_admin }}
+        run: |
+          [ -n "${SITE_ENV_SECRET:-}" ] || { echo "❌ Missing SITE_ENV secret"; exit 1; }
+          printf "%s\n" "$SITE_ENV_SECRET" | sed 's/\r$//' > .site_env
+          get(){ awk -F= -v k="$1" '$1==k{print $2}' .site_env | tail -1; }
+          NPU="$(get NEXT_PUBLIC_SITE_URL)";   [ -n "$NPU" ] || NPU="https://${DOMAIN}"
+          NPA="$(get NEXT_PUBLIC_ADMIN_URL)";  [ -n "$NPA" ] || { [ -n "${ADMIN_DOMAIN:-}" ] && NPA="https://${ADMIN_DOMAIN}" || NPA=""; }
+          SU="$(get SITE_URL)";                [ -n "$SU" ]  || SU="https://${DOMAIN}"
+          echo "NEXT_PUBLIC_SITE_URL=$NPU"  >> $GITHUB_OUTPUT
+          echo "NEXT_PUBLIC_ADMIN_URL=$NPA" >> $GITHUB_OUTPUT
+          echo "SITE_URL=$SU"               >> $GITHUB_OUTPUT
+          echo "Using base URLs:"; echo "$NPU"; echo "$NPA"; echo "$SU"
+
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -406,11 +468,16 @@ jobs:
           tags: |
             ${{ steps.meta.outputs.ref }}
             ${{ steps.meta.outputs.image }}:latest
+          build-args: |
+            NEXT_PUBLIC_SITE_URL=${{ steps.envparse.outputs.NEXT_PUBLIC_SITE_URL }}
+            NEXT_PUBLIC_ADMIN_URL=${{ steps.envparse.outputs.NEXT_PUBLIC_ADMIN_URL }}
+            SITE_URL=${{ steps.envparse.outputs.SITE_URL }}
 
   hetzner_node:
     needs: [detect, image_build_push]
     if: needs.detect.outputs.project_type == 'node' && needs.detect.outputs.branch == 'main-hetz'
     runs-on: ubuntu-latest
     steps:
-      # (Your existing SSH + Traefik + DB + compose + prisma migrate deploy steps stay as-is)
-      - run: echo "Hetzner deploy follows (unchanged)…"
+      # (same as your current hetzner_node job – omitted here for brevity)
+      # Keep your existing content unchanged
+      - run: echo "Hetzner deploy steps unchanged; using your existing definitions."
