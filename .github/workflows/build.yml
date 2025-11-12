@@ -207,7 +207,7 @@ jobs:
 
       - name: Build
         working-directory: site
-        run: npm run build -- --no-lint
+        run: npm run build
 
       - name: Unit tests (optional)
         working-directory: site
