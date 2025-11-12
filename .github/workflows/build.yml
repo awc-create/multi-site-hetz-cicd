@@ -32,6 +32,7 @@ jobs:
       domain_prod:      ${{ steps.dom.outputs.DOMAIN_PROD }}
       domain_admin:     ${{ steps.dom.outputs.DOMAIN_ADMIN }}
       domain_pgadmin:   ${{ steps.dom.outputs.DOMAIN_PGADMIN }}
+      db_mode:          ${{ steps.dbmode.outputs.DB_MODE }}
     steps:
       - name: Extract payload (repo/branch)
         id: p
@@ -88,25 +89,38 @@ jobs:
           fi
           echo "PROJECT_TYPE=$PT" >> $GITHUB_OUTPUT
 
+      - name: Detect DB mode
+        id: dbmode
+        working-directory: site
+        shell: bash
+        run: |
+          DBM="postgres"
+          if [ -f ".cicd-config.yml" ] && grep -qiE '^db:\s*none' .cicd-config.yml; then
+            DBM="none"
+          fi
+          echo "DB_MODE=$DBM" >> $GITHUB_OUTPUT
+          echo "DB mode: $DBM"
+
       - name: Finalize domains (default admin=admin.prod, pgadmin=dbui.prod)
         id: dom
         run: |
           PROD="${{ steps.cfg.outputs.DOMAIN_PROD_RAW }}"
           ADMIN="${{ steps.cfg.outputs.DOMAIN_ADMIN_RAW }}"
-          PGADMIN="${{ steps.cfg.outputs.DOMAIN_PGADMIN_RAW }}"
+          PGADMIN_RAW="${{ steps.cfg.outputs.DOMAIN_PGADMIN_RAW }}"
           if [ -z "$PROD" ]; then
             echo "❌ DOMAIN_PROD missing (set it in .cicd-config.yml -> domains.prod)"; exit 1;
           fi
-          if [ -z "$ADMIN" ]; then
-            ADMIN="admin.${PROD}"
-          fi
-          if [ -z "$PGADMIN" ]; then
-            PGADMIN="dbui.${PROD}"
+          [ -n "$ADMIN" ] || ADMIN="admin.${PROD}"
+          if [ "${{ steps.dbmode.outputs.DB_MODE }}" != "none" ]; then
+            PGADMIN="${PGADMIN_RAW:-dbui.${PROD}}"
+          else
+            PGADMIN=""
           fi
           echo "DOMAIN_PROD=$PROD"    >> $GITHUB_OUTPUT
           echo "DOMAIN_ADMIN=$ADMIN"  >> $GITHUB_OUTPUT
           echo "DOMAIN_PGADMIN=$PGADMIN" >> $GITHUB_OUTPUT
-          echo "Using domains: PROD=$PROD ADMIN=$ADMIN PGADMIN=$PGADMIN"
+          echo "Using domains: PROD=$PROD ADMIN=$ADMIN PGADMIN=${PGADMIN:-<disabled>}"
+
 
   build_test:
     runs-on: ubuntu-latest
@@ -150,43 +164,46 @@ jobs:
         env:
           SITE_ENV: ${{ secrets[format('SITE_ENV__{0}', steps.repokey.outputs.KEY_UPPER)] }}
           BRANCH: ${{ needs.detect.outputs.branch }}
+          DB_MODE: ${{ needs.detect.outputs.db_mode }}
         working-directory: site
         run: |
           [ -n "${SITE_ENV:-}" ] || { echo "❌ Missing secret SITE_ENV__${{ steps.repokey.outputs.KEY_UPPER }}"; exit 1; }
           printf "%s\n" "$SITE_ENV" | sed 's/\r$//' > .env
 
-          # If DATABASE_URL/DIRECT_DATABASE_URL are not present, derive from suffix based on branch
-          have_db=$(grep -cE '^(DATABASE_URL|DIRECT_DATABASE_URL)=' .env || true)
-          if [ "$have_db" -lt 2 ]; then
-            if [ "$BRANCH" = "main-hetz" ]; then
-              HDB="$(awk -F= '$1=="DATABASE_URL_HETZNER"{print $2}' .env | tail -1)"
-              HDD="$(awk -F= '$1=="DIRECT_DATABASE_URL_HETZNER"{print $2}' .env | tail -1)"
-              [ -n "$HDB" ] && echo "DATABASE_URL=$HDB" >> .env
-              [ -n "$HDD" ] && echo "DIRECT_DATABASE_URL=$HDD" >> .env
-            else
-              VDB="$(awk -F= '$1=="DATABASE_URL_VERCEL"{print $2}' .env | tail -1)"
-              VDD="$(awk -F= '$1=="DIRECT_DATABASE_URL_VERCEL"{print $2}' .env | tail -1)"
-              [ -n "$VDB" ] && echo "DATABASE_URL=$VDB" >> .env
-              # If no explicit direct URL, mirror DATABASE_URL
-              if [ -n "$VDD" ]; then
-                echo "DIRECT_DATABASE_URL=$VDD" >> .env
+          if [ "$DB_MODE" != "none" ]; then
+            have_db=$(grep -cE '^(DATABASE_URL|DIRECT_DATABASE_URL)=' .env || true)
+            if [ "$have_db" -lt 2 ]; then
+              if [ "$BRANCH" = "main-hetz" ]; then
+                HDB="$(awk -F= '$1=="DATABASE_URL_HETZNER"{print $2}' .env | tail -1)"
+                HDD="$(awk -F= '$1=="DIRECT_DATABASE_URL_HETZNER"{print $2}' .env | tail -1)"
+                [ -n "$HDB" ] && echo "DATABASE_URL=$HDB" >> .env
+                [ -n "$HDD" ] && echo "DIRECT_DATABASE_URL=$HDD" >> .env
               else
-                echo "DIRECT_DATABASE_URL=${VDB}" >> .env
+                VDB="$(awk -F= '$1=="DATABASE_URL_VERCEL"{print $2}' .env | tail -1)"
+                VDD="$(awk -F= '$1=="DIRECT_DATABASE_URL_VERCEL"{print $2}' .env | tail -1)"
+                [ -n "$VDB" ] && echo "DATABASE_URL=$VDB" >> .env
+                if [ -n "$VDD" ]; then
+                  echo "DIRECT_DATABASE_URL=$VDD" >> .env
+                else
+                  echo "DIRECT_DATABASE_URL=${VDB}" >> .env
+                fi
               fi
             fi
+            echo "DB envs in use:"; grep -E '^(DATABASE_URL|DIRECT_DATABASE_URL)=' .env
+            grep -q '^DATABASE_URL=' .env || { echo "❌ DATABASE_URL still missing after normalization"; exit 1; }
+            grep -q '^DIRECT_DATABASE_URL=' .env || { echo "❌ DIRECT_DATABASE_URL still missing after normalization"; exit 1; }
+          else
+            echo "DB disabled (db: none) — skipping DB env normalization/requirements."
           fi
-
-          # Sanity check
-          echo "DB envs in use:"
-          grep -E '^(DATABASE_URL|DIRECT_DATABASE_URL)=' .env
-
-          # Optional: warn if still missing
-          grep -q '^DATABASE_URL=' .env || { echo "❌ DATABASE_URL still missing after normalization"; exit 1; }
-          grep -q '^DIRECT_DATABASE_URL=' .env || { echo "❌ DIRECT_DATABASE_URL still missing after normalization"; exit 1; }
 
       - name: Prisma generate (for Next build)
         working-directory: site
-        run: npx prisma generate
+        run: |
+          if [ -f prisma/schema.prisma ]; then
+            npx prisma generate
+          else
+            echo "No Prisma schema found — skipping generate"
+          fi
 
       - name: Build
         working-directory: site
@@ -273,7 +290,7 @@ jobs:
           echo "Preview .env (first lines):"; sed -n '1,20p' .env
 
       - name: Ensure DB vars (preview)
-        if: env.SKIP != '1'
+        if: env.SKIP != '1' && needs.detect.outputs.db_mode != 'none'
         working-directory: site
         run: |
           # Set DATABASE_URL if still missing
@@ -295,7 +312,12 @@ jobs:
 
       - if: env.SKIP != '1'
         working-directory: site
-        run: npx prisma generate
+        run: |
+          if [ -f prisma/schema.prisma ]; then
+            npx prisma generate
+          else
+            echo "No Prisma schema found — skipping generate"
+          fi
 
       - if: env.SKIP != '1'
         working-directory: site
@@ -367,7 +389,7 @@ jobs:
           echo "Prod .env (first lines):"; sed -n '1,20p' .env
 
       - name: Ensure DB vars (prod)
-        if: env.SKIP != '1'
+        if: env.SKIP != '1' && needs.detect.outputs.db_mode != 'none'
         working-directory: site
         run: |
           if ! grep -q '^DATABASE_URL=' .env; then
@@ -387,7 +409,12 @@ jobs:
 
       - if: env.SKIP != '1'
         working-directory: site
-        run: npx prisma generate
+        run: |
+          if [ -f prisma/schema.prisma ]; then
+            npx prisma generate
+          else
+            echo "No Prisma schema found — skipping generate"
+          fi
 
       - if: env.SKIP != '1'
         working-directory: site
@@ -472,12 +499,631 @@ jobs:
             NEXT_PUBLIC_SITE_URL=${{ steps.envparse.outputs.NEXT_PUBLIC_SITE_URL }}
             NEXT_PUBLIC_ADMIN_URL=${{ steps.envparse.outputs.NEXT_PUBLIC_ADMIN_URL }}
             SITE_URL=${{ steps.envparse.outputs.SITE_URL }}
+            USE_DB=${{ needs.detect.outputs.db_mode != 'none' && 'true' || 'false' }}
+
 
   hetzner_node:
     needs: [detect, image_build_push]
     if: needs.detect.outputs.project_type == 'node' && needs.detect.outputs.branch == 'main-hetz'
     runs-on: ubuntu-latest
     steps:
-      # (same as your current hetzner_node job – omitted here for brevity)
-      # Keep your existing content unchanged
+      - name: Derive REPO_KEY (UPPERCASE, '-' -> '_')
+        id: repokey
+        run: |
+          NAME="${{ needs.detect.outputs.repository_name }}"
+          KEY_UPPER="$(echo "$NAME" | tr '[:lower:]-' '[:upper:]_')"
+          echo "KEY_UPPER=$KEY_UPPER" >> $GITHUB_OUTPUT
+
+      - name: Load SITE_ENV__{REPO_KEY} to env
+        env:
+          SITE_ENV_SECRET: ${{ secrets[format('SITE_ENV__{0}', steps.repokey.outputs.KEY_UPPER)] }}
+        run: |
+          [ -n "${SITE_ENV_SECRET:-}" ] || { echo "❌ Missing secret SITE_ENV__${{ steps.repokey.outputs.KEY_UPPER }}"; exit 1; }
+          {
+            echo 'SITE_ENV<<EOF'
+            printf '%s\n' "$SITE_ENV_SECRET"
+            echo 'EOF'
+          } >> "$GITHUB_ENV"
+
+      - name: Parse values from SITE_ENV (pgAdmin + Cloudflare)
+        env:
+          CF_SECRET_DIRECT: ${{ secrets.CF_DNS_API_TOKEN }}
+          DB_MODE: ${{ needs.detect.outputs.db_mode }}
+        run: |
+          printf "%s\n" "$SITE_ENV" | sed 's/\r$//' > .site_env
+
+          # Cloudflare token
+          if [ -n "${CF_SECRET_DIRECT:-}" ]; then
+            echo "CF_DNS_API_TOKEN=${CF_SECRET_DIRECT}" >> $GITHUB_ENV
+          else
+            CF_FROM_ENV="$(awk -F= '/^(CLOUDFLARE_DNS_API_TOKEN|CF_DNS_API_TOKEN)=/{print $2}' .site_env | tail -1)"
+            [ -n "$CF_FROM_ENV" ] || { echo "❌ Cloudflare DNS token missing"; exit 1; }
+            echo "CF_DNS_API_TOKEN=$CF_FROM_ENV" >> $GITHUB_ENV
+          fi
+
+          # pgAdmin only if DB enabled
+          if [ "${DB_MODE}" != "none" ]; then
+            PGADMIN_EMAIL="$(awk -F= '/^PGADMIN_EMAIL=/{print $2}' .site_env | tail -1)"
+            PGADMIN_PASSWORD="$(awk -F= '/^PGADMIN_PASSWORD=/{print $2}' .site_env | tail -1)"
+            [ -n "$PGADMIN_EMAIL" ]    || { echo "❌ PGADMIN_EMAIL missing in SITE_ENV"; exit 1; }
+            [ -n "$PGADMIN_PASSWORD" ] || { echo "❌ PGADMIN_PASSWORD missing in SITE_ENV"; exit 1; }
+            echo "PGADMIN_EMAIL=$PGADMIN_EMAIL"       >> $GITHUB_ENV
+            echo "PGADMIN_PASSWORD=$PGADMIN_PASSWORD" >> $GITHUB_ENV
+          else
+            echo "DB disabled — skipping pgAdmin variables"
+          fi
+
+      - name: Sanity check required SSH & parsed vars
+        env:
+          HZ_HOST:    ${{ secrets.HZ_HOST }}
+          HZ_SSH_KEY: ${{ secrets.HZ_SSH_KEY }}
+          DB_MODE:    ${{ needs.detect.outputs.db_mode }}
+        run: |
+          [ -n "${HZ_HOST:-}" ]  || { echo "❌ Missing secret: HZ_HOST"; exit 1; }
+          [ -n "${HZ_SSH_KEY:-}" ] || { echo "❌ Missing secret: HZ_SSH_KEY"; exit 1; }
+          [ -n "${CF_DNS_API_TOKEN:-}" ] || { echo "❌ CF_DNS_API_TOKEN not available"; exit 1; }
+          if [ "${DB_MODE}" != "none" ]; then
+            [ -n "${PGADMIN_EMAIL:-}" ]    || { echo "❌ PGADMIN_EMAIL not exported"; exit 1; }
+            [ -n "${PGADMIN_PASSWORD:-}" ] || { echo "❌ PGADMIN_PASSWORD not exported"; exit 1; }
+          fi
+
+      - name: Resolve Hetzner public IPv4
+        id: ipresolve
+        env:
+          HOST: ${{ secrets.HZ_HOST }}
+        run: |
+          set -euo pipefail
+          H="$HOST"
+          ip_re='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+          if [[ "$H" =~ $ip_re ]]; then
+            IP4="$H"
+          else
+            IP4="$(getent ahostsv4 "$H" | awk '{print $1; exit}' || true)"
+            [ -n "$IP4" ] || IP4="$(dig +short A "$H" | head -1 || true)"
+            if [ -z "$IP4" ] && command -v nslookup >/dev/null 2>&1; then
+              IP4="$(nslookup -type=A "$H" 2>/dev/null | awk '/Address: /{print $2; exit}' || true)"
+            fi
+          fi
+          [ -n "${IP4:-}" ] || { echo "❌ Could not resolve IPv4 for $H"; exit 1; }
+          echo "PUBLIC_IPV4=$IP4" >> "$GITHUB_OUTPUT"
+          echo "Resolved IPv4: $IP4"
+
+      - name: Ensure Cloudflare DNS (root, www, admin, pgadmin)
+        env:
+          CF_TOKEN:   ${{ env.CF_DNS_API_TOKEN }}
+          ROOT:       ${{ needs.detect.outputs.domain_prod }}
+          ADMIN:      ${{ needs.detect.outputs.domain_admin }}
+          PGADMIN:    ${{ needs.detect.outputs.domain_pgadmin }}
+          IP4:        ${{ steps.ipresolve.outputs.PUBLIC_IPV4 }}
+          DB_MODE:    ${{ needs.detect.outputs.db_mode }}
+        run: |
+          set -euo pipefail
+          api(){ curl -sS -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" "$@"; }
+          ZONE_NAME="$ROOT"
+          if [ "$(echo "$ZONE_NAME" | awk -F. '{print NF}')" -gt 2 ]; then
+            ZONE_NAME="$(echo "$ZONE_NAME" | awk -F. '{print $(NF-1)"."$NF}')"
+          fi
+          ZID=$(api "https://api.cloudflare.com/client/v4/zones?name=${ZONE_NAME}" | jq -r '.result[0].id')
+          [ "$ZID" != "null" ] && [ -n "$ZID" ] || { echo "❌ Zone ${ZONE_NAME} not found in Cloudflare"; exit 1; }
+
+          upsert_a(){
+            local name="$1"; local ip="$2"; local proxied="${3:-true}"
+            local rid=$(api "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records?type=A&name=${name}" | jq -r '.result[0].id')
+            if [ "$rid" = "null" ] || [ -z "$rid" ]; then
+              echo "Create A ${name} -> ${ip}"
+              api -X POST "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records" \
+                --data "{\"type\":\"A\",\"name\":\"${name}\",\"content\":\"${ip}\",\"ttl\":120,\"proxied\":${proxied}}" >/dev/null
+            else
+              echo "Update A ${name} -> ${ip}"
+              api -X PUT "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records/${rid}" \
+                --data "{\"type\":\"A\",\"name\":\"${name}\",\"content\":\"${ip}\",\"ttl\":120,\"proxied\":${proxied}}" >/dev/null
+            fi
+          }
+
+          upsert_a "${ROOT}"      "$IP4" true
+          upsert_a "www.${ROOT}"  "$IP4" true
+          upsert_a "${ADMIN}"     "$IP4" true
+          if [ "${DB_MODE}" != "none" ]; then
+            upsert_a "${PGADMIN}"   "$IP4" true
+          else
+            echo "DB disabled — skipping pgAdmin DNS"
+          fi
+
+          echo "✅ DNS records ensured (pgAdmin conditional on DB mode)"
+
+
+      - name: Deploy over SSH (Traefik + per-project DB + app + pgAdmin)
+        uses: appleboy/ssh-action@v1
+        env:
+          SLUG:         ${{ needs.detect.outputs.slug }}
+          PORT:         ${{ needs.detect.outputs.port }}
+          DOMAIN:       ${{ needs.detect.outputs.domain_prod }}
+          ADMIN_DOMAIN: ${{ needs.detect.outputs.domain_admin }}
+          PGADMIN_HOST: ${{ needs.detect.outputs.domain_pgadmin }}
+          IMAGE_REF:    ${{ needs.image_build_push.outputs.ref }}
+          SITE_ENV:     ${{ env.SITE_ENV }}
+          GHCR_USER:    ${{ github.repository_owner }}
+          GHCR_TOKEN:   ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
+          CF_DNS_API_TOKEN: ${{ env.CF_DNS_API_TOKEN }}
+          PGADMIN_EMAIL:    ${{ env.PGADMIN_EMAIL }}
+          PGADMIN_PASSWORD: ${{ env.PGADMIN_PASSWORD }}
+          DB_MODE:          ${{ needs.detect.outputs.db_mode }}
+        with:
+          host: ${{ secrets.HZ_HOST }}
+          username: ${{ secrets.HZ_USER || 'root' }}
+          key: ${{ secrets.HZ_SSH_KEY }}
+          port: 22
+          timeout: 60s
+          command_timeout: 25m
+          envs: SLUG,PORT,DOMAIN,ADMIN_DOMAIN,PGADMIN_HOST,IMAGE_REF,SITE_ENV,GHCR_USER,GHCR_TOKEN,CF_DNS_API_TOKEN,PGADMIN_EMAIL,PGADMIN_PASSWORD,DB_MODE
+          script: |
+            set -euo pipefail
+
+            [ -n "${SLUG:-}" ] && [ -n "${DOMAIN:-}" ] && [ -n "${IMAGE_REF:-}" ] || { echo "❌ Missing SLUG/DOMAIN/IMAGE_REF"; exit 1; }
+
+            SLUG_SAFE="$(printf '%s' "${SLUG}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
+            [ -n "$SLUG_SAFE" ] || { echo "❌ Bad SLUG"; exit 1; }
+
+            DB_NET="${SLUG_SAFE}_db_net"
+            DB_DIR="/opt/services/postgres-${SLUG_SAFE}"
+            SITE_DIR="/opt/sites/${SLUG_SAFE}"
+
+            docker network create proxy >/dev/null 2>&1 || true
+            if [ "${DB_MODE}" != "none" ]; then
+              docker network create "${DB_NET}" >/dev/null 2>&1 || true
+            fi
+
+            SITE_ENV_NORM="$(printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//')"
+            ACME_EMAIL="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^ACME_EMAIL=/{print $2}' | tail -1)"
+            [ -n "$ACME_EMAIL" ] || { echo "❌ ACME_EMAIL missing in SITE_ENV"; exit 1; }
+
+            DB_NAME="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_DB|DB_NAME)=/{print $2}' | tail -1)"
+            [ -n "$DB_NAME" ] || DB_NAME="${SLUG_SAFE}"
+            DB_USER="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_USER|DB_USER)=/{print $2}' | tail -1)"
+            [ -n "$DB_USER" ] || DB_USER="${SLUG_SAFE}_admin"
+            DB_PASS="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_PASSWORD|DB_PASSWORD)=/{print $2}' | tail -1)"
+            [ -n "$DB_PASS" ] || DB_PASS=""
+
+            # --- Traefik (shared) ---
+            TDIR="/opt/services/traefik"
+            mkdir -p "$TDIR/letsencrypt"
+            [ -f "$TDIR/letsencrypt/acme.json" ] || install -m 600 /dev/null "$TDIR/letsencrypt/acme.json"
+            cat > "$TDIR/.env" <<EOF
+            ACME_EMAIL=${ACME_EMAIL}
+            CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
+            CLOUDFLARE_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
+            EOF
+            cat > "$TDIR/docker-compose.yml" <<'YAML'
+            services:
+              traefik:
+                image: traefik:v3.0
+                restart: unless-stopped
+                env_file: .env
+                command:
+                  - --providers.docker=true
+                  - --providers.docker.exposedbydefault=false
+                  - --entrypoints.web.address=:80
+                  - --entrypoints.websecure.address=:443
+                  - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
+                  - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+                  - --certificatesresolvers.le.acme.dnschallenge=true
+                  - --certificatesresolvers.le.acme.dnschallenge.provider=cloudflare
+                  - --certificatesresolvers.le.acme.dnschallenge.delaybeforecheck=10
+                environment:
+                  CF_DNS_API_TOKEN: ${CF_DNS_API_TOKEN}
+                  CLOUDFLARE_DNS_API_TOKEN: ${CLOUDFLARE_DNS_API_TOKEN}
+                ports:
+                  - "80:80"
+                  - "443:443"
+                volumes:
+                  - /var/run/docker.sock:/var/run/docker.sock:ro
+                  - ./letsencrypt:/letsencrypt
+                networks:
+                  - proxy
+            networks:
+              proxy:
+                external: true
+                name: proxy
+            YAML
+            (cd "$TDIR" && docker compose up -d)
+
+            # --- Login to GHCR (if token provided) ---
+            if [ -n "${GHCR_TOKEN:-}" ]; then
+              echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            fi
+
+            # ============================================
+            # DB stack only if DB_MODE != none
+            # ============================================
+            if [ "${DB_MODE}" != "none" ]; then
+              echo "🔹 DB enabled — setting up Postgres + PgBouncer + pgAdmin"
+              mkdir -p "${DB_DIR}"
+              cat > "${DB_DIR}/.env" <<EOF
+              POSTGRES_USER=${DB_USER}
+              POSTGRES_PASSWORD=${DB_PASS}
+              POSTGRES_DB=${DB_NAME}
+              DB_USER=${DB_USER}
+              DB_PASSWORD=${DB_PASS}
+              DB_NAME=${DB_NAME}
+              PGADMIN_DEFAULT_EMAIL=${PGADMIN_EMAIL}
+              PGADMIN_DEFAULT_PASSWORD=${PGADMIN_PASSWORD}
+              PGADMIN_DEFAULT_SERVER_NAME=PgBouncer (${SLUG_SAFE})
+              EOF
+
+              cat > "${DB_DIR}/pgadmin-servers.json" <<JSON
+              {
+                "Servers": {
+                  "1": {
+                    "Name": "PgBouncer (${SLUG_SAFE})",
+                    "Group": "Servers",
+                    "Host": "pgbouncer",
+                    "Port": 5432,
+                    "MaintenanceDB": "${DB_NAME}",
+                    "Username": "${DB_USER}",
+                    "SSLMode": "prefer"
+                  }
+                }
+              }
+              JSON
+
+              cat > "${DB_DIR}/docker-compose.yml" <<DBYAML
+              services:
+                postgres:
+                  image: postgres:15
+                  restart: unless-stopped
+                  env_file: .env
+                  environment:
+                    POSTGRES_INITDB_ARGS: "--auth=scram-sha-256"
+                  healthcheck:
+                    test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+                    interval: 10s
+                    timeout: 5s
+                    retries: 30
+                  volumes:
+                    - pg_data_${SLUG_SAFE}:/var/lib/postgresql/data
+                  networks:
+                    - ${DB_NET}
+
+                pgbouncer:
+                  image: edoburu/pgbouncer
+                  restart: unless-stopped
+                  env_file: .env
+                  environment:
+                    POOL_MODE: transaction
+                    MAX_CLIENT_CONN: 200
+                    DEFAULT_POOL_SIZE: 20
+                    AUTH_TYPE: scram-sha-256
+                    DB_HOST: postgres
+                    DB_USER: \${POSTGRES_USER}
+                    DB_PASSWORD: \${POSTGRES_PASSWORD}
+                  depends_on:
+                    postgres:
+                      condition: service_healthy
+                  networks:
+                    - ${DB_NET}
+
+                pgadmin:
+                  image: dpage/pgadmin4:8
+                  restart: unless-stopped
+                  env_file: .env
+                  environment:
+                    PGADMIN_LISTEN_PORT: "8080"
+                    PGADMIN_CONFIG_ENABLE_PROXY_FIX: "True"
+                  volumes:
+                    - ./pgadmin-servers.json:/pgadmin4/servers.json:ro
+                    - pgadmin_data_${SLUG_SAFE}:/var/lib/pgadmin
+                  networks:
+                    - ${DB_NET}
+                    - proxy
+                  labels:
+                    - 'traefik.enable=true'
+                    - 'traefik.docker.network=proxy'
+                    - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.rule=Host("${PGADMIN_HOST}")'
+                    - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.entrypoints=websecure'
+                    - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.tls.certresolver=le'
+                    - 'traefik.http.services.${SLUG_SAFE}-pgadmin.loadbalancer.server.port=8080'
+
+              volumes:
+                pg_data_${SLUG_SAFE}:
+                pgadmin_data_${SLUG_SAFE}:
+
+              networks:
+                ${DB_NET}:
+                  external: true
+                  name: ${DB_NET}
+                proxy:
+                  external: true
+                  name: proxy
+              DBYAML
+
+              (cd "${DB_DIR}" && docker compose up -d)
+            else
+              echo "🚫 DB disabled — skipping Postgres/PgBouncer/pgAdmin setup"
+            fi
+
+            # ============================================
+            # App deploy (common)
+            # ============================================
+            mkdir -p "${SITE_DIR}"
+            cd "${SITE_DIR}"
+            printf "%s\n" "$SITE_ENV_NORM" > app.env
+
+            # Basic shared env setup
+            grep -q '^AUTH_TRUST_HOST=' app.env || echo 'AUTH_TRUST_HOST=true' >> app.env
+            grep -q '^NEXTAUTH_URL_PUBLIC=' app.env || echo "NEXTAUTH_URL_PUBLIC=https://${DOMAIN}" >> app.env
+            if [ -n "${ADMIN_DOMAIN:-}" ]; then
+              grep -q '^NEXTAUTH_URL_ADMIN=' app.env || echo "NEXTAUTH_URL_ADMIN=https://${ADMIN_DOMAIN}" >> app.env
+            fi
+
+            # Inject DB URLs only if DB enabled
+            if [ "${DB_MODE}" != "none" ]; then
+              grep -q '^DATABASE_URL=' app.env || echo "DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@pgbouncer:5432/${DB_NAME}?pgbouncer=true&connection_limit=1&connect_timeout=5" >> app.env
+              grep -q '^DIRECT_DATABASE_URL=' app.env || echo "DIRECT_DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@postgres:5432/${DB_NAME}?connect_timeout=5" >> app.env
+            fi
+
+            # --- Compose template (DB-aware) ---
+            if [ "${DB_MODE}" != "none" ]; then
+              NET_LINE="- ${DB_NET}"
+            else
+              NET_LINE=""
+            fi
+
+            cat > docker-compose.yml.tpl <<'YAML'
+            services:
+              app:
+                image: ${IMAGE_REF}
+                restart: unless-stopped
+                env_file:
+                  - app.env
+                labels:
+                  - 'traefik.enable=true'
+                  - 'traefik.docker.network=proxy'
+                  - 'traefik.http.routers.${SLUG_SAFE}.rule=Host("${DOMAIN}") || Host("www.${DOMAIN}")'
+                  - 'traefik.http.routers.${SLUG_SAFE}.entrypoints=websecure'
+                  - 'traefik.http.routers.${SLUG_SAFE}.tls.certresolver=le'
+                  - 'traefik.http.services.${SLUG_SAFE}.loadbalancer.server.port=${PORT}'
+                networks:
+                  - proxy
+            YAML
+            if [ "${DB_MODE}" != "none" ]; then
+              echo "      ${NET_LINE}" >> docker-compose.yml.tpl
+            fi
+            echo "networks:" >> docker-compose.yml.tpl
+            echo "  proxy: { external: true, name: proxy }" >> docker-compose.yml.tpl
+            if [ "${DB_MODE}" != "none" ]; then
+              echo "  ${DB_NET}: { external: true, name: ${DB_NET} }" >> docker-compose.yml.tpl
+            fi
+
+            export IMAGE_REF SLUG_SAFE DOMAIN PORT DB_NET
+            envsubst '$IMAGE_REF $SLUG_SAFE $DOMAIN $PORT $DB_NET' < docker-compose.yml.tpl > docker-compose.yml
+
+            docker compose pull || true
+            docker compose up -d --remove-orphans
+
+            # --- Prisma migrate + Admin ensure (only if DB enabled) ---
+            if [ "${DB_MODE}" != "none" ]; then
+              docker compose exec -T app sh -s <<'SH'
+              set -e
+              NODE_PATH=/app/node_modules npx prisma migrate deploy
+              NODE_PATH=/app/node_modules node <<'EOF'
+              (async () => {
+                const { PrismaClient, Role, UserSource } = require("@prisma/client");
+                const bcrypt = require("bcryptjs");
+                const prisma = new PrismaClient();
+                const email = (process.env.ADMIN_EMAIL || "admin@princefoods.com").toLowerCase();
+                const name  = process.env.ADMIN_NAME  || "Head Admin";
+                const plain = process.env.ADMIN_PASSWORD || "supersecurepassword";
+                const existing = await prisma.user.findUnique({ where: { email } });
+                const passwordHash = await bcrypt.hash(plain, 12);
+                if (!existing) {
+                  await prisma.user.create({
+                    data: { email, name, role: Role.HEAD, source: UserSource.LOCAL, password: passwordHash, emailVerified: new Date() },
+                  });
+                  console.log("✅ Created admin:", email);
+                } else {
+                  await prisma.user.update({ where: { email }, data: { name, password: passwordHash } });
+                  console.log("✅ Updated admin password:", email);
+                }
+                await prisma.$disconnect();
+              })().catch(e => { console.error(e); process.exit(1); });
+              EOF
+              SH
+            else
+              echo "🚫 DB disabled — skipping Prisma migrations and admin seed"
+            fi 
+
+      - name: In-container health check (bypasses DNS/SSL)
+        uses: appleboy/ssh-action@v1
+        env:
+          SLUG:   ${{ needs.detect.outputs.slug }}
+          DOMAIN: ${{ needs.detect.outputs.domain_prod }}
+        with:
+          host: ${{ secrets.HZ_HOST }}
+          username: ${{ secrets.HZ_USER || 'root' }}
+          key: ${{ secrets.HZ_SSH_KEY }}
+          port: 22
+          timeout: 60s
+          command_timeout: 10m
+          envs: SLUG,DOMAIN
+          script: |
+            set -euo pipefail
+            : "${SLUG:?missing SLUG}"
+            : "${DOMAIN:?missing DOMAIN}"
+
+            SLUG_SAFE="$(printf '%s' "${SLUG}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
+            cd "/opt/sites/${SLUG_SAFE}"
+
+            PORT=$(docker compose exec -T app sh -lc 'printf "%s" "${PORT:-3000}"')
+            echo "Detected PORT=$PORT"
+
+            ok=0
+            for path in /api/healthz /api/healthz/ /; do
+              echo "Probing http://127.0.0.1:${PORT}${path}"
+              for i in $(seq 1 20); do
+                if docker compose exec -T app node -e "const http=require('http');http.get({host:'127.0.0.1',port:${PORT},path:'${path}',headers:{'x-forwarded-proto':'https','host':'${DOMAIN:-localhost}'}},r=>process.exit(r.statusCode<400?0:1)).on('error',()=>process.exit(1))"; then
+                  echo '✅ OK'; ok=1; break
+                fi
+                echo "  retry $i"; sleep 3
+              done
+              [ $ok -eq 1 ] && break
+            done
+            [ $ok -eq 1 ] || { echo "❌ App not healthy internally"; docker compose logs --no-color --tail=200 app || true; exit 1; }
+
+      - name: Short settle
+        run: sleep 10
+
+      - name: Public health check (through Traefik)
+        env:
+          DOMAIN: ${{ needs.detect.outputs.domain_prod }}
+        run: |
+          set -e
+          urls=("https://${DOMAIN}/api/healthz" "https://${DOMAIN}/")
+          ok=0
+          for i in {1..36}; do
+            for u in "${urls[@]}"; do
+              code=$(curl -L -sS -o /tmp/health_body -w "%{http_code}" "$u" || true)
+              echo "GET $u -> HTTP $code"
+              if grep -q "404 page not found" /tmp/health_body 2>/dev/null; then
+                echo "Traefik 404 (router warming/rule) — retrying…"
+              fi
+              [[ "$code" =~ ^(200|204|301|302|307|308)$ ]] && { echo "✅ Public health OK ($code)"; ok=1; break; }
+            done
+            [ $ok -eq 1 ] && break
+            sleep 5
+          done
+          [ $ok -eq 1 ] || { echo "❌ Public health failed"; exit 1; }
+
+  hetzner_static:
+    needs: [detect, build_test]
+    if: needs.detect.outputs.project_type == 'static' && needs.detect.outputs.branch == 'main-hetz'
+    runs-on: ubuntu-latest
+    env:
+      SLUG:   ${{ needs.detect.outputs.slug }}
+      DOMAIN: ${{ needs.detect.outputs.domain_prod }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: static-export
+
+      - name: Move artifact to ./out
+        run: |
+          rm -rf out && mkdir -p out
+          cp -R static-export/. out/
+
+      - name: Create Dockerfile for static image
+        run: |
+          cat > site.Dockerfile <<'DOCKER'
+          FROM nginx:alpine
+          COPY out/ /usr/share/nginx/html
+          RUN adduser -D -g 'www' www \
+           && chown -R www:www /usr/share/nginx/html \
+           && sed -i 's/user  nginx;/user www;/' /etc/nginx/nginx.conf
+          EXPOSE 80
+          DOCKER
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push static image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: site.Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/static-${{ needs.detect.outputs.repository_name }}:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/static-${{ needs.detect.outputs.repository_name }}:latest
+
+      - name: Deploy static container on Hetzner (HTTPS only)
+        uses: appleboy/ssh-action@v1
+        env:
+          SLUG: ${{ needs.detect.outputs.slug }}
+          DOMAIN: ${{ needs.detect.outputs.domain_prod }}
+          IMAGE_REF: ghcr.io/${{ github.repository_owner }}/static-${{ needs.detect.outputs.repository_name }}:${{ github.sha }}
+          GHCR_USER: ${{ github.repository_owner }}
+          GHCR_TOKEN: ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.HETZNER_HOST || secrets.HZ_HOST }}
+          username: ${{ secrets.HETZNER_USER || secrets.HZ_USER || 'root' }}
+          key: ${{ secrets.HETZNER_SSH_KEY || secrets.HZ_SSH_KEY }}
+          port: 22
+          timeout: 60s
+          command_timeout: 15m
+          envs: SLUG,DOMAIN,IMAGE_REF,GHCR_USER,GHCR_TOKEN
+          script: |
+            set -euo pipefail
+            docker network create proxy >/dev/null 2>&1 || true
+            if [ -n "${GHCR_TOKEN:-}" ]; then
+              echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            fi
+            SLUG_SAFE="$(printf '%s' "${SLUG}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
+            SITE_DIR="/opt/sites/${SLUG_SAFE}"
+            mkdir -p "$SITE_DIR"
+            cd "$SITE_DIR"
+
+            cat > docker-compose.yml.tpl <<'YAML'
+            services:
+              web:
+                image: ${IMAGE_REF}
+                restart: unless-stopped
+                labels:
+                  - 'traefik.enable=true'
+                  - 'traefik.docker.network=proxy'
+                  - 'traefik.http.routers.${SLUG_SAFE}.rule=Host("${DOMAIN}")'
+                  - 'traefik.http.routers.${SLUG_SAFE}.entrypoints=websecure'
+                  - 'traefik.http.routers.${SLUG_SAFE}.tls.certresolver=le'
+                  - 'traefik.http.services.${SLUG_SAFE}.loadbalancer.server.port=80'
+                  - 'traefik.http.routers.${SLUG_SAFE}-http.rule=Host("${DOMAIN}")'
+                  - 'traefik.http.routers.${SLUG_SAFE}-http.entrypoints=web'
+                  - 'traefik.http.routers.${SLUG_SAFE}-http.middlewares=${SLUG_SAFE}-redirect'
+                  - 'traefik.http.routers.${SLUG_SAFE}-http.service=${SLUG_SAFE}'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-redirect.redirectscheme.scheme=https'
+                networks:
+                  - proxy
+            networks:
+              proxy:
+                external: true
+                name: proxy
+            YAML
+            export IMAGE_REF SLUG_SAFE DOMAIN
+            if ! command -v envsubst >/dev/null 2>&1; then
+              apt-get update -y && apt-get install -y --no-install-recommends gettext-base
+            fi
+            envsubst '$IMAGE_REF $SLUG_SAFE $DOMAIN' < docker-compose.yml.tpl > docker-compose.yml
+
+            docker compose pull || true
+            docker compose up -d --remove-orphans
+
+      - name: Static public check
+        run: |
+          for i in {1..36}; do
+            if curl -L -sS "https://${{ needs.detect.outputs.domain_prod }}/" >/dev/null; then
+              echo "✅ Site up"; exit 0; fi
+            echo "retry $i"; sleep 5
+          done
+          echo "❌ Timed out"; exit 1
+
+      - name: Trigger Receive & Deploy (post-Hetzner static)
+        if: needs.detect.outputs.branch == 'main-hetz' && success()
+        run: |
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token ${{ secrets.CICD_DISPATCH_TOKEN }}" \
+            https://api.github.com/repos/CICD/multi-site-hetz-cicd/dispatches \
+            -d @- <<'JSON'
+          {
+            "event_type": "deploy",
+            "client_payload": {
+              "repository": "${{ needs.detect.outputs.repository }}",
+              "repository_name": "${{ needs.detect.outputs.repository_name }}",
+              "branch": "${{ needs.detect.outputs.branch }}"
+            }
+          }
+          JSON
       - run: echo "Hetzner deploy steps unchanged; using your existing definitions."
