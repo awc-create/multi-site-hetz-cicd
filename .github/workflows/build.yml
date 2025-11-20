@@ -310,6 +310,18 @@ jobs:
           echo "Using DB envs:"; grep -E '^(DATABASE_URL|DIRECT_DATABASE_URL)=' .env
 
       - if: env.SKIP != '1'
+        name: Install deps (for Prisma + Vercel build)
+        working-directory: site
+        run: |
+          if [ -f yarn.lock ]; then
+            yarn install --immutable
+          elif [ -f pnpm-lock.yaml ]; then
+            corepack enable && pnpm i --frozen-lockfile
+          else
+            npm ci
+          fi
+
+      - if: env.SKIP != '1'
         working-directory: site
         run: |
           if [ -f prisma/schema.prisma ]; then
@@ -320,7 +332,8 @@ jobs:
 
       - if: env.SKIP != '1'
         working-directory: site
-        run: vercel build --token="${{ env.VERCEL_TOKEN }}"
+        run: vercel build --prod --token="${{ env.VERCEL_TOKEN }}"
+
 
       - if: env.SKIP != '1'
         working-directory: site
@@ -407,6 +420,18 @@ jobs:
           echo "Using DB envs:"; grep -E '^(DATABASE_URL|DIRECT_DATABASE_URL)=' .env
 
       - if: env.SKIP != '1'
+        name: Install deps (for Prisma + Vercel build)
+        working-directory: site
+        run: |
+          if [ -f yarn.lock ]; then
+            yarn install --immutable
+          elif [ -f pnpm-lock.yaml ]; then
+            corepack enable && pnpm i --frozen-lockfile
+          else
+            npm ci
+          fi
+
+      - if: env.SKIP != '1'
         working-directory: site
         run: |
           if [ -f prisma/schema.prisma ]; then
@@ -418,6 +443,7 @@ jobs:
       - if: env.SKIP != '1'
         working-directory: site
         run: vercel build --prod --token="${{ env.VERCEL_TOKEN }}"
+
 
       - if: env.SKIP != '1'
         working-directory: site
