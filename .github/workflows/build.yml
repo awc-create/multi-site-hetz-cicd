@@ -332,7 +332,7 @@ jobs:
 
       - if: env.SKIP != '1'
         working-directory: site
-        run: vercel build --prod --token="${{ env.VERCEL_TOKEN }}"
+        run: vercel build --token="${{ env.VERCEL_TOKEN }}"
 
 
       - if: env.SKIP != '1'
