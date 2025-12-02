@@ -928,34 +928,53 @@ jobs:
             # --- Prisma migrate + Admin ensure (only if DB enabled) ---
             if [ "${DB_MODE}" != "none" ]; then
               docker compose exec -T app sh -s <<'SH'
-              set -e
-              NODE_PATH=/app/node_modules npx prisma migrate deploy
-              NODE_PATH=/app/node_modules node <<'EOF'
-              (async () => {
-                const { PrismaClient, Role, UserSource } = require("@prisma/client");
-                const bcrypt = require("bcryptjs");
-                const prisma = new PrismaClient();
-                const email = (process.env.ADMIN_EMAIL || "admin@princefoods.com").toLowerCase();
-                const name  = process.env.ADMIN_NAME  || "Head Admin";
-                const plain = process.env.ADMIN_PASSWORD || "supersecurepassword";
-                const existing = await prisma.user.findUnique({ where: { email } });
-                const passwordHash = await bcrypt.hash(plain, 12);
-                if (!existing) {
-                  await prisma.user.create({
-                    data: { email, name, role: Role.HEAD, source: UserSource.LOCAL, password: passwordHash, emailVerified: new Date() },
-                  });
-                  console.log("✅ Created admin:", email);
-                } else {
-                  await prisma.user.update({ where: { email }, data: { name, password: passwordHash } });
-                  console.log("✅ Updated admin password:", email);
-                }
-                await prisma.$disconnect();
-              })().catch(e => { console.error(e); process.exit(1); });
-              EOF
-              SH
+            set -e
+            NODE_PATH=/app/node_modules npx prisma migrate deploy
+
+            # Run admin creation script
+            NODE_PATH=/app/node_modules node <<'EOF'
+            (async () => {
+              const { PrismaClient, Role, UserSource } = require("@prisma/client");
+              const bcrypt = require("bcryptjs");
+              const prisma = new PrismaClient();
+
+              const email = (process.env.ADMIN_EMAIL || "admin@drcodezenna.com").toLowerCase();
+              const name  = process.env.ADMIN_NAME  || "Head Admin";
+              const plain = process.env.ADMIN_PASSWORD || "supersecurepassword";
+
+              const existing = await prisma.user.findUnique({ where: { email } });
+              const passwordHash = await bcrypt.hash(plain, 12);
+
+              if (!existing) {
+                await prisma.user.create({
+                  data: {
+                    email,
+                    name,
+                    role: Role.HEAD,
+                    source: UserSource.LOCAL,
+                    password: passwordHash,
+                    emailVerified: new Date(),
+                  },
+                });
+                console.log("✅ Created admin:", email);
+              } else {
+                await prisma.user.update({
+                  where: { email },
+                  data: { name, password: passwordHash },
+                });
+                console.log("✅ Updated admin password:", email);
+              }
+
+              await prisma.$disconnect();
+            })().catch(e => {
+              console.error(e);
+              process.exit(1);
+            });
+            EOF
+            SH
             else
               echo "🚫 DB disabled — skipping Prisma migrations and admin seed"
-            fi 
+            fi
 
       - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@v1
