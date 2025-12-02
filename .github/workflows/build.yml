@@ -893,7 +893,7 @@ jobs:
               NET_LINE=""
             fi
 
-            cat > docker-compose.yml.tpl <<'YAML'
+            cat > docker-compose.yml.tpl <<'EOF'
             services:
               app:
                 image: ${IMAGE_REF}
@@ -909,15 +909,19 @@ jobs:
                   - 'traefik.http.services.${SLUG_SAFE}.loadbalancer.server.port=${PORT}'
                 networks:
                   - proxy
-            YAML
+            EOF
+
+            # ✅ NOW NET_LINE is defined BEFORE being used
             if [ "${DB_MODE}" != "none" ]; then
               echo "      ${NET_LINE}" >> docker-compose.yml.tpl
             fi
+
             echo "networks:" >> docker-compose.yml.tpl
             echo "  proxy: { external: true, name: proxy }" >> docker-compose.yml.tpl
             if [ "${DB_MODE}" != "none" ]; then
               echo "  ${DB_NET}: { external: true, name: ${DB_NET} }" >> docker-compose.yml.tpl
             fi
+
 
             export IMAGE_REF SLUG_SAFE DOMAIN PORT DB_NET
             envsubst '$IMAGE_REF $SLUG_SAFE $DOMAIN $PORT $DB_NET' < docker-compose.yml.tpl > docker-compose.yml
@@ -1111,7 +1115,7 @@ jobs:
             mkdir -p "$SITE_DIR"
             cd "$SITE_DIR"
 
-            cat > docker-compose.yml.tpl <<'YAML'
+            cat > docker-compose.yml.tpl <<'EOF'
             services:
               web:
                 image: ${IMAGE_REF}
@@ -1134,7 +1138,7 @@ jobs:
               proxy:
                 external: true
                 name: proxy
-            YAML
+            EOF
             export IMAGE_REF SLUG_SAFE DOMAIN
             if ! command -v envsubst >/dev/null 2>&1; then
               apt-get update -y && apt-get install -y --no-install-recommends gettext-base
