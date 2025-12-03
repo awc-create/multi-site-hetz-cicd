@@ -681,7 +681,7 @@ jobs:
           timeout: 60s
           command_timeout: 25m
           envs: SLUG,PORT,DOMAIN,ADMIN_DOMAIN,PGADMIN_HOST,IMAGE_REF,SITE_ENV,GHCR_USER,GHCR_TOKEN,CF_DNS_API_TOKEN,PGADMIN_EMAIL,PGADMIN_PASSWORD,DB_MODE
-          script: |
+                    script: |
             set -euo pipefail
 
             # Basic required vars
@@ -722,7 +722,7 @@ jobs:
             CLOUDFLARE_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
             TRAEFIK_ENV
 
-                        cat > "$TDIR/docker-compose.yml" <<'TRAEFIK_YML'
+            cat > "$TDIR/docker-compose.yml" <<'TRAEFIK_YML'
             services:
               traefik:
                 image: traefik:v3.0
@@ -816,57 +816,57 @@ jobs:
                   networks:
                     - ${DB_NET}
 
-              pgbouncer:
-                image: edoburu/pgbouncer
-                restart: unless-stopped
-                env_file: .env
-                environment:
-                  POOL_MODE: transaction
-                  MAX_CLIENT_CONN: 200
-                  DEFAULT_POOL_SIZE: 20
-                  AUTH_TYPE: scram-sha-256
-                  DB_HOST: postgres
-                  DB_USER: \${POSTGRES_USER}
-                  DB_PASSWORD: \${POSTGRES_PASSWORD}
-                depends_on:
-                  postgres:
-                    condition: service_healthy
-                networks:
-                  - ${DB_NET}
+                pgbouncer:
+                  image: edoburu/pgbouncer
+                  restart: unless-stopped
+                  env_file: .env
+                  environment:
+                    POOL_MODE: transaction
+                    MAX_CLIENT_CONN: 200
+                    DEFAULT_POOL_SIZE: 20
+                    AUTH_TYPE: scram-sha-256
+                    DB_HOST: postgres
+                    DB_USER: \${POSTGRES_USER}
+                    DB_PASSWORD: \${POSTGRES_PASSWORD}
+                  depends_on:
+                    postgres:
+                      condition: service_healthy
+                  networks:
+                    - ${DB_NET}
 
-              pgadmin:
-                image: dpage/pgadmin4:8
-                restart: unless-stopped
-                env_file: .env
-                environment:
-                  PGADMIN_LISTEN_PORT: "8080"
-                  PGADMIN_CONFIG_ENABLE_PROXY_FIX: "True"
-                volumes:
-                  - ./pgadmin-servers.json:/pgadmin4/servers.json:ro
-                  - pgadmin_data_${SLUG_SAFE}:/var/lib/pgadmin
-                networks:
-                  - ${DB_NET}
-                  - proxy
-                labels:
-                  - 'traefik.enable=true'
-                  - 'traefik.docker.network=proxy'
-                  - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.rule=Host("${PGADMIN_HOST}")'
-                  - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.entrypoints=websecure'
-                  - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.tls.certresolver=le'
-                  - 'traefik.http.services.${SLUG_SAFE}-pgadmin.loadbalancer.server.port=8080'
+                pgadmin:
+                  image: dpage/pgadmin4:8
+                  restart: unless-stopped
+                  env_file: .env
+                  environment:
+                    PGADMIN_LISTEN_PORT: "8080"
+                    PGADMIN_CONFIG_ENABLE_PROXY_FIX: "True"
+                  volumes:
+                    - ./pgadmin-servers.json:/pgadmin4/servers.json:ro
+                    - pgadmin_data_${SLUG_SAFE}:/var/lib/pgadmin
+                  networks:
+                    - ${DB_NET}
+                    - proxy
+                  labels:
+                    - 'traefik.enable=true'
+                    - 'traefik.docker.network=proxy'
+                    - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.rule=Host("${PGADMIN_HOST}")'
+                    - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.entrypoints=websecure'
+                    - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.tls.certresolver=le'
+                    - 'traefik.http.services.${SLUG_SAFE}-pgadmin.loadbalancer.server.port=8080'
 
-            volumes:
-              pg_data_${SLUG_SAFE}:
-              pgadmin_data_${SLUG_SAFE}:
+              volumes:
+                pg_data_${SLUG_SAFE}:
+                pgadmin_data_${SLUG_SAFE}:
 
-            networks:
-              ${DB_NET}:
-                external: true
-                name: ${DB_NET}
-              proxy:
-                external: true
-                name: proxy
-            DB_STACK_YML
+              networks:
+                ${DB_NET}:
+                  external: true
+                  name: ${DB_NET}
+                proxy:
+                  external: true
+                  name: proxy
+              DB_STACK_YML
 
               (cd "${DB_DIR}" && docker compose up -d)
             else
@@ -983,9 +983,9 @@ jobs:
             });
             NODE_ADMIN
             PRISMA_SH
-            else
-              echo "🚫 DB disabled — skipping Prisma migrations and admin seed"
-            fi
+                        else
+                          echo "🚫 DB disabled — skipping Prisma migrations and admin seed"
+                        fi
 
       - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@v1
