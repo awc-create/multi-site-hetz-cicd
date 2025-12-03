@@ -684,6 +684,7 @@ jobs:
           script: |
             set -euo pipefail
 
+            # Basic required vars
             [ -n "${SLUG:-}" ] && [ -n "${DOMAIN:-}" ] && [ -n "${IMAGE_REF:-}" ] || { echo "❌ Missing SLUG/DOMAIN/IMAGE_REF"; exit 1; }
 
             SLUG_SAFE="$(printf '%s' "${SLUG}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
@@ -698,6 +699,7 @@ jobs:
               docker network create "${DB_NET}" >/dev/null 2>&1 || true
             fi
 
+            # Normalize SITE_ENV
             SITE_ENV_NORM="$(printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//')"
             ACME_EMAIL="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^ACME_EMAIL=/{print $2}' | tail -1)"
             [ -n "$ACME_EMAIL" ] || { echo "❌ ACME_EMAIL missing in SITE_ENV"; exit 1; }
@@ -713,12 +715,14 @@ jobs:
             TDIR="/opt/services/traefik"
             mkdir -p "$TDIR/letsencrypt"
             [ -f "$TDIR/letsencrypt/acme.json" ] || install -m 600 /dev/null "$TDIR/letsencrypt/acme.json"
-            cat > "$TDIR/.env" <<EOF
+
+            cat > "$TDIR/.env" <<TRAEFIK_ENV
             ACME_EMAIL=${ACME_EMAIL}
             CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
             CLOUDFLARE_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
-            EOF
-            cat > "$TDIR/docker-compose.yml" <<'YAML'
+            TRAEFIK_ENV
+
+                        cat > "$TDIR/docker-compose.yml" <<'TRAEFIK_YML'
             services:
               traefik:
                 image: traefik:v3.0
@@ -745,11 +749,13 @@ jobs:
                   - ./letsencrypt:/letsencrypt
                 networks:
                   - proxy
+
             networks:
               proxy:
                 external: true
                 name: proxy
-            YAML
+            TRAEFIK_YML
+
             (cd "$TDIR" && docker compose up -d)
 
             # --- Login to GHCR (if token provided) ---
@@ -763,7 +769,8 @@ jobs:
             if [ "${DB_MODE}" != "none" ]; then
               echo "🔹 DB enabled — setting up Postgres + PgBouncer + pgAdmin"
               mkdir -p "${DB_DIR}"
-              cat > "${DB_DIR}/.env" <<EOF
+
+              cat > "${DB_DIR}/.env" <<DB_ENV
               POSTGRES_USER=${DB_USER}
               POSTGRES_PASSWORD=${DB_PASS}
               POSTGRES_DB=${DB_NAME}
@@ -773,9 +780,9 @@ jobs:
               PGADMIN_DEFAULT_EMAIL=${PGADMIN_EMAIL}
               PGADMIN_DEFAULT_PASSWORD=${PGADMIN_PASSWORD}
               PGADMIN_DEFAULT_SERVER_NAME=PgBouncer (${SLUG_SAFE})
-              EOF
+              DB_ENV
 
-              cat > "${DB_DIR}/pgadmin-servers.json" <<JSON
+              cat > "${DB_DIR}/pgadmin-servers.json" <<DB_SERVERS
               {
                 "Servers": {
                   "1": {
@@ -789,9 +796,9 @@ jobs:
                   }
                 }
               }
-              JSON
+              DB_SERVERS
 
-              cat > "${DB_DIR}/docker-compose.yml" <<DBYAML
+              cat > "${DB_DIR}/docker-compose.yml" <<DB_STACK_YML
               services:
                 postgres:
                   image: postgres:15
@@ -800,7 +807,7 @@ jobs:
                   environment:
                     POSTGRES_INITDB_ARGS: "--auth=scram-sha-256"
                   healthcheck:
-                    test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+                    test: ["CMD-SHELL", "pg_isready -U \$\$POSTGRES_USER -d \$\$POSTGRES_DB"]
                     interval: 10s
                     timeout: 5s
                     retries: 30
@@ -809,57 +816,57 @@ jobs:
                   networks:
                     - ${DB_NET}
 
-                pgbouncer:
-                  image: edoburu/pgbouncer
-                  restart: unless-stopped
-                  env_file: .env
-                  environment:
-                    POOL_MODE: transaction
-                    MAX_CLIENT_CONN: 200
-                    DEFAULT_POOL_SIZE: 20
-                    AUTH_TYPE: scram-sha-256
-                    DB_HOST: postgres
-                    DB_USER: \${POSTGRES_USER}
-                    DB_PASSWORD: \${POSTGRES_PASSWORD}
-                  depends_on:
-                    postgres:
-                      condition: service_healthy
-                  networks:
-                    - ${DB_NET}
+              pgbouncer:
+                image: edoburu/pgbouncer
+                restart: unless-stopped
+                env_file: .env
+                environment:
+                  POOL_MODE: transaction
+                  MAX_CLIENT_CONN: 200
+                  DEFAULT_POOL_SIZE: 20
+                  AUTH_TYPE: scram-sha-256
+                  DB_HOST: postgres
+                  DB_USER: \${POSTGRES_USER}
+                  DB_PASSWORD: \${POSTGRES_PASSWORD}
+                depends_on:
+                  postgres:
+                    condition: service_healthy
+                networks:
+                  - ${DB_NET}
 
-                pgadmin:
-                  image: dpage/pgadmin4:8
-                  restart: unless-stopped
-                  env_file: .env
-                  environment:
-                    PGADMIN_LISTEN_PORT: "8080"
-                    PGADMIN_CONFIG_ENABLE_PROXY_FIX: "True"
-                  volumes:
-                    - ./pgadmin-servers.json:/pgadmin4/servers.json:ro
-                    - pgadmin_data_${SLUG_SAFE}:/var/lib/pgadmin
-                  networks:
-                    - ${DB_NET}
-                    - proxy
-                  labels:
-                    - 'traefik.enable=true'
-                    - 'traefik.docker.network=proxy'
-                    - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.rule=Host("${PGADMIN_HOST}")'
-                    - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.entrypoints=websecure'
-                    - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.tls.certresolver=le'
-                    - 'traefik.http.services.${SLUG_SAFE}-pgadmin.loadbalancer.server.port=8080'
+              pgadmin:
+                image: dpage/pgadmin4:8
+                restart: unless-stopped
+                env_file: .env
+                environment:
+                  PGADMIN_LISTEN_PORT: "8080"
+                  PGADMIN_CONFIG_ENABLE_PROXY_FIX: "True"
+                volumes:
+                  - ./pgadmin-servers.json:/pgadmin4/servers.json:ro
+                  - pgadmin_data_${SLUG_SAFE}:/var/lib/pgadmin
+                networks:
+                  - ${DB_NET}
+                  - proxy
+                labels:
+                  - 'traefik.enable=true'
+                  - 'traefik.docker.network=proxy'
+                  - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.rule=Host("${PGADMIN_HOST}")'
+                  - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.entrypoints=websecure'
+                  - 'traefik.http.routers.${SLUG_SAFE}-pgadmin.tls.certresolver=le'
+                  - 'traefik.http.services.${SLUG_SAFE}-pgadmin.loadbalancer.server.port=8080'
 
-              volumes:
-                pg_data_${SLUG_SAFE}:
-                pgadmin_data_${SLUG_SAFE}:
+            volumes:
+              pg_data_${SLUG_SAFE}:
+              pgadmin_data_${SLUG_SAFE}:
 
-              networks:
-                ${DB_NET}:
-                  external: true
-                  name: ${DB_NET}
-                proxy:
-                  external: true
-                  name: proxy
-              DBYAML
+            networks:
+              ${DB_NET}:
+                external: true
+                name: ${DB_NET}
+              proxy:
+                external: true
+                name: proxy
+            DB_STACK_YML
 
               (cd "${DB_DIR}" && docker compose up -d)
             else
@@ -893,7 +900,7 @@ jobs:
               NET_LINE=""
             fi
 
-            cat > docker-compose.yml.tpl <<'EOF'
+            cat > docker-compose.yml.tpl <<'APP_COMPOSE_YML'
             services:
               app:
                 image: ${IMAGE_REF}
@@ -909,34 +916,34 @@ jobs:
                   - 'traefik.http.services.${SLUG_SAFE}.loadbalancer.server.port=${PORT}'
                 networks:
                   - proxy
-            EOF
+            APP_COMPOSE_YML
 
-            # ✅ NOW NET_LINE is defined BEFORE being used
-            if [ "${DB_MODE}" != "none" ]; then
-              echo "      ${NET_LINE}" >> docker-compose.yml.tpl
-            fi
+                        if [ "${DB_MODE}" != "none" ]; then
+                          echo "      ${NET_LINE}" >> docker-compose.yml.tpl
+                        fi
 
-            echo "networks:" >> docker-compose.yml.tpl
-            echo "  proxy: { external: true, name: proxy }" >> docker-compose.yml.tpl
-            if [ "${DB_MODE}" != "none" ]; then
-              echo "  ${DB_NET}: { external: true, name: ${DB_NET} }" >> docker-compose.yml.tpl
-            fi
+                        echo "networks:" >> docker-compose.yml.tpl
+                        echo "  proxy: { external: true, name: proxy }" >> docker-compose.yml.tpl
+                        if [ "${DB_MODE}" != "none" ]; then
+                          echo "  ${DB_NET}: { external: true, name: ${DB_NET} }" >> docker-compose.yml.tpl
+                        fi
 
+                        export IMAGE_REF SLUG_SAFE DOMAIN PORT DB_NET
+                        if ! command -v envsubst >/dev/null 2>&1; then
+                          apt-get update -y && apt-get install -y --no-install-recommends gettext-base
+                        fi
+                        envsubst '$IMAGE_REF $SLUG_SAFE $DOMAIN $PORT $DB_NET' < docker-compose.yml.tpl > docker-compose.yml
 
-            export IMAGE_REF SLUG_SAFE DOMAIN PORT DB_NET
-            envsubst '$IMAGE_REF $SLUG_SAFE $DOMAIN $PORT $DB_NET' < docker-compose.yml.tpl > docker-compose.yml
+                        docker compose pull || true
+                        docker compose up -d --remove-orphans
 
-            docker compose pull || true
-            docker compose up -d --remove-orphans
-
-            # --- Prisma migrate + Admin ensure (only if DB enabled) ---
-            if [ "${DB_MODE}" != "none" ]; then
-              docker compose exec -T app sh -s <<'SH'
+                        # --- Prisma migrate + Admin ensure (only if DB enabled) ---
+                        if [ "${DB_MODE}" != "none" ]; then
+                          docker compose exec -T app sh -s <<'PRISMA_SH'
             set -e
             NODE_PATH=/app/node_modules npx prisma migrate deploy
 
-            # Run admin creation script
-            NODE_PATH=/app/node_modules node <<'EOF'
+            NODE_PATH=/app/node_modules node <<'NODE_ADMIN'
             (async () => {
               const { PrismaClient, Role, UserSource } = require("@prisma/client");
               const bcrypt = require("bcryptjs");
@@ -974,8 +981,8 @@ jobs:
               console.error(e);
               process.exit(1);
             });
-            EOF
-            SH
+            NODE_ADMIN
+            PRISMA_SH
             else
               echo "🚫 DB disabled — skipping Prisma migrations and admin seed"
             fi
