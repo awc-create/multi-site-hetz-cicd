@@ -700,15 +700,15 @@ jobs:
             fi
 
             # Normalize SITE_ENV
-            SITE_ENV_NORM="$(printf "%s\n" "${SITE_ENV:-}" | sed 's/\r$//')"
-            ACME_EMAIL="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^ACME_EMAIL=/{print $2}' | tail -1)"
+            SITE_ENV_NORM="$(printf "%s" "${SITE_ENV:-}" | sed 's/\r$//')"
+            ACME_EMAIL="$(printf "%s" "$SITE_ENV_NORM" | awk -F= '/^ACME_EMAIL=/{print $2}' | tail -1)"
             [ -n "$ACME_EMAIL" ] || { echo "❌ ACME_EMAIL missing in SITE_ENV"; exit 1; }
 
-            DB_NAME="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_DB|DB_NAME)=/{print $2}' | tail -1)"
+            DB_NAME="$(printf "%s" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_DB|DB_NAME)=/{print $2}' | tail -1)"
             [ -n "$DB_NAME" ] || DB_NAME="${SLUG_SAFE}"
-            DB_USER="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_USER|DB_USER)=/{print $2}' | tail -1)"
+            DB_USER="$(printf "%s" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_USER|DB_USER)=/{print $2}' | tail -1)"
             [ -n "$DB_USER" ] || DB_USER="${SLUG_SAFE}_admin"
-            DB_PASS="$(printf "%s\n" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_PASSWORD|DB_PASSWORD)=/{print $2}' | tail -1)"
+            DB_PASS="$(printf "%s" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_PASSWORD|DB_PASSWORD)=/{print $2}' | tail -1)"
             [ -n "$DB_PASS" ] || DB_PASS=""
 
             # --- Traefik (shared) ---
@@ -771,15 +771,15 @@ jobs:
               mkdir -p "${DB_DIR}"
 
               cat > "${DB_DIR}/.env" <<DB_ENV
-                POSTGRES_USER=${DB_USER}
-                POSTGRES_PASSWORD=${DB_PASS}
-                POSTGRES_DB=${DB_NAME}
-                DB_USER=${DB_USER}
-                DB_PASSWORD=${DB_PASS}
-                DB_NAME=${DB_NAME}
-                PGADMIN_DEFAULT_EMAIL=${PGADMIN_EMAIL}
-                PGADMIN_DEFAULT_PASSWORD=${PGADMIN_PASSWORD}
-                PGADMIN_DEFAULT_SERVER_NAME=PgBouncer (${SLUG_SAFE})
+              POSTGRES_USER=${DB_USER}
+              POSTGRES_PASSWORD=${DB_PASS}
+              POSTGRES_DB=${DB_NAME}
+              DB_USER=${DB_USER}
+              DB_PASSWORD=${DB_PASS}
+              DB_NAME=${DB_NAME}
+              PGADMIN_DEFAULT_EMAIL=${PGADMIN_EMAIL}
+              PGADMIN_DEFAULT_PASSWORD=${PGADMIN_PASSWORD}
+              PGADMIN_DEFAULT_SERVER_NAME=PgBouncer (${SLUG_SAFE})
               DB_ENV
 
               cat > "${DB_DIR}/pgadmin-servers.json" <<DB_SERVERS
