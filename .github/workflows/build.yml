@@ -656,7 +656,6 @@ jobs:
 
           echo "✅ DNS records ensured (pgAdmin conditional on DB mode)"
 
-
       - name: Deploy over SSH (Traefik + per-project DB + app + pgAdmin)
         uses: appleboy/ssh-action@v1
         env:
@@ -716,13 +715,13 @@ jobs:
             mkdir -p "$TDIR/letsencrypt"
             [ -f "$TDIR/letsencrypt/acme.json" ] || install -m 600 /dev/null "$TDIR/letsencrypt/acme.json"
 
-            cat > "$TDIR/.env" <<TRAEFIK_ENV
+            cat > "$TDIR/.env" <<-TRAEFIK_ENV
             ACME_EMAIL=${ACME_EMAIL}
             CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
             CLOUDFLARE_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
             TRAEFIK_ENV
 
-            cat > "$TDIR/docker-compose.yml" <<'TRAEFIK_YML'
+            cat > "$TDIR/docker-compose.yml" <<-'TRAEFIK_YML'
             services:
               traefik:
                 image: traefik:v3.0
@@ -770,7 +769,7 @@ jobs:
               echo "🔹 DB enabled — setting up Postgres + PgBouncer + pgAdmin"
               mkdir -p "${DB_DIR}"
 
-              cat > "${DB_DIR}/.env" <<DB_ENV
+              cat > "${DB_DIR}/.env" <<-DB_ENV
               POSTGRES_USER=${DB_USER}
               POSTGRES_PASSWORD=${DB_PASS}
               POSTGRES_DB=${DB_NAME}
@@ -782,7 +781,7 @@ jobs:
               PGADMIN_DEFAULT_SERVER_NAME=PgBouncer (${SLUG_SAFE})
               DB_ENV
 
-              cat > "${DB_DIR}/pgadmin-servers.json" <<DB_SERVERS
+              cat > "${DB_DIR}/pgadmin-servers.json" <<-DB_SERVERS
               {
                 "Servers": {
                   "1": {
@@ -798,7 +797,7 @@ jobs:
               }
               DB_SERVERS
 
-              cat > "${DB_DIR}/docker-compose.yml" <<DB_STACK_YML
+              cat > "${DB_DIR}/docker-compose.yml" <<-DB_STACK_YML
               services:
                 postgres:
                   image: postgres:15
@@ -900,7 +899,7 @@ jobs:
               NET_LINE=""
             fi
 
-            cat > docker-compose.yml.tpl <<'APP_COMPOSE_YML'
+            cat > docker-compose.yml.tpl <<-'APP_COMPOSE_YML'
             services:
               app:
                 image: ${IMAGE_REF}
@@ -939,11 +938,11 @@ jobs:
 
                         # --- Prisma migrate + Admin ensure (only if DB enabled) ---
                         if [ "${DB_MODE}" != "none" ]; then
-                          docker compose exec -T app sh -s <<'PRISMA_SH'
+                          docker compose exec -T app sh -s <<-'PRISMA_SH'
             set -e
             NODE_PATH=/app/node_modules npx prisma migrate deploy
 
-            NODE_PATH=/app/node_modules node <<'NODE_ADMIN'
+            NODE_PATH=/app/node_modules node <<-'NODE_ADMIN'
             (async () => {
               const { PrismaClient, Role, UserSource } = require("@prisma/client");
               const bcrypt = require("bcryptjs");
