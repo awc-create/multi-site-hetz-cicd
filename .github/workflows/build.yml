@@ -945,7 +945,7 @@ jobs:
 
             NODE_PATH=/app/node_modules node <<-'NODE_ADMIN'
             (async () => {
-              const { PrismaClient, Role, UserSource } = require("@prisma/client");
+              const { PrismaClient } = require("@prisma/client");
               const bcrypt = require("bcryptjs");
               const prisma = new PrismaClient();
 
@@ -961,8 +961,8 @@ jobs:
                   data: {
                     email,
                     name,
-                    role: Role.HEAD,
-                    source: UserSource.LOCAL,
+                    role: "HEAD",
+                    source: "LOCAL",
                     password: passwordHash,
                     emailVerified: new Date(),
                   },
@@ -971,7 +971,12 @@ jobs:
               } else {
                 await prisma.user.update({
                   where: { email },
-                  data: { name, password: passwordHash },
+                  data: { 
+                  name, 
+                  password: passwordHash,
+                  role: "HEAD",
+                  source: "LOCAL",
+                 },
                 });
                 console.log("✅ Updated admin password:", email);
               }
