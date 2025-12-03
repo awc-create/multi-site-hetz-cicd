@@ -921,91 +921,91 @@ jobs:
                   - proxy
             APP_COMPOSE_YML
 
-                        if [ "${DB_MODE}" != "none" ]; then
-                          echo "      ${NET_LINE}" >> docker-compose.yml.tpl
-                        fi
+            if [ "${DB_MODE}" != "none" ]; then
+              echo "      ${NET_LINE}" >> docker-compose.yml.tpl
+            fi
 
-                        echo "networks:" >> docker-compose.yml.tpl
-                        echo "  proxy: { external: true, name: proxy }" >> docker-compose.yml.tpl
-                        if [ "${DB_MODE}" != "none" ]; then
-                          echo "  ${DB_NET}: { external: true, name: ${DB_NET} }" >> docker-compose.yml.tpl
-                        fi
+            echo "networks:" >> docker-compose.yml.tpl
+            echo "  proxy: { external: true, name: proxy }" >> docker-compose.yml.tpl
+            if [ "${DB_MODE}" != "none" ]; then
+              echo "  ${DB_NET}: { external: true, name: ${DB_NET} }" >> docker-compose.yml.tpl
+            fi
 
-                        export IMAGE_REF SLUG_SAFE DOMAIN PORT DB_NET
-                        if ! command -v envsubst >/dev/null 2>&1; then
-                          apt-get update -y && apt-get install -y --no-install-recommends gettext-base
-                        fi
-                        envsubst '$IMAGE_REF $SLUG_SAFE $DOMAIN $PORT $DB_NET' < docker-compose.yml.tpl > docker-compose.yml
+            export IMAGE_REF SLUG_SAFE DOMAIN PORT DB_NET
+            if ! command -v envsubst >/dev/null 2>&1; then
+              apt-get update -y && apt-get install -y --no-install-recommends gettext-base
+            fi
+            envsubst '$IMAGE_REF $SLUG_SAFE $DOMAIN $PORT $DB_NET' < docker-compose.yml.tpl > docker-compose.yml
 
-                        docker compose pull || true
-                        docker compose up -d --remove-orphans
+            docker compose pull || true
+            docker compose up -d --remove-orphans
 
-                        # --- Prisma migrate + Admin ensure (only if DB enabled) ---
-                        if [ "${DB_MODE}" != "none" ]; then
-                          docker compose exec -T app sh -s <<-'PRISMA_SH'
-                        set -e
-                        NODE_PATH=/app/node_modules npx prisma migrate deploy
+            # --- Prisma migrate + Admin ensure (only if DB enabled) ---
+            if [ "${DB_MODE}" != "none" ]; then
+              docker compose exec -T app sh -s <<-'PRISMA_SH'
+            set -e
+            NODE_PATH=/app/node_modules npx prisma migrate deploy
 
-                        # Optional admin seeding – configurable per project via env
-                        NODE_PATH=/app/node_modules node <<-'NODE_ADMIN'
-                        (async () => {
-                          const { PrismaClient } = require("@prisma/client");
-                          const bcrypt = require("bcryptjs");
-                          const prisma = new PrismaClient();
+            # Optional admin seeding – configurable per project via env
+            NODE_PATH=/app/node_modules node <<-'NODE_ADMIN'
+            (async () => {
+              const { PrismaClient } = require("@prisma/client");
+              const bcrypt = require("bcryptjs");
+              const prisma = new PrismaClient();
 
-                          // Turn off seeding for a project with ADMIN_ENABLED=false in SITE_ENV
-                          const enabledFlag = (process.env.ADMIN_ENABLED ?? "true").toLowerCase();
-                          if (["false", "0", "no"].includes(enabledFlag)) {
-                            console.log("ℹ️ ADMIN_ENABLED is false — skipping admin seed");
-                            await prisma.$disconnect();
-                            return;
-                          }
+              // Turn off seeding for a project with ADMIN_ENABLED=false in SITE_ENV
+              const enabledFlag = (process.env.ADMIN_ENABLED ?? "true").toLowerCase();
+              if (["false", "0", "no"].includes(enabledFlag)) {
+                console.log("ℹ️ ADMIN_ENABLED is false — skipping admin seed");
+                await prisma.$disconnect();
+                return;
+              }
 
-                          const siteDomain =
-                            (process.env.SITE_DOMAIN || "")
-                              .replace(/^https?:\/\//, "")
-                              .replace(/\/.*/, "") || "example.com";
+              const siteDomain =
+                (process.env.SITE_DOMAIN || "")
+                  .replace(/^https?:\/\//, "")
+                  .replace(/\/.*/, "") || "example.com";
 
-                          const email = (process.env.ADMIN_EMAIL || `admin@${siteDomain}`).toLowerCase();
-                          const name  = process.env.ADMIN_NAME       || "Head Admin";
-                          const plain = process.env.ADMIN_PASSWORD   || "supersecurepassword";
-                          const role  = process.env.ADMIN_ROLE       || "admin";  // your User.role is String
+              const email = (process.env.ADMIN_EMAIL || `admin@${siteDomain}`).toLowerCase();
+              const name  = process.env.ADMIN_NAME       || "Head Admin";
+              const plain = process.env.ADMIN_PASSWORD   || "supersecurepassword";
+              const role  = process.env.ADMIN_ROLE       || "admin";  // your User.role is String
 
-                          const existing = await prisma.user.findUnique({ where: { email } });
-                          const passwordHash = await bcrypt.hash(plain, 12);
+              const existing = await prisma.user.findUnique({ where: { email } });
+              const passwordHash = await bcrypt.hash(plain, 12);
 
-                          if (!existing) {
-                            await prisma.user.create({
-                              data: {
-                                email,
-                                name,
-                                role,
-                                passwordHash,
-                              },
-                            });
-                            console.log("✅ Created admin:", email);
-                          } else {
-                            await prisma.user.update({
-                              where: { email },
-                              data: {
-                                name,
-                                role,
-                                passwordHash,
-                              },
-                            });
-                            console.log("✅ Updated admin:", email);
-                          }
+              if (!existing) {
+                await prisma.user.create({
+                  data: {
+                    email,
+                    name,
+                    role,
+                    passwordHash,
+                  },
+                });
+                console.log("✅ Created admin:", email);
+              } else {
+                await prisma.user.update({
+                  where: { email },
+                  data: {
+                    name,
+                    role,
+                    passwordHash,
+                  },
+                });
+                console.log("✅ Updated admin:", email);
+              }
 
-                          await prisma.$disconnect();
-                        })().catch(e => {
-                          console.error(e);
-                          process.exit(1);
-                        });
-                        NODE_ADMIN
-                        PRISMA_SH
-                        else
-                          echo "🚫 DB disabled — skipping Prisma migrations and admin seed"
-                        fi
+              await prisma.$disconnect();
+            })().catch(e => {
+              console.error(e);
+              process.exit(1);
+            });
+            NODE_ADMIN
+            PRISMA_SH
+            else
+              echo "🚫 DB disabled — skipping Prisma migrations and admin seed"
+            fi
 
       - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@v1
