@@ -769,17 +769,17 @@ jobs:
               echo "🔹 DB enabled — setting up Postgres + PgBouncer + pgAdmin"
               mkdir -p "${DB_DIR}"
 
-              cat > "${DB_DIR}/.env" <<-DB_ENV
-              POSTGRES_USER=${DB_USER}
-              POSTGRES_PASSWORD=${DB_PASS}
-              POSTGRES_DB=${DB_NAME}
-              DB_USER=${DB_USER}
-              DB_PASSWORD=${DB_PASS}
-              DB_NAME=${DB_NAME}
-              PGADMIN_DEFAULT_EMAIL=${PGADMIN_EMAIL}
-              PGADMIN_DEFAULT_PASSWORD=${PGADMIN_PASSWORD}
-              PGADMIN_DEFAULT_SERVER_NAME=PgBouncer (${SLUG_SAFE})
-              DB_ENV
+              {
+                echo "POSTGRES_USER=${DB_USER}"
+                echo "POSTGRES_PASSWORD=${DB_PASS}"
+                echo "POSTGRES_DB=${DB_NAME}"
+                echo "DB_USER=${DB_USER}"
+                echo "DB_PASSWORD=${DB_PASS}"
+                echo "DB_NAME=${DB_NAME}"
+                echo "PGADMIN_DEFAULT_EMAIL=${PGADMIN_EMAIL}"
+                echo "PGADMIN_DEFAULT_PASSWORD=${PGADMIN_PASSWORD}"
+                echo "PGADMIN_DEFAULT_SERVER_NAME=PgBouncer (${SLUG_SAFE})"
+              } > "${DB_DIR}/.env"
 
               cat > "${DB_DIR}/pgadmin-servers.json" <<-DB_SERVERS
               {
