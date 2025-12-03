@@ -681,7 +681,7 @@ jobs:
           timeout: 60s
           command_timeout: 25m
           envs: SLUG,PORT,DOMAIN,ADMIN_DOMAIN,PGADMIN_HOST,IMAGE_REF,SITE_ENV,GHCR_USER,GHCR_TOKEN,CF_DNS_API_TOKEN,PGADMIN_EMAIL,PGADMIN_PASSWORD,DB_MODE
-                    script: |
+          script: |
             set -euo pipefail
 
             # Basic required vars
@@ -983,9 +983,9 @@ jobs:
             });
             NODE_ADMIN
             PRISMA_SH
-                        else
-                          echo "🚫 DB disabled — skipping Prisma migrations and admin seed"
-                        fi
+                else
+                  echo "🚫 DB disabled — skipping Prisma migrations and admin seed"
+                fi
 
       - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@v1
