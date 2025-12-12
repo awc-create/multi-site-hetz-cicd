@@ -1075,27 +1075,38 @@ jobs:
     env:
       SLUG:   ${{ needs.detect.outputs.slug }}
       DOMAIN: ${{ needs.detect.outputs.domain_prod }}
+
     steps:
-      - uses: actions/download-artifact@v4
+      # ⬇️ Download artifact INTO a folder
+      - name: Download static export
+        uses: actions/download-artifact@v4
         with:
           name: static-export
+          path: static-export   # ✅ THIS IS THE FIX
 
+      # ⬇️ Move files into out/
       - name: Move artifact to ./out
         run: |
-          rm -rf out && mkdir -p out
+          rm -rf out
+          mkdir -p out
           cp -R static-export/. out/
+          echo "✅ Contents of out/:"
+          ls -la out | head -50
 
+      # ⬇️ Build static nginx image
       - name: Create Dockerfile for static image
         run: |
           cat > site.Dockerfile <<'DOCKER'
           FROM nginx:alpine
+
           COPY out/ /usr/share/nginx/html
+
           RUN adduser -D -g 'www' www \
-           && chown -R www:www /usr/share/nginx/html \
-           && sed -i 's/user  nginx;/user www;/' /etc/nginx/nginx.conf
+          && chown -R www:www /usr/share/nginx/html \
+          && sed -i 's/user  nginx;/user www;/' /etc/nginx/nginx.conf
+
           EXPOSE 80
           DOCKER
-
       - uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
