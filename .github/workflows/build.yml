@@ -64,12 +64,15 @@ jobs:
           DOMAIN_ADMIN=""
           DOMAIN_PGADMIN=""
           if [ -f ".cicd-config.yml" ]; then
-            get_val(){ grep -E "^$1:" .cicd-config.yml | head -1 | awk -F': *' '{print $2}' | tr -d "\"'"; }
+            get_val(){
+              grep -E "^$1:" .cicd-config.yml | head -1 | awk -F': *' '{print $2}' \
+                | tr -d "\"'" | tr -d '\r' | xargs
+            }
             SLUG="$(get_val slug || echo "$SLUG")"
             PORT="$(get_val port || echo "$PORT")"
             DOM_BLOCK="$(awk '/^domains:/{f=1;next} f && /^[^ ]/{f=0} f{print}' .cicd-config.yml)"
-            DOMAIN_PROD="$(printf '%s\n' "$DOM_BLOCK" | awk '/prod:/{print $2}' | tr -d "\"'")"
-            DOMAIN_ADMIN="$(printf '%s\n' "$DOM_BLOCK" | awk '/admin:/{print $2}' | tr -d "\"'")"
+            DOMAIN_PROD="$(printf '%s\n' "$DOM_BLOCK" | awk '/prod:/{print $2}' | tr -d "\"'\r" | xargs)"
+            DOMAIN_ADMIN="$(printf '%s\n' "$DOM_BLOCK" | awk '/admin:/{print $2}' | tr -d "\"'\r" | xargs)"
             PGADMIN_SUB="$(get_val pgadmin_subdomain || true)"
             [ -n "$PGADMIN_SUB" ] && DOMAIN_PGADMIN="${PGADMIN_SUB}.${DOMAIN_PROD}"
           fi
@@ -647,6 +650,16 @@ jobs:
           CF_TOKEN_CLEAN="$(printf '%s' "${CF_TOKEN:-}" | tr -d '\r\n')"
           [ -n "${CF_TOKEN_CLEAN:-}" ] || { echo "❌ CF_TOKEN is empty"; exit 1; }
 
+          # ✅ Clean ROOT/ADMIN/PGADMIN too (CRLF + whitespace)
+          ROOT_CLEAN="$(printf '%s' "${ROOT:-}" | tr -d '\r\n' | xargs)"
+          ADMIN_CLEAN="$(printf '%s' "${ADMIN:-}" | tr -d '\r\n' | xargs)"
+          PGADMIN_CLEAN="$(printf '%s' "${PGADMIN:-}" | tr -d '\r\n' | xargs)"
+
+          [ -n "${ROOT_CLEAN:-}" ] || { echo "❌ ROOT is empty"; exit 1; }
+
+          echo "ROOT(raw)   = $(printf %q "${ROOT:-}")"
+          echo "ROOT(clean) = $(printf %q "${ROOT_CLEAN}")"
+
           api() {
             curl -fsS \
               -H "Authorization: Bearer ${CF_TOKEN_CLEAN}" \
@@ -660,10 +673,12 @@ jobs:
 
             IFS='.' read -r -a parts <<< "$fqdn"
 
-            # Try progressively shorter suffixes: a.b.c -> a.b.c, b.c
             for ((i=0; i<=${#parts[@]}-2; i++)); do
               candidate="$(IFS='.'; echo "${parts[@]:i}")"
-              echo "Checking Cloudflare zone candidate: $candidate"
+              # ✅ sanitize candidate too
+              candidate="$(printf '%s' "$candidate" | tr -d '\r\n' | xargs)"
+
+              echo "Checking Cloudflare zone candidate: $(printf %q "$candidate")"
 
               zid=$(api "https://api.cloudflare.com/client/v4/zones?name=${candidate}" | jq -r '.result[0].id')
               if [ "$zid" != "null" ] && [ -n "$zid" ]; then
@@ -675,11 +690,13 @@ jobs:
             return 1
           }
 
-          ZID="$(get_zone_id "$ROOT")" || { echo "❌ No Cloudflare zone found for $ROOT"; exit 1; }
+          ZID="$(get_zone_id "$ROOT_CLEAN")" || { echo "❌ No Cloudflare zone found for $ROOT_CLEAN"; exit 1; }
           echo "✅ Using zone id: $ZID"
 
           upsert_a(){
             local name="$1"; local ip="$2"; local proxied="${3:-true}"
+            name="$(printf '%s' "$name" | tr -d '\r\n' | xargs)"
+
             local rid
             rid=$(api "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records?type=A&name=${name}" | jq -r '.result[0].id')
 
@@ -695,24 +712,25 @@ jobs:
           }
 
           # Always create root + www
-          upsert_a "${ROOT}"     "$IP4" true
-          upsert_a "www.${ROOT}" "$IP4" true
+          upsert_a "${ROOT_CLEAN}" "$IP4" true
+          upsert_a "www.${ROOT_CLEAN}" "$IP4" true
 
-          # Admin is optional
-          if [ -n "${ADMIN:-}" ]; then
-            upsert_a "${ADMIN}" "$IP4" true
+          # Admin optional
+          if [ -n "${ADMIN_CLEAN:-}" ]; then
+            upsert_a "${ADMIN_CLEAN}" "$IP4" true
           else
             echo "No ADMIN domain set — skipping admin DNS"
           fi
 
           # PgAdmin only when DB enabled AND PGADMIN set
-          if [ "${DB_MODE}" != "none" ] && [ -n "${PGADMIN:-}" ]; then
-            upsert_a "${PGADMIN}" "$IP4" true
+          if [ "${DB_MODE}" != "none" ] && [ -n "${PGADMIN_CLEAN:-}" ]; then
+            upsert_a "${PGADMIN_CLEAN}" "$IP4" true
           else
             echo "DB disabled or PGADMIN empty — skipping pgAdmin DNS"
           fi
 
           echo "✅ DNS records ensured"
+
 
       - name: Deploy over SSH (Traefik + per-project DB + app + pgAdmin)
         uses: appleboy/ssh-action@v1
