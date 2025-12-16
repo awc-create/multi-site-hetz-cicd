@@ -64,15 +64,12 @@ jobs:
           DOMAIN_ADMIN=""
           DOMAIN_PGADMIN=""
           if [ -f ".cicd-config.yml" ]; then
-            get_val(){
-              grep -E "^$1:" .cicd-config.yml | head -1 | awk -F': *' '{print $2}' \
-                | tr -d "\"'" | tr -d '\r' | xargs
-            }
+            get_val(){ grep -E "^$1:" .cicd-config.yml | head -1 | awk -F': *' '{print $2}' | tr -d "\"'"; }
             SLUG="$(get_val slug || echo "$SLUG")"
             PORT="$(get_val port || echo "$PORT")"
             DOM_BLOCK="$(awk '/^domains:/{f=1;next} f && /^[^ ]/{f=0} f{print}' .cicd-config.yml)"
-            DOMAIN_PROD="$(printf '%s\n' "$DOM_BLOCK" | awk '/prod:/{print $2}' | tr -d "\"'\r" | xargs)"
-            DOMAIN_ADMIN="$(printf '%s\n' "$DOM_BLOCK" | awk '/admin:/{print $2}' | tr -d "\"'\r" | xargs)"
+            DOMAIN_PROD="$(printf '%s\n' "$DOM_BLOCK" | awk '/prod:/{print $2}' | tr -d "\"'")"
+            DOMAIN_ADMIN="$(printf '%s\n' "$DOM_BLOCK" | awk '/admin:/{print $2}' | tr -d "\"'")"
             PGADMIN_SUB="$(get_val pgadmin_subdomain || true)"
             [ -n "$PGADMIN_SUB" ] && DOMAIN_PGADMIN="${PGADMIN_SUB}.${DOMAIN_PROD}"
           fi
@@ -104,45 +101,26 @@ jobs:
           echo "DB_MODE=$DBM" >> $GITHUB_OUTPUT
           echo "DB mode: $DBM"
 
-      - name: Finalize domains (admin optional, pgadmin only if DB enabled)
+      - name: Finalize domains (default admin=admin.prod, pgadmin=dbui.prod)
         id: dom
-        shell: bash
         run: |
-          set -euo pipefail
-
           PROD="${{ steps.cfg.outputs.DOMAIN_PROD_RAW }}"
-          ADMIN_RAW="${{ steps.cfg.outputs.DOMAIN_ADMIN_RAW }}"
+          ADMIN="${{ steps.cfg.outputs.DOMAIN_ADMIN_RAW }}"
           PGADMIN_RAW="${{ steps.cfg.outputs.DOMAIN_PGADMIN_RAW }}"
-          DB_MODE="${{ steps.dbmode.outputs.DB_MODE }}"
-
           if [ -z "$PROD" ]; then
             echo "❌ DOMAIN_PROD missing (set it in .cicd-config.yml -> domains.prod)"; exit 1;
           fi
-
-          # ✅ Admin is OPTIONAL — only use if explicitly provided
-          ADMIN=""
-          if [ -n "$ADMIN_RAW" ]; then
-            ADMIN="$ADMIN_RAW"
+          [ -n "$ADMIN" ] || ADMIN="admin.${PROD}"
+          if [ "${{ steps.dbmode.outputs.DB_MODE }}" != "none" ]; then
+            PGADMIN="${PGADMIN_RAW:-dbui.${PROD}}"
+          else
+            PGADMIN=""
           fi
-
-          # ✅ PgAdmin ONLY when DB enabled
-          PGADMIN=""
-          if [ "$DB_MODE" != "none" ]; then
-            if [ -n "$PGADMIN_RAW" ]; then
-              PGADMIN="$PGADMIN_RAW"
-            else
-              PGADMIN="dbui.${PROD}"
-            fi
-          fi
-
-          echo "DOMAIN_PROD=$PROD" >> $GITHUB_OUTPUT
-          echo "DOMAIN_ADMIN=$ADMIN" >> $GITHUB_OUTPUT
+          echo "DOMAIN_PROD=$PROD"    >> $GITHUB_OUTPUT
+          echo "DOMAIN_ADMIN=$ADMIN"  >> $GITHUB_OUTPUT
           echo "DOMAIN_PGADMIN=$PGADMIN" >> $GITHUB_OUTPUT
+          echo "Using domains: PROD=$PROD ADMIN=$ADMIN PGADMIN=${PGADMIN:-<disabled>}"
 
-          echo "Using domains:"
-          echo "  PROD=$PROD"
-          echo "  ADMIN=${ADMIN:-<disabled>}"
-          echo "  PGADMIN=${PGADMIN:-<disabled>}"
 
   build_test:
     runs-on: ubuntu-latest
@@ -635,7 +613,7 @@ jobs:
           echo "PUBLIC_IPV4=$IP4" >> "$GITHUB_OUTPUT"
           echo "Resolved IPv4: $IP4"
 
-      - name: Ensure Cloudflare DNS (root, www, admin?, pgadmin?)
+      - name: Ensure Cloudflare DNS (root, www, admin, pgadmin)
         env:
           CF_TOKEN:   ${{ env.CF_DNS_API_TOKEN }}
           ROOT:       ${{ needs.detect.outputs.domain_prod }}
@@ -646,59 +624,58 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Clean token (handles accidental CRLF)
-          CF_TOKEN_CLEAN="$(printf '%s' "${CF_TOKEN:-}" | tr -d '\r\n')"
-          [ -n "${CF_TOKEN_CLEAN:-}" ] || { echo "❌ CF_TOKEN is empty"; exit 1; }
+          # Clean CRLF/whitespace
+          CF_TOKEN="$(printf '%s' "${CF_TOKEN:-}" | tr -d '\r\n' | xargs)"
+          ROOT="$(printf '%s' "${ROOT:-}" | tr -d '\r\n' | xargs)"
+          ADMIN="$(printf '%s' "${ADMIN:-}" | tr -d '\r\n' | xargs)"
+          PGADMIN="$(printf '%s' "${PGADMIN:-}" | tr -d '\r\n' | xargs)"
 
-          # ✅ Clean ROOT/ADMIN/PGADMIN too (CRLF + whitespace)
-          ROOT_CLEAN="$(printf '%s' "${ROOT:-}" | tr -d '\r\n' | xargs)"
-          ADMIN_CLEAN="$(printf '%s' "${ADMIN:-}" | tr -d '\r\n' | xargs)"
-          PGADMIN_CLEAN="$(printf '%s' "${PGADMIN:-}" | tr -d '\r\n' | xargs)"
+          [ -n "${CF_TOKEN:-}" ] || { echo "❌ CF_TOKEN empty"; exit 1; }
+          [ -n "${ROOT:-}" ] || { echo "❌ ROOT empty"; exit 1; }
 
-          [ -n "${ROOT_CLEAN:-}" ] || { echo "❌ ROOT is empty"; exit 1; }
-
-          echo "ROOT(raw)   = $(printf %q "${ROOT:-}")"
-          echo "ROOT(clean) = $(printf %q "${ROOT_CLEAN}")"
-
-          api() {
-            curl -fsS \
-              -H "Authorization: Bearer ${CF_TOKEN_CLEAN}" \
+          api(){
+            curl -sS \
+              -H "Authorization: Bearer $CF_TOKEN" \
               -H "Content-Type: application/json" \
               "$@"
           }
 
-          get_zone_id() {
-            local fqdn="$1"
-            local parts i candidate zid
+          # ---- FIX: derive zone name correctly for .co.uk etc ----
+          ZONE_NAME="$ROOT"
+          # if hostname has 3+ labels, pick zone candidate
+          if [ "$(echo "$ZONE_NAME" | awk -F. '{print NF}')" -gt 2 ]; then
+            # If the last 2 labels are a public suffix like co.uk/org.uk, keep 3 labels
+            if echo "$ZONE_NAME" | grep -Eq '\.(co|org|ac|gov|net|sch)\.uk$'; then
+              ZONE_NAME="$(echo "$ZONE_NAME" | awk -F. '{print $(NF-2)"."$(NF-1)"."$NF}')"
+            else
+              # normal case: last 2 labels
+              ZONE_NAME="$(echo "$ZONE_NAME" | awk -F. '{print $(NF-1)"."$NF}')"
+            fi
+          fi
 
-            IFS='.' read -r -a parts <<< "$fqdn"
+          echo "Using ZONE_NAME=$ZONE_NAME (from ROOT=$ROOT)"
 
-            for ((i=0; i<=${#parts[@]}-2; i++)); do
-              candidate="$(IFS='.'; echo "${parts[@]:i}")"
-              # ✅ sanitize candidate too
-              candidate="$(printf '%s' "$candidate" | tr -d '\r\n' | xargs)"
+          # Use -G + --data-urlencode to avoid curl (3) malformed URL issues
+          ZID=$(
+            api -G "https://api.cloudflare.com/client/v4/zones" \
+              --data-urlencode "name=${ZONE_NAME}" \
+            | jq -r '.result[0].id'
+          )
 
-              echo "Checking Cloudflare zone candidate: $(printf %q "$candidate")"
-
-              zid=$(api "https://api.cloudflare.com/client/v4/zones?name=${candidate}" | jq -r '.result[0].id')
-              if [ "$zid" != "null" ] && [ -n "$zid" ]; then
-                echo "$zid"
-                return 0
-              fi
-            done
-
-            return 1
-          }
-
-          ZID="$(get_zone_id "$ROOT_CLEAN")" || { echo "❌ No Cloudflare zone found for $ROOT_CLEAN"; exit 1; }
-          echo "✅ Using zone id: $ZID"
+          [ "$ZID" != "null" ] && [ -n "$ZID" ] || { echo "❌ Zone ${ZONE_NAME} not found in Cloudflare"; exit 1; }
 
           upsert_a(){
             local name="$1"; local ip="$2"; local proxied="${3:-true}"
-            name="$(printf '%s' "$name" | tr -d '\r\n' | xargs)"
 
-            local rid
-            rid=$(api "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records?type=A&name=${name}" | jq -r '.result[0].id')
+            name="$(printf '%s' "$name" | tr -d '\r\n' | xargs)"
+            [ -n "$name" ] || { echo "skip empty record name"; return 0; }
+
+            local rid=$(
+              api -G "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records" \
+                --data-urlencode "type=A" \
+                --data-urlencode "name=${name}" \
+              | jq -r '.result[0].id'
+            )
 
             if [ "$rid" = "null" ] || [ -z "$rid" ]; then
               echo "Create A ${name} -> ${ip}"
@@ -711,26 +688,25 @@ jobs:
             fi
           }
 
-          # Always create root + www
-          upsert_a "${ROOT_CLEAN}" "$IP4" true
-          upsert_a "www.${ROOT_CLEAN}" "$IP4" true
+          # Always root + www
+          upsert_a "${ROOT}"      "$IP4" true
+          upsert_a "www.${ROOT}"  "$IP4" true
 
-          # Admin optional
-          if [ -n "${ADMIN_CLEAN:-}" ]; then
-            upsert_a "${ADMIN_CLEAN}" "$IP4" true
+          # Admin optional (some projects won't have it)
+          if [ -n "${ADMIN:-}" ]; then
+            upsert_a "${ADMIN}" "$IP4" true
           else
-            echo "No ADMIN domain set — skipping admin DNS"
+            echo "No ADMIN set — skipping admin DNS"
           fi
 
-          # PgAdmin only when DB enabled AND PGADMIN set
-          if [ "${DB_MODE}" != "none" ] && [ -n "${PGADMIN_CLEAN:-}" ]; then
-            upsert_a "${PGADMIN_CLEAN}" "$IP4" true
+          # PgAdmin only if DB enabled AND PGADMIN set
+          if [ "${DB_MODE}" != "none" ] && [ -n "${PGADMIN:-}" ]; then
+            upsert_a "${PGADMIN}" "$IP4" true
           else
             echo "DB disabled or PGADMIN empty — skipping pgAdmin DNS"
           fi
 
-          echo "✅ DNS records ensured"
-
+          echo "✅ DNS records ensured (admin/pgadmin optional)"
 
       - name: Deploy over SSH (Traefik + per-project DB + app + pgAdmin)
         uses: appleboy/ssh-action@v1
