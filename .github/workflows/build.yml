@@ -101,26 +101,45 @@ jobs:
           echo "DB_MODE=$DBM" >> $GITHUB_OUTPUT
           echo "DB mode: $DBM"
 
-      - name: Finalize domains (default admin=admin.prod, pgadmin=dbui.prod)
+      - name: Finalize domains (admin optional, pgadmin only if DB enabled)
         id: dom
+        shell: bash
         run: |
+          set -euo pipefail
+
           PROD="${{ steps.cfg.outputs.DOMAIN_PROD_RAW }}"
-          ADMIN="${{ steps.cfg.outputs.DOMAIN_ADMIN_RAW }}"
+          ADMIN_RAW="${{ steps.cfg.outputs.DOMAIN_ADMIN_RAW }}"
           PGADMIN_RAW="${{ steps.cfg.outputs.DOMAIN_PGADMIN_RAW }}"
+          DB_MODE="${{ steps.dbmode.outputs.DB_MODE }}"
+
           if [ -z "$PROD" ]; then
             echo "❌ DOMAIN_PROD missing (set it in .cicd-config.yml -> domains.prod)"; exit 1;
           fi
-          [ -n "$ADMIN" ] || ADMIN="admin.${PROD}"
-          if [ "${{ steps.dbmode.outputs.DB_MODE }}" != "none" ]; then
-            PGADMIN="${PGADMIN_RAW:-dbui.${PROD}}"
-          else
-            PGADMIN=""
-          fi
-          echo "DOMAIN_PROD=$PROD"    >> $GITHUB_OUTPUT
-          echo "DOMAIN_ADMIN=$ADMIN"  >> $GITHUB_OUTPUT
-          echo "DOMAIN_PGADMIN=$PGADMIN" >> $GITHUB_OUTPUT
-          echo "Using domains: PROD=$PROD ADMIN=$ADMIN PGADMIN=${PGADMIN:-<disabled>}"
 
+          # ✅ Admin is OPTIONAL — only use if explicitly provided
+          ADMIN=""
+          if [ -n "$ADMIN_RAW" ]; then
+            ADMIN="$ADMIN_RAW"
+          fi
+
+          # ✅ PgAdmin ONLY when DB enabled
+          PGADMIN=""
+          if [ "$DB_MODE" != "none" ]; then
+            if [ -n "$PGADMIN_RAW" ]; then
+              PGADMIN="$PGADMIN_RAW"
+            else
+              PGADMIN="dbui.${PROD}"
+            fi
+          fi
+
+          echo "DOMAIN_PROD=$PROD" >> $GITHUB_OUTPUT
+          echo "DOMAIN_ADMIN=$ADMIN" >> $GITHUB_OUTPUT
+          echo "DOMAIN_PGADMIN=$PGADMIN" >> $GITHUB_OUTPUT
+
+          echo "Using domains:"
+          echo "  PROD=$PROD"
+          echo "  ADMIN=${ADMIN:-<disabled>}"
+          echo "  PGADMIN=${PGADMIN:-<disabled>}"
 
   build_test:
     runs-on: ubuntu-latest
@@ -613,7 +632,7 @@ jobs:
           echo "PUBLIC_IPV4=$IP4" >> "$GITHUB_OUTPUT"
           echo "Resolved IPv4: $IP4"
 
-      - name: Ensure Cloudflare DNS (root, www, admin, pgadmin)
+      - name: Ensure Cloudflare DNS (root, www, admin?, pgadmin?)
         env:
           CF_TOKEN:   ${{ env.CF_DNS_API_TOKEN }}
           ROOT:       ${{ needs.detect.outputs.domain_prod }}
@@ -624,6 +643,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Clean token (handles accidental CRLF)
           CF_TOKEN_CLEAN="$(printf '%s' "${CF_TOKEN:-}" | tr -d '\r\n')"
           [ -n "${CF_TOKEN_CLEAN:-}" ] || { echo "❌ CF_TOKEN is empty"; exit 1; }
 
@@ -640,6 +660,7 @@ jobs:
 
             IFS='.' read -r -a parts <<< "$fqdn"
 
+            # Try progressively shorter suffixes: a.b.c -> a.b.c, b.c
             for ((i=0; i<=${#parts[@]}-2; i++)); do
               candidate="$(IFS='.'; echo "${parts[@]:i}")"
               echo "Checking Cloudflare zone candidate: $candidate"
@@ -659,7 +680,9 @@ jobs:
 
           upsert_a(){
             local name="$1"; local ip="$2"; local proxied="${3:-true}"
-            local rid=$(api "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records?type=A&name=${name}" | jq -r '.result[0].id')
+            local rid
+            rid=$(api "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records?type=A&name=${name}" | jq -r '.result[0].id')
+
             if [ "$rid" = "null" ] || [ -z "$rid" ]; then
               echo "Create A ${name} -> ${ip}"
               api -X POST "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records" \
@@ -671,16 +694,25 @@ jobs:
             fi
           }
 
-          upsert_a "${ROOT}"      "$IP4" true
-          upsert_a "www.${ROOT}"  "$IP4" true
-          upsert_a "${ADMIN}"     "$IP4" true
-          if [ "${DB_MODE}" != "none" ]; then
-            upsert_a "${PGADMIN}"   "$IP4" true
+          # Always create root + www
+          upsert_a "${ROOT}"     "$IP4" true
+          upsert_a "www.${ROOT}" "$IP4" true
+
+          # Admin is optional
+          if [ -n "${ADMIN:-}" ]; then
+            upsert_a "${ADMIN}" "$IP4" true
           else
-            echo "DB disabled — skipping pgAdmin DNS"
+            echo "No ADMIN domain set — skipping admin DNS"
           fi
 
-          echo "✅ DNS records ensured (pgAdmin conditional on DB mode)"
+          # PgAdmin only when DB enabled AND PGADMIN set
+          if [ "${DB_MODE}" != "none" ] && [ -n "${PGADMIN:-}" ]; then
+            upsert_a "${PGADMIN}" "$IP4" true
+          else
+            echo "DB disabled or PGADMIN empty — skipping pgAdmin DNS"
+          fi
+
+          echo "✅ DNS records ensured"
 
       - name: Deploy over SSH (Traefik + per-project DB + app + pgAdmin)
         uses: appleboy/ssh-action@v1
