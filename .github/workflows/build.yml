@@ -627,7 +627,12 @@ jobs:
           CF_TOKEN_CLEAN="$(printf '%s' "${CF_TOKEN:-}" | tr -d '\r\n')"
           [ -n "${CF_TOKEN_CLEAN:-}" ] || { echo "❌ CF_TOKEN is empty"; exit 1; }
 
-          api(){ curl -fsS -H "Authorization: Bearer ${CF_TOKEN_CLEAN}" -H "Content-Type: application/json" "$@"; }
+          api() {
+            curl -fsS \
+              -H "Authorization: Bearer ${CF_TOKEN_CLEAN}" \
+              -H "Content-Type: application/json" \
+              "$@"
+          }
 
           get_zone_id() {
             local fqdn="$1"
@@ -638,7 +643,6 @@ jobs:
             for ((i=0; i<=${#parts[@]}-2; i++)); do
               candidate="$(IFS='.'; echo "${parts[@]:i}")"
               echo "Checking Cloudflare zone candidate: $candidate"
-              echo "GET zones?name=${candidate}"
 
               zid=$(api "https://api.cloudflare.com/client/v4/zones?name=${candidate}" | jq -r '.result[0].id')
               if [ "$zid" != "null" ] && [ -n "$zid" ]; then
@@ -652,8 +656,6 @@ jobs:
 
           ZID="$(get_zone_id "$ROOT")" || { echo "❌ No Cloudflare zone found for $ROOT"; exit 1; }
           echo "✅ Using zone id: $ZID"
-
-          [ "$ZID" != "null" ] && [ -n "$ZID" ] || { echo "❌ Zone ${ZONE_NAME} not found in Cloudflare"; exit 1; }
 
           upsert_a(){
             local name="$1"; local ip="$2"; local proxied="${3:-true}"
