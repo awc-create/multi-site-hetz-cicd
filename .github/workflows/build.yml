@@ -613,7 +613,7 @@ jobs:
           echo "PUBLIC_IPV4=$IP4" >> "$GITHUB_OUTPUT"
           echo "Resolved IPv4: $IP4"
 
-      - name: Ensure Cloudflare DNS (root, www, admin, pgadmin)
+      - name: Ensure Cloudflare DNS (root, www, admin, pgadmin) — optional admin/pgadmin
         env:
           CF_TOKEN:   ${{ env.CF_DNS_API_TOKEN }}
           ROOT:       ${{ needs.detect.outputs.domain_prod }}
@@ -633,44 +633,69 @@ jobs:
           [ -n "${CF_TOKEN:-}" ] || { echo "❌ CF_TOKEN empty"; exit 1; }
           [ -n "${ROOT:-}" ] || { echo "❌ ROOT empty"; exit 1; }
 
-          api(){
-            curl -sS \
-              -H "Authorization: Bearer $CF_TOKEN" \
+          api() {
+            curl -fsS \
+              -H "Authorization: Bearer ${CF_TOKEN}" \
               -H "Content-Type: application/json" \
               "$@"
           }
 
-          # ---- FIX: derive zone name correctly for .co.uk etc ----
-          ZONE_NAME="$ROOT"
-          # if hostname has 3+ labels, pick zone candidate
-          if [ "$(echo "$ZONE_NAME" | awk -F. '{print NF}')" -gt 2 ]; then
-            # If the last 2 labels are a public suffix like co.uk/org.uk, keep 3 labels
-            if echo "$ZONE_NAME" | grep -Eq '\.(co|org|ac|gov|net|sch)\.uk$'; then
-              ZONE_NAME="$(echo "$ZONE_NAME" | awk -F. '{print $(NF-2)"."$(NF-1)"."$NF}')"
-            else
-              # normal case: last 2 labels
-              ZONE_NAME="$(echo "$ZONE_NAME" | awk -F. '{print $(NF-1)"."$NF}')"
+          # Build candidate zone names (try exact first, then suffixes)
+          zone_candidates() {
+            local fqdn="$1"
+            fqdn="$(printf '%s' "$fqdn" | tr -d '\r\n' | xargs)"
+
+            # 1) exact
+            echo "$fqdn"
+
+            # 2) last 2 labels (example.net -> example.net)
+            if [ "$(awk -F. '{print NF}' <<< "$fqdn")" -ge 2 ]; then
+              echo "$(awk -F. '{print $(NF-1)"."$NF}' <<< "$fqdn")"
             fi
-          fi
 
-          echo "Using ZONE_NAME=$ZONE_NAME (from ROOT=$ROOT)"
+            # 3) last 3 labels for common public suffixes (madafmltd.co.uk -> madafmltd.co.uk)
+            if echo "$fqdn" | grep -Eq '\.(co|org|ac|gov|net|sch)\.uk$'; then
+              echo "$(awk -F. '{print $(NF-2)"."$(NF-1)"."$NF}' <<< "$fqdn")"
+            fi
+            if echo "$fqdn" | grep -Eq '\.(com|net|org|edu|gov)\.(au|br|nz|za|sg)$'; then
+              echo "$(awk -F. '{print $(NF-2)"."$(NF-1)"."$NF}' <<< "$fqdn")"
+            fi
+          }
 
-          # Use -G + --data-urlencode to avoid curl (3) malformed URL issues
-          ZID=$(
-            api -G "https://api.cloudflare.com/client/v4/zones" \
-              --data-urlencode "name=${ZONE_NAME}" \
-            | jq -r '.result[0].id'
-          )
+          get_zone_id() {
+            local candidate zid
+            while IFS= read -r candidate; do
+              candidate="$(printf '%s' "$candidate" | tr -d '\r\n' | xargs)"
+              [ -n "$candidate" ] || continue
+              echo "🔎 Looking for Cloudflare zone: $candidate"
+              zid=$(
+                api -G "https://api.cloudflare.com/client/v4/zones" \
+                  --data-urlencode "name=${candidate}" \
+                | jq -r '.result[0].id'
+              )
+              if [ "$zid" != "null" ] && [ -n "$zid" ]; then
+                echo "$zid"
+                return 0
+              fi
+            done < <(zone_candidates "$ROOT" | awk '!seen[$0]++')  # unique
+            return 1
+          }
 
-          [ "$ZID" != "null" ] && [ -n "$ZID" ] || { echo "❌ Zone ${ZONE_NAME} not found in Cloudflare"; exit 1; }
+          ZID="$(get_zone_id)" || {
+            echo "❌ No Cloudflare zone found for ROOT=$ROOT"
+            echo "👉 This usually means the token is scoped to a different zone/account."
+            echo "👉 Confirm token has Zone:Read + DNS:Edit for zone: $ROOT"
+            exit 1
+          }
+          echo "✅ Using zone id: $ZID"
 
-          upsert_a(){
-            local name="$1"; local ip="$2"; local proxied="${3:-true}"
-
+          upsert_a() {
+            local name="$1" ip="$2" proxied="${3:-true}"
             name="$(printf '%s' "$name" | tr -d '\r\n' | xargs)"
             [ -n "$name" ] || { echo "skip empty record name"; return 0; }
 
-            local rid=$(
+            local rid
+            rid=$(
               api -G "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records" \
                 --data-urlencode "type=A" \
                 --data-urlencode "name=${name}" \
@@ -692,14 +717,14 @@ jobs:
           upsert_a "${ROOT}"      "$IP4" true
           upsert_a "www.${ROOT}"  "$IP4" true
 
-          # Admin optional (some projects won't have it)
+          # Admin optional
           if [ -n "${ADMIN:-}" ]; then
             upsert_a "${ADMIN}" "$IP4" true
           else
             echo "No ADMIN set — skipping admin DNS"
           fi
 
-          # PgAdmin only if DB enabled AND PGADMIN set
+          # PgAdmin optional (only if DB enabled AND PGADMIN set)
           if [ "${DB_MODE}" != "none" ] && [ -n "${PGADMIN:-}" ]; then
             upsert_a "${PGADMIN}" "$IP4" true
           else
