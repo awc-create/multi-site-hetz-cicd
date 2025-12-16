@@ -101,25 +101,46 @@ jobs:
           echo "DB_MODE=$DBM" >> $GITHUB_OUTPUT
           echo "DB mode: $DBM"
 
-      - name: Finalize domains (default admin=admin.prod, pgadmin=dbui.prod)
+      - name: Finalize domains (admin optional, pgadmin only if DB enabled)
         id: dom
+        shell: bash
         run: |
+          set -euo pipefail
+
           PROD="${{ steps.cfg.outputs.DOMAIN_PROD_RAW }}"
-          ADMIN="${{ steps.cfg.outputs.DOMAIN_ADMIN_RAW }}"
+          ADMIN_RAW="${{ steps.cfg.outputs.DOMAIN_ADMIN_RAW }}"
           PGADMIN_RAW="${{ steps.cfg.outputs.DOMAIN_PGADMIN_RAW }}"
+          DB_MODE="${{ steps.dbmode.outputs.DB_MODE }}"
+
           if [ -z "$PROD" ]; then
             echo "❌ DOMAIN_PROD missing (set it in .cicd-config.yml -> domains.prod)"; exit 1;
           fi
-          [ -n "$ADMIN" ] || ADMIN="admin.${PROD}"
-          if [ "${{ steps.dbmode.outputs.DB_MODE }}" != "none" ]; then
-            PGADMIN="${PGADMIN_RAW:-dbui.${PROD}}"
-          else
-            PGADMIN=""
+
+          # ✅ Admin is OPTIONAL — only use if explicitly provided
+          ADMIN=""
+          if [ -n "$ADMIN_RAW" ]; then
+            ADMIN="$ADMIN_RAW"
           fi
-          echo "DOMAIN_PROD=$PROD"    >> $GITHUB_OUTPUT
-          echo "DOMAIN_ADMIN=$ADMIN"  >> $GITHUB_OUTPUT
+
+          # ✅ PgAdmin ONLY when DB enabled
+          PGADMIN=""
+          if [ "$DB_MODE" != "none" ]; then
+            if [ -n "$PGADMIN_RAW" ]; then
+              PGADMIN="$PGADMIN_RAW"
+            else
+              PGADMIN="dbui.${PROD}"
+            fi
+          fi
+
+          echo "DOMAIN_PROD=$PROD" >> $GITHUB_OUTPUT
+          echo "DOMAIN_ADMIN=$ADMIN" >> $GITHUB_OUTPUT
           echo "DOMAIN_PGADMIN=$PGADMIN" >> $GITHUB_OUTPUT
-          echo "Using domains: PROD=$PROD ADMIN=$ADMIN PGADMIN=${PGADMIN:-<disabled>}"
+
+          echo "Using domains:"
+          echo "  PROD=$PROD"
+          echo "  ADMIN=${ADMIN:-<disabled>}"
+          echo "  PGADMIN=${PGADMIN:-<disabled>}"
+
 
 
   build_test:
@@ -667,19 +688,25 @@ jobs:
             while IFS= read -r candidate; do
               candidate="$(printf '%s' "$candidate" | tr -d '\r\n' | xargs)"
               [ -n "$candidate" ] || continue
-              echo "🔎 Looking for Cloudflare zone: $candidate"
+
+              # 👇 IMPORTANT: debug -> stderr, so command substitution stays clean
+              echo "🔎 Looking for Cloudflare zone: $candidate" >&2
+
               zid=$(
                 api -G "https://api.cloudflare.com/client/v4/zones" \
                   --data-urlencode "name=${candidate}" \
                 | jq -r '.result[0].id'
               )
+
               if [ "$zid" != "null" ] && [ -n "$zid" ]; then
-                echo "$zid"
+                # 👇 IMPORTANT: ONLY the zid to stdout
+                printf '%s\n' "$zid"
                 return 0
               fi
-            done < <(zone_candidates "$ROOT" | awk '!seen[$0]++')  # unique
+            done < <(zone_candidates "$ROOT" | awk '!seen[$0]++')
             return 1
           }
+
 
           ZID="$(get_zone_id)" || {
             echo "❌ No Cloudflare zone found for ROOT=$ROOT"
