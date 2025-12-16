@@ -623,7 +623,11 @@ jobs:
           DB_MODE:    ${{ needs.detect.outputs.db_mode }}
         run: |
           set -euo pipefail
-          api(){ curl -sS -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" "$@"; }
+
+          CF_TOKEN_CLEAN="$(printf '%s' "${CF_TOKEN:-}" | tr -d '\r\n')"
+          [ -n "${CF_TOKEN_CLEAN:-}" ] || { echo "❌ CF_TOKEN is empty"; exit 1; }
+
+          api(){ curl -fsS -H "Authorization: Bearer ${CF_TOKEN_CLEAN}" -H "Content-Type: application/json" "$@"; }
 
           get_zone_id() {
             local fqdn="$1"
@@ -634,6 +638,8 @@ jobs:
             for ((i=0; i<=${#parts[@]}-2; i++)); do
               candidate="$(IFS='.'; echo "${parts[@]:i}")"
               echo "Checking Cloudflare zone candidate: $candidate"
+              echo "GET zones?name=${candidate}"
+
               zid=$(api "https://api.cloudflare.com/client/v4/zones?name=${candidate}" | jq -r '.result[0].id')
               if [ "$zid" != "null" ] && [ -n "$zid" ]; then
                 echo "$zid"
