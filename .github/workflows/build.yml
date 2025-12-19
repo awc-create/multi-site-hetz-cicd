@@ -983,33 +983,63 @@ jobs:
             if [ "${DB_MODE}" != "none" ]; then
               echo "🔧 DB: verifying credentials for user '${DB_USER}' on db '${DB_NAME}'"
 
-              # Wait for postgres socket to be ready (extra safety)
+              db_compose() { docker compose -f "${DB_DIR}/docker-compose.yml" "$@"; }
+
+              SUPER_USER="${DB_USER}"          # because you set POSTGRES_USER=${DB_USER} in DB_DIR/.env
+              SUPER_PASS="${DB_PASS}"          # POSTGRES_PASSWORD too
+
+              # Wait for postgres server (no auth required for pg_isready)
               for i in $(seq 1 30); do
-                if docker compose -f "${DB_DIR}/docker-compose.yml" exec -T postgres pg_isready -U "${DB_USER}" -d "${DB_NAME}" >/dev/null 2>&1; then
+                if db_compose exec -T postgres pg_isready -U "${SUPER_USER}" -d postgres >/dev/null 2>&1; then
                   break
                 fi
                 echo "  waiting for postgres ($i/30)..."
                 sleep 2
               done
 
-              # 1) Test auth using TCP to postgres service
-              auth_ok=0
-              if [ -n "${DB_PASS}" ]; then
-                if docker compose -f "${DB_DIR}/docker-compose.yml" exec -T \
-                  -e PGPASSWORD="${DB_PASS}" postgres \
-                  psql -h postgres -U "${DB_USER}" -d "${DB_NAME}" -c "SELECT 1;" >/dev/null 2>&1; then
-                  auth_ok=1
+              # Can we connect as the superuser we *expect*?
+              super_ok=0
+              if db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
+                psql -h postgres -U "${SUPER_USER}" -d postgres -c "SELECT 1;" >/dev/null 2>&1; then
+                super_ok=1
+              fi
+
+              if [ "$super_ok" -ne 1 ]; then
+                echo "❌ Cannot authenticate as superuser '${SUPER_USER}'."
+                echo "   This usually means the DB volume was created with DIFFERENT creds previously."
+
+                # OPTIONAL: only wipe if you explicitly allow it
+                RESET_FLAG="$(printf "%s" "$SITE_ENV_NORM" | awk -F= '/^DB_RESET_ON_FAIL=/{print tolower($2)}' | tail -1)"
+                if [ "$RESET_FLAG" = "true" ] || [ "$RESET_FLAG" = "1" ] || [ "$RESET_FLAG" = "yes" ]; then
+                  echo "🔥 DB_RESET_ON_FAIL enabled — wiping DB volumes and recreating fresh"
+                  (cd "${DB_DIR}" && docker compose down -v)
+                  (cd "${DB_DIR}" && docker compose up -d)
+
+                  # wait again
+                  for i in $(seq 1 30); do
+                    if db_compose exec -T postgres pg_isready -U "${SUPER_USER}" -d postgres >/dev/null 2>&1; then
+                      break
+                    fi
+                    echo "  waiting for postgres after reset ($i/30)..."
+                    sleep 2
+                  done
+
+                  # must now succeed (brand new cluster)
+                  db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
+                    psql -h postgres -U "${SUPER_USER}" -d postgres -c "SELECT 1;" >/dev/null 2>&1 \
+                    || { echo "❌ Still cannot auth after reset"; exit 1; }
+
+                  echo "✅ Fresh DB created with expected credentials"
+                else
+                  echo "👉 Set DB_RESET_ON_FAIL=true in SITE_ENV if you want CI to auto-wipe and recreate."
+                  exit 1
                 fi
               fi
 
-              if [ "$auth_ok" -eq 1 ]; then
-                echo "✅ DB auth OK"
-              else
-                echo "⚠️ DB auth failed — attempting to reconcile role/password inside Postgres"
-
-                # 2) Ensure role exists + set password (runs as OS user 'postgres' -> peer auth works)
-                docker compose -f "${DB_DIR}/docker-compose.yml" exec -T -u postgres postgres \
-                  psql -d postgres <<SQL
+              # Now we can safely reconcile the app role/db using the SUPERUSER connection
+              echo "⚙️ Ensuring role/db/ownership for '${DB_USER}' / '${DB_NAME}'"
+              db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
+                psql -h postgres -U "${SUPER_USER}" -d postgres <<SQL
             DO \$\$
             BEGIN
               IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${DB_USER}') THEN
@@ -1019,11 +1049,7 @@ jobs:
             \$\$;
 
             ALTER ROLE "${DB_USER}" WITH PASSWORD '${DB_PASS}';
-            SQL
 
-                # 3) Ensure DB exists (optional) + ownership (optional but nice)
-                docker compose -f "${DB_DIR}/docker-compose.yml" exec -T -u postgres postgres \
-                  psql -d postgres <<SQL
             DO \$\$
             BEGIN
               IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = '${DB_NAME}') THEN
@@ -1035,20 +1061,10 @@ jobs:
             ALTER DATABASE "${DB_NAME}" OWNER TO "${DB_USER}";
             SQL
 
-                # 4) Re-test
-                if docker compose -f "${DB_DIR}/docker-compose.yml" exec -T \
-                  -e PGPASSWORD="${DB_PASS}" postgres \
-                  psql -h postgres -U "${DB_USER}" -d "${DB_NAME}" -c "SELECT 1;" >/dev/null 2>&1; then
-                  echo "✅ DB auth fixed (password reconciled)"
-                else
-                  echo "❌ DB auth still failing after reconcile — stopping"
-                  exit 1
-                fi
-
-                # Restart pgbouncer so it definitely picks up the correct password
-                docker compose -f "${DB_DIR}/docker-compose.yml" restart pgbouncer >/dev/null 2>&1 || true
-              fi
+              db_compose restart pgbouncer >/dev/null 2>&1 || true
+              echo "✅ DB reconcile done"
             fi
+
 
             # ============================================
             # App deploy (common)
