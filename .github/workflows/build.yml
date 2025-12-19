@@ -985,19 +985,21 @@ jobs:
 
               db_compose() { docker compose -f "${DB_DIR}/docker-compose.yml" "$@"; }
 
-              SUPER_USER="${DB_USER}"          # because you set POSTGRES_USER=${DB_USER} in DB_DIR/.env
-              SUPER_PASS="${DB_PASS}"          # POSTGRES_PASSWORD too
+              # Because DB_DIR/.env sets POSTGRES_USER/POSTGRES_PASSWORD from DB_USER/DB_PASS,
+              # the "superuser" we expect is DB_USER.
+              SUPER_USER="${DB_USER}"
+              SUPER_PASS="${DB_PASS}"
 
-              # Wait for postgres server (no auth required for pg_isready)
+              # Wait for postgres to be ready (pg_isready itself doesn't validate password)
               for i in $(seq 1 30); do
-                if db_compose exec -T postgres pg_isready -U "${SUPER_USER}" -d postgres >/dev/null 2>&1; then
+                if db_compose exec -T postgres pg_isready -h postgres -U "${SUPER_USER}" -d postgres >/dev/null 2>&1; then
                   break
                 fi
                 echo "  waiting for postgres ($i/30)..."
                 sleep 2
               done
 
-              # Can we connect as the superuser we *expect*?
+              # Test superuser auth (expected creds)
               super_ok=0
               if db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
                 psql -h postgres -U "${SUPER_USER}" -d postgres -c "SELECT 1;" >/dev/null 2>&1; then
@@ -1006,7 +1008,7 @@ jobs:
 
               if [ "$super_ok" -ne 1 ]; then
                 echo "❌ Cannot authenticate as superuser '${SUPER_USER}'."
-                echo "   This usually means the DB volume was created with DIFFERENT creds previously."
+                echo "   This usually means the DB volume was created previously with DIFFERENT creds."
 
                 # OPTIONAL: only wipe if you explicitly allow it
                 RESET_FLAG="$(printf "%s" "$SITE_ENV_NORM" | awk -F= '/^DB_RESET_ON_FAIL=/{print tolower($2)}' | tail -1)"
@@ -1015,16 +1017,16 @@ jobs:
                   (cd "${DB_DIR}" && docker compose down -v)
                   (cd "${DB_DIR}" && docker compose up -d)
 
-                  # wait again
+                  # wait again after reset
                   for i in $(seq 1 30); do
-                    if db_compose exec -T postgres pg_isready -U "${SUPER_USER}" -d postgres >/dev/null 2>&1; then
+                    if db_compose exec -T postgres pg_isready -h postgres -U "${SUPER_USER}" -d postgres >/dev/null 2>&1; then
                       break
                     fi
                     echo "  waiting for postgres after reset ($i/30)..."
                     sleep 2
                   done
 
-                  # must now succeed (brand new cluster)
+                  # must succeed now (brand new cluster)
                   db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
                     psql -h postgres -U "${SUPER_USER}" -d postgres -c "SELECT 1;" >/dev/null 2>&1 \
                     || { echo "❌ Still cannot auth after reset"; exit 1; }
@@ -1036,35 +1038,36 @@ jobs:
                 fi
               fi
 
-              # Now we can safely reconcile the app role/db using the SUPERUSER connection
+              # Now we can safely reconcile the role/db using the SUPERUSER connection
               echo "⚙️ Ensuring role/db/ownership for '${DB_USER}' / '${DB_NAME}'"
               db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
-                psql -h postgres -U "${SUPER_USER}" -d postgres <<SQL
-            DO \$\$
+                psql -h postgres -U "${SUPER_USER}" -d postgres \
+                -v APP_USER="${DB_USER}" -v APP_DB="${DB_NAME}" -v APP_PASS="${DB_PASS}" <<'SQL'
+            DO $$
             BEGIN
-              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${DB_USER}') THEN
-                CREATE ROLE "${DB_USER}" LOGIN;
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_setting('APP_USER', true)) THEN
+                EXECUTE format('CREATE ROLE %I LOGIN', current_setting('APP_USER', true));
               END IF;
-            END
-            \$\$;
 
-            ALTER ROLE "${DB_USER}" WITH PASSWORD '${DB_PASS}';
+              EXECUTE format(
+                'ALTER ROLE %I WITH PASSWORD %s',
+                current_setting('APP_USER', true),
+                quote_literal(current_setting('APP_PASS', true))
+              );
 
-            DO \$\$
-            BEGIN
-              IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = '${DB_NAME}') THEN
-                CREATE DATABASE "${DB_NAME}" OWNER "${DB_USER}";
+              IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = current_setting('APP_DB', true)) THEN
+                EXECUTE format('CREATE DATABASE %I OWNER %I', current_setting('APP_DB', true), current_setting('APP_USER', true));
               END IF;
-            END
-            \$\$;
 
-            ALTER DATABASE "${DB_NAME}" OWNER TO "${DB_USER}";
+              EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_setting('APP_DB', true), current_setting('APP_USER', true));
+            END
+            $$;
             SQL
 
+              # Restart pgbouncer so it definitely picks up the updated password
               db_compose restart pgbouncer >/dev/null 2>&1 || true
               echo "✅ DB reconcile done"
             fi
-
 
             # ============================================
             # App deploy (common)
