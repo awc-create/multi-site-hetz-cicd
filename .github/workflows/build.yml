@@ -192,28 +192,37 @@ jobs:
           printf "%s\n" "$SITE_ENV" | sed 's/\r$//' > .env
 
           if [ "$DB_MODE" != "none" ]; then
-            # Always use Vercel DB for GitHub Action builds.
-            # Hetzner DB is only used at runtime on the Hetzner server.
-            VDB="$(awk -F= '$1=="DATABASE_URL_VERCEL"{print $2}' .env | tail -1)"
-            VDD="$(awk -F= '$1=="DIRECT_DATABASE_URL_VERCEL"{print $2}' .env | tail -1)"
-          
-            if [ -z "$VDB" ]; then
-              echo "❌ DATABASE_URL_VERCEL missing in .env"; exit 1;
+            # 1️⃣ Prefer Vercel DB (preview/dev)
+            DB_URL="$(awk -F= '$1=="DATABASE_URL_VERCEL"{print $2}' .env | tail -1)"
+
+            # 2️⃣ Fallback to normal DB (Hetzner / local)
+            if [ -z "$DB_URL" ]; then
+              DB_URL="$(awk -F= '$1=="DATABASE_URL"{print $2}' .env | tail -1)"
             fi
-          
-            echo "DATABASE_URL=$VDB" >> .env
-          
-            if [ -n "$VDD" ]; then
-              echo "DIRECT_DATABASE_URL=$VDD" >> .env
+
+            # 3️⃣ If no DB at all → skip cleanly
+            if [ -z "$DB_URL" ]; then
+              echo "ℹ️ No DATABASE_URL found — skipping DB in CI"
             else
-              echo "DIRECT_DATABASE_URL=$VDB" >> .env
+              # Ensure DATABASE_URL exists
+              grep -q '^DATABASE_URL=' .env || echo "DATABASE_URL=$DB_URL" >> .env
+
+              # Prefer direct DB if available
+              DIRECT_URL="$(awk -F= '$1=="DIRECT_DATABASE_URL_VERCEL"{print $2}' .env | tail -1)"
+              if [ -z "$DIRECT_URL" ]; then
+                DIRECT_URL="$(awk -F= '$1=="DIRECT_DATABASE_URL"{print $2}' .env | tail -1)"
+              fi
+              [ -z "$DIRECT_URL" ] && DIRECT_URL="$DB_URL"
+
+              grep -q '^DIRECT_DATABASE_URL=' .env || echo "DIRECT_DATABASE_URL=$DIRECT_URL" >> .env
+
+              echo "DB envs resolved for CI:"
+              grep -E '^(DATABASE_URL|DIRECT_DATABASE_URL)=' .env
             fi
-          
-            echo "DB envs in use (Vercel for CI build):"
-            grep -E '^(DATABASE_URL|DIRECT_DATABASE_URL)=' .env
           else
-            echo "DB disabled (db: none) — skipping DB env normalization/requirements."
+            echo "DB disabled (db: none)"
           fi
+
 
 
       - name: Prisma generate (for Next build)
