@@ -1052,26 +1052,39 @@ jobs:
               db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
                 psql -h postgres -U "${SUPER_USER}" -d postgres \
                 -v APP_USER="${DB_USER}" -v APP_DB="${DB_NAME}" -v APP_PASS="${DB_PASS}" <<'SQL'
-            DO $$
-            BEGIN
-              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_setting('APP_USER', true)) THEN
-                EXECUTE format('CREATE ROLE %I LOGIN', current_setting('APP_USER', true));
-              END IF;
+              DO $$
+              DECLARE
+                app_user text := :'APP_USER';
+                app_db   text := :'APP_DB';
+                app_pass text := :'APP_PASS';
+              BEGIN
+                IF app_user IS NULL OR app_user = '' THEN
+                  RAISE EXCEPTION 'APP_USER missing';
+                END IF;
 
-              EXECUTE format(
-                'ALTER ROLE %I WITH PASSWORD %s',
-                current_setting('APP_USER', true),
-                quote_literal(current_setting('APP_PASS', true))
-              );
+                IF app_db IS NULL OR app_db = '' THEN
+                  RAISE EXCEPTION 'APP_DB missing';
+                END IF;
 
-              IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = current_setting('APP_DB', true)) THEN
-                EXECUTE format('CREATE DATABASE %I OWNER %I', current_setting('APP_DB', true), current_setting('APP_USER', true));
-              END IF;
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = app_user) THEN
+                  EXECUTE format('CREATE ROLE %I LOGIN', app_user);
+                END IF;
 
-              EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_setting('APP_DB', true), current_setting('APP_USER', true));
-            END
-            $$;
-            SQL
+                IF app_pass IS NULL THEN
+                  app_pass := '';
+                END IF;
+
+                EXECUTE format('ALTER ROLE %I WITH PASSWORD %L', app_user, app_pass);
+
+                IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = app_db) THEN
+                  EXECUTE format('CREATE DATABASE %I OWNER %I', app_db, app_user);
+                END IF;
+
+                EXECUTE format('ALTER DATABASE %I OWNER TO %I', app_db, app_user);
+              END
+              $$;
+              SQL
+
 
               # Restart pgbouncer so it definitely picks up the updated password
               db_compose restart pgbouncer >/dev/null 2>&1 || true
@@ -1149,65 +1162,94 @@ jobs:
             if [ "${DB_MODE}" != "none" ]; then
               docker compose exec -T app sh -s <<-'PRISMA_SH'
             set -e
+
+            echo "🧹 Pre-migrate cleanup"
+
+            node <<'NODE_CLEAN'
+            const { Client } = require("pg");
+
+            const url =
+              process.env.DIRECT_DATABASE_URL ??
+              process.env.DATABASE_URL;
+
+            if (!url) {
+              console.log("ℹ️ No DB URL found, skipping cleanup");
+              process.exit(0);
+            }
+
+            (async () => {
+              const client = new Client({ connectionString: url });
+              await client.connect();
+
+              -- remove duplicate Product.sku
+              await client.query(`
+                WITH d AS (
+                  SELECT id,
+                        ROW_NUMBER() OVER (PARTITION BY sku ORDER BY "createdAt" ASC) rn
+                  FROM "public"."Product"
+                  WHERE sku IS NOT NULL AND sku <> ''
+                )
+                UPDATE "public"."Product"
+                SET sku = NULL
+                WHERE id IN (SELECT id FROM d WHERE rn > 1);
+              `);
+
+              -- remove duplicate User.stripeCustomerId
+              await client.query(`
+                WITH d AS (
+                  SELECT id,
+                        ROW_NUMBER() OVER (PARTITION BY "stripeCustomerId" ORDER BY "createdAt" ASC) rn
+                  FROM "public"."User"
+                  WHERE "stripeCustomerId" IS NOT NULL AND "stripeCustomerId" <> ''
+                )
+                UPDATE "public"."User"
+                SET "stripeCustomerId" = NULL
+                WHERE id IN (SELECT id FROM d WHERE rn > 1);
+              `);
+
+              await client.end();
+              console.log("✅ Cleanup complete");
+            })();
+            NODE_CLEAN
+
             NODE_PATH=/app/node_modules npx prisma migrate deploy
 
-            # Optional admin seeding – configurable per project via env
             NODE_PATH=/app/node_modules node <<-'NODE_ADMIN'
             (async () => {
               const { PrismaClient } = require("@prisma/client");
               const bcrypt = require("bcryptjs");
               const prisma = new PrismaClient();
 
-              // Turn off seeding for a project with ADMIN_ENABLED=false in SITE_ENV
-              const enabledFlag = (process.env.ADMIN_ENABLED ?? "true").toLowerCase();
-              if (["false", "0", "no"].includes(enabledFlag)) {
-                console.log("ℹ️ ADMIN_ENABLED is false — skipping admin seed");
-                await prisma.$disconnect();
-                return;
-              }
+              const email = (process.env.ADMIN_EMAIL ?? "admin@example.com").toLowerCase();
+              const name = process.env.ADMIN_NAME ?? "Head Admin";
+              const password = await bcrypt.hash(
+                process.env.ADMIN_PASSWORD ?? "supersecurepassword",
+                12
+              );
 
-              const siteDomain =
-                (process.env.SITE_DOMAIN || "")
-                  .replace(/^https?:\/\//, "")
-                  .replace(/\/.*/, "") || "example.com";
-
-              const email = (process.env.ADMIN_EMAIL || `admin@${siteDomain}`).toLowerCase();
-              const name  = process.env.ADMIN_NAME       || "Head Admin";
-              const plain = process.env.ADMIN_PASSWORD   || "supersecurepassword";
-              const role  = process.env.ADMIN_ROLE       || "admin";  // your User.role is String
+              const role =
+                ["HEAD", "STAFF", "VIEWER"].includes(process.env.ADMIN_ROLE)
+                  ? process.env.ADMIN_ROLE
+                  : "HEAD";
 
               const existing = await prisma.user.findUnique({ where: { email } });
-              const passwordHash = await bcrypt.hash(plain, 12);
 
               if (!existing) {
                 await prisma.user.create({
-                  data: {
-                    email,
-                    name,
-                    role,
-                    passwordHash,
-                  },
+                  data: { email, name, role, password },
                 });
-                console.log("✅ Created admin:", email);
               } else {
                 await prisma.user.update({
                   where: { email },
-                  data: {
-                    name,
-                    role,
-                    passwordHash,
-                  },
+                  data: { name, role, password },
                 });
-                console.log("✅ Updated admin:", email);
               }
 
               await prisma.$disconnect();
-            })().catch(e => {
-              console.error(e);
-              process.exit(1);
-            });
+            })();
             NODE_ADMIN
             PRISMA_SH
+
             else
               echo "🚫 DB disabled — skipping Prisma migrations and admin seed"
             fi
