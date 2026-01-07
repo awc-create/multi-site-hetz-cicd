@@ -1049,14 +1049,14 @@ jobs:
 
               # Now we can safely reconcile the role/db using the SUPERUSER connection
               echo "⚙️ Ensuring role/db/ownership for '${DB_USER}' / '${DB_NAME}'"
-              db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
-                psql -h postgres -U "${SUPER_USER}" -d postgres \
-                -v APP_USER="${DB_USER}" -v APP_DB="${DB_NAME}" -v APP_PASS="${DB_PASS}" <<'SQL'
-              DO $$
+              echo "⚙️ Ensuring role/db/ownership for '${DB_USER}' / '${DB_NAME}'"
+
+              SQL_CMD="
+              DO \$\$
               DECLARE
-                app_user text := :'APP_USER';
-                app_db   text := :'APP_DB';
-                app_pass text := :'APP_PASS';
+                app_user text := '${DB_USER}';
+                app_db   text := '${DB_NAME}';
+                app_pass text := '${DB_PASS}';
               BEGIN
                 IF app_user IS NULL OR app_user = '' THEN
                   RAISE EXCEPTION 'APP_USER missing';
@@ -1082,8 +1082,13 @@ jobs:
 
                 EXECUTE format('ALTER DATABASE %I OWNER TO %I', app_db, app_user);
               END
-              $$;
-              SQL
+              \$\$;
+              "
+
+              db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
+                psql -h postgres -U "${SUPER_USER}" -d postgres -v ON_ERROR_STOP=1 \
+                -c "$SQL_CMD"
+
 
 
               # Restart pgbouncer so it definitely picks up the updated password
