@@ -556,7 +556,6 @@ jobs:
             SITE_URL=${{ steps.envparse.outputs.SITE_URL }}
             USE_DB=${{ needs.detect.outputs.db_mode != 'none' && 'true' || 'false' }}
 
-
   hetzner_node:
     needs: [detect, image_build_push]
     if: needs.detect.outputs.project_type == 'node' && needs.detect.outputs.branch == 'main-hetz'
@@ -716,7 +715,6 @@ jobs:
             return 1
           }
 
-
           ZID="$(get_zone_id)" || {
             echo "❌ No Cloudflare zone found for ROOT=$ROOT"
             echo "👉 This usually means the token is scoped to a different zone/account."
@@ -828,15 +826,13 @@ jobs:
             mkdir -p "$TDIR/letsencrypt"
             [ -f "$TDIR/letsencrypt/acme.json" ] || install -m 600 /dev/null "$TDIR/letsencrypt/acme.json"
 
-            # Write Traefik env without heredoc
-            printf "%s\n" \
-              "ACME_EMAIL=${ACME_EMAIL}" \
-              "CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}" \
-              "CLOUDFLARE_DNS_API_TOKEN=${CF_DNS_API_TOKEN}" \
-              > "$TDIR/.env"
+            cat > "$TDIR/.env" <<-TRAEFIK_ENV
+            ACME_EMAIL=${ACME_EMAIL}
+            CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
+            CLOUDFLARE_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
+            TRAEFIK_ENV
 
-            # Write Traefik compose without heredoc
-            cat > "$TDIR/docker-compose.yml" <<EOF
+            cat > "$TDIR/docker-compose.yml" <<-'TRAEFIK_YML'
             services:
               traefik:
                 image: traefik:v3.0
@@ -847,14 +843,14 @@ jobs:
                   - --providers.docker.exposedbydefault=false
                   - --entrypoints.web.address=:80
                   - --entrypoints.websecure.address=:443
-                  - --certificatesresolvers.le.acme.email=\${ACME_EMAIL}
+                  - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
                   - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
                   - --certificatesresolvers.le.acme.dnschallenge=true
                   - --certificatesresolvers.le.acme.dnschallenge.provider=cloudflare
                   - --certificatesresolvers.le.acme.dnschallenge.delaybeforecheck=10
                 environment:
-                  CF_DNS_API_TOKEN: \${CF_DNS_API_TOKEN}
-                  CLOUDFLARE_DNS_API_TOKEN: \${CLOUDFLARE_DNS_API_TOKEN}
+                  CF_DNS_API_TOKEN: ${CF_DNS_API_TOKEN}
+                  CLOUDFLARE_DNS_API_TOKEN: ${CLOUDFLARE_DNS_API_TOKEN}
                 ports:
                   - "80:80"
                   - "443:443"
@@ -868,8 +864,7 @@ jobs:
               proxy:
                 external: true
                 name: proxy
-            EOF
-
+            TRAEFIK_YML
 
             (cd "$TDIR" && docker compose up -d)
 
@@ -983,7 +978,6 @@ jobs:
                 echo "    name: proxy"
               } > "${DB_DIR}/docker-compose.yml"
 
-
               (cd "${DB_DIR}" && docker compose up -d)
             else
               echo "🚫 DB disabled — skipping Postgres/PgBouncer/pgAdmin setup"
@@ -1052,45 +1046,28 @@ jobs:
 
               # Now we can safely reconcile the role/db using the SUPERUSER connection
               echo "⚙️ Ensuring role/db/ownership for '${DB_USER}' / '${DB_NAME}'"
-              echo "⚙️ Ensuring role/db/ownership for '${DB_USER}' / '${DB_NAME}'"
-
-              SQL_CMD="
-              DO \$\$
-              DECLARE
-                app_user text := '${DB_USER}';
-                app_db   text := '${DB_NAME}';
-                app_pass text := '${DB_PASS}';
-              BEGIN
-                IF app_user IS NULL OR app_user = '' THEN
-                  RAISE EXCEPTION 'APP_USER missing';
-
-                IF app_db IS NULL OR app_db = '' THEN
-                  RAISE EXCEPTION 'APP_DB missing';
-                END IF;
-
-                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = app_user) THEN
-                  EXECUTE format('CREATE ROLE %I LOGIN', app_user);
-                END IF;
-
-                IF app_pass IS NULL THEN
-                  app_pass := '';
-                END IF;
-
-                EXECUTE format('ALTER ROLE %I WITH PASSWORD %L', app_user, app_pass);
-
-                IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = app_db) THEN
-                  EXECUTE format('CREATE DATABASE %I OWNER %I', app_db, app_user);
-                END IF;
-                EXECUTE format('ALTER DATABASE %I OWNER TO %I', app_db, app_user);
-              END
-              \$\$;
-              "
-
               db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
-                psql -h postgres -U "${SUPER_USER}" -d postgres -v ON_ERROR_STOP=1 \
-                -c "$SQL_CMD"
+                psql -h postgres -U "${SUPER_USER}" -d postgres \
+                -v APP_USER="${DB_USER}" -v APP_DB="${DB_NAME}" -v APP_PASS="${DB_PASS}" <<'SQL'
+              DO $$
+              BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_setting('APP_USER', true)) THEN
+                  EXECUTE format('CREATE ROLE %I LOGIN', current_setting('APP_USER', true));
+                END IF;
 
+                EXECUTE format(
+                  'ALTER ROLE %I WITH PASSWORD %s',
+                  current_setting('APP_USER', true),
+                  quote_literal(current_setting('APP_PASS', true))
+                );
 
+                IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = current_setting('APP_DB', true)) THEN
+                  EXECUTE format('CREATE DATABASE %I OWNER %I', current_setting('APP_DB', true), current_setting('APP_USER', true));
+                END IF;
+
+                EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_setting('APP_DB', true), current_setting('APP_USER', true));
+              END $$;
+              SQL
 
               # Restart pgbouncer so it definitely picks up the updated password
               db_compose restart pgbouncer >/dev/null 2>&1 || true
@@ -1112,7 +1089,6 @@ jobs:
             fi
             # Expose the base domain for seed script
             grep -q '^SITE_DOMAIN=' app.env || echo "SITE_DOMAIN=${DOMAIN}" >> app.env
-
 
             # Inject DB URLs only if DB enabled
             if [ "${DB_MODE}" != "none" ]; then
@@ -1169,93 +1145,56 @@ jobs:
               docker compose exec -T app sh -s <<-'PRISMA_SH'
             set -e
 
-            echo "🧹 Pre-migrate cleanup"
-
-            node <<'NODE_CLEAN'
-            const { Client } = require("pg");
-
-            const url =
-              process.env.DIRECT_DATABASE_URL ??
-              process.env.DATABASE_URL;
-
-            if (!url) {
-              console.log("ℹ️ No DB URL found, skipping cleanup");
-              process.exit(0);
-            }
-
-            (async () => {
-              const client = new Client({ connectionString: url });
-              await client.connect();
-
-              -- remove duplicate Product.sku
-              await client.query(`
-                WITH d AS (
-                  SELECT id,
-                        ROW_NUMBER() OVER (PARTITION BY sku ORDER BY "createdAt" ASC) rn
-                  FROM "public"."Product"
-                  WHERE sku IS NOT NULL AND sku <> ''
-                )
-                UPDATE "public"."Product"
-                SET sku = NULL
-                WHERE id IN (SELECT id FROM d WHERE rn > 1);
-              `);
-
-              -- remove duplicate User.stripeCustomerId
-              await client.query(`
-                WITH d AS (
-                  SELECT id,
-                        ROW_NUMBER() OVER (PARTITION BY "stripeCustomerId" ORDER BY "createdAt" ASC) rn
-                  FROM "public"."User"
-                  WHERE "stripeCustomerId" IS NOT NULL AND "stripeCustomerId" <> ''
-                )
-                UPDATE "public"."User"
-                SET "stripeCustomerId" = NULL
-                WHERE id IN (SELECT id FROM d WHERE rn > 1);
-              `);
-
-              await client.end();
-              console.log("✅ Cleanup complete");
-            })();
-            NODE_CLEAN
-
             NODE_PATH=/app/node_modules npx prisma migrate deploy
 
+            # Optional admin seeding – configurable per project via env
             NODE_PATH=/app/node_modules node <<-'NODE_ADMIN'
             (async () => {
               const { PrismaClient } = require("@prisma/client");
               const bcrypt = require("bcryptjs");
               const prisma = new PrismaClient();
 
-              const email = (process.env.ADMIN_EMAIL ?? "admin@example.com").toLowerCase();
-              const name = process.env.ADMIN_NAME ?? "Head Admin";
-              const password = await bcrypt.hash(
-                process.env.ADMIN_PASSWORD ?? "supersecurepassword",
-                12
-              );
+              // Turn off seeding for a project with ADMIN_ENABLED=false in SITE_ENV
+              const enabledFlag = (process.env.ADMIN_ENABLED ?? "true").toLowerCase();
+              if (["false", "0", "no"].includes(enabledFlag)) {
+                console.log("ℹ️ ADMIN_ENABLED is false — skipping admin seed");
+                await prisma.$disconnect();
+                return;
+              }
 
-              const role =
-                ["HEAD", "STAFF", "VIEWER"].includes(process.env.ADMIN_ROLE)
-                  ? process.env.ADMIN_ROLE
-                  : "HEAD";
+              const siteDomain = (process.env.SITE_DOMAIN || "")
+                .replace(/^https?:\/\//, "")
+                .replace(/\/.*/, "")
+                || "example.com";
+
+              const email = (process.env.ADMIN_EMAIL || `admin@${siteDomain}`).toLowerCase();
+              const name = process.env.ADMIN_NAME || "Head Admin";
+              const plain = process.env.ADMIN_PASSWORD || "supersecurepassword";
+              const role = process.env.ADMIN_ROLE || "admin"; // your User.role is String
 
               const existing = await prisma.user.findUnique({ where: { email } });
+              const passwordHash = await bcrypt.hash(plain, 12);
 
               if (!existing) {
                 await prisma.user.create({
-                  data: { email, name, role, password },
+                  data: { email, name, role, passwordHash },
                 });
+                console.log("✅ Created admin:", email);
               } else {
                 await prisma.user.update({
                   where: { email },
-                  data: { name, role, password },
+                  data: { name, role, passwordHash },
                 });
+                console.log("✅ Updated admin:", email);
               }
 
               await prisma.$disconnect();
-            })();
+            })().catch(e => {
+              console.error(e);
+              process.exit(1);
+            });
             NODE_ADMIN
             PRISMA_SH
-
             else
               echo "🚫 DB disabled — skipping Prisma migrations and admin seed"
             fi
@@ -1320,7 +1259,7 @@ jobs:
             sleep 5
           done
           [ $ok -eq 1 ] || { echo "❌ Public health failed"; exit 1; }
-
+        
   hetzner_static:
     needs: [detect, build_test]
     if: needs.detect.outputs.project_type == 'static' && needs.detect.outputs.branch == 'main-hetz'
