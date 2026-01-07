@@ -215,16 +215,14 @@ jobs:
               [ -z "$DIRECT_URL" ] && DIRECT_URL="$DB_URL"
 
               grep -q '^DIRECT_DATABASE_URL=' .env || echo "DIRECT_DATABASE_URL=$DIRECT_URL" >> .env
-
+          
               echo "DB envs resolved for CI:"
-              grep -E '^(DATABASE_URL|DIRECT_DATABASE_URL)=' .env
+            grep -E '^(DATABASE_URL|DIRECT_DATABASE_URL)=' .env
             fi
           else
             echo "DB disabled (db: none)"
           fi
-
-
-
+          
       - name: Prisma generate (for Next build)
         working-directory: site
         run: |
@@ -556,6 +554,7 @@ jobs:
             SITE_URL=${{ steps.envparse.outputs.SITE_URL }}
             USE_DB=${{ needs.detect.outputs.db_mode != 'none' && 'true' || 'false' }}
 
+
   hetzner_node:
     needs: [detect, image_build_push]
     if: needs.detect.outputs.project_type == 'node' && needs.detect.outputs.branch == 'main-hetz'
@@ -714,6 +713,7 @@ jobs:
             done < <(zone_candidates "$ROOT" | awk '!seen[$0]++')
             return 1
           }
+
 
           ZID="$(get_zone_id)" || {
             echo "❌ No Cloudflare zone found for ROOT=$ROOT"
@@ -978,6 +978,7 @@ jobs:
                 echo "    name: proxy"
               } > "${DB_DIR}/docker-compose.yml"
 
+
               (cd "${DB_DIR}" && docker compose up -d)
             else
               echo "🚫 DB disabled — skipping Postgres/PgBouncer/pgAdmin setup"
@@ -1049,25 +1050,26 @@ jobs:
               db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
                 psql -h postgres -U "${SUPER_USER}" -d postgres \
                 -v APP_USER="${DB_USER}" -v APP_DB="${DB_NAME}" -v APP_PASS="${DB_PASS}" <<'SQL'
-              DO $$
-              BEGIN
-                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_setting('APP_USER', true)) THEN
-                  EXECUTE format('CREATE ROLE %I LOGIN', current_setting('APP_USER', true));
-                END IF;
+            DO $$
+            BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_setting('APP_USER', true)) THEN
+                EXECUTE format('CREATE ROLE %I LOGIN', current_setting('APP_USER', true));
+              END IF;
 
-                EXECUTE format(
-                  'ALTER ROLE %I WITH PASSWORD %s',
-                  current_setting('APP_USER', true),
-                  quote_literal(current_setting('APP_PASS', true))
-                );
+              EXECUTE format(
+                'ALTER ROLE %I WITH PASSWORD %s',
+                current_setting('APP_USER', true),
+                quote_literal(current_setting('APP_PASS', true))
+              );
 
-                IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = current_setting('APP_DB', true)) THEN
-                  EXECUTE format('CREATE DATABASE %I OWNER %I', current_setting('APP_DB', true), current_setting('APP_USER', true));
-                END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = current_setting('APP_DB', true)) THEN
+                EXECUTE format('CREATE DATABASE %I OWNER %I', current_setting('APP_DB', true), current_setting('APP_USER', true));
+              END IF;
 
-                EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_setting('APP_DB', true), current_setting('APP_USER', true));
-              END $$;
-              SQL
+              EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_setting('APP_DB', true), current_setting('APP_USER', true));
+            END
+            $$;
+            SQL
 
               # Restart pgbouncer so it definitely picks up the updated password
               db_compose restart pgbouncer >/dev/null 2>&1 || true
@@ -1089,6 +1091,7 @@ jobs:
             fi
             # Expose the base domain for seed script
             grep -q '^SITE_DOMAIN=' app.env || echo "SITE_DOMAIN=${DOMAIN}" >> app.env
+
 
             # Inject DB URLs only if DB enabled
             if [ "${DB_MODE}" != "none" ]; then
@@ -1144,7 +1147,6 @@ jobs:
             if [ "${DB_MODE}" != "none" ]; then
               docker compose exec -T app sh -s <<-'PRISMA_SH'
             set -e
-
             NODE_PATH=/app/node_modules npx prisma migrate deploy
 
             # Optional admin seeding – configurable per project via env
@@ -1163,7 +1165,7 @@ jobs:
               }
 
               const siteDomain = (process.env.SITE_DOMAIN || "")
-                .replace(/^https?:\/\//, "")
+                  .replace(/^https?:\/\//, "")
                 .replace(/\/.*/, "")
                 || "example.com";
 
@@ -1177,13 +1179,22 @@ jobs:
 
               if (!existing) {
                 await prisma.user.create({
-                  data: { email, name, role, passwordHash },
+                  data: {
+                    email,
+                    name,
+                    role,
+                    passwordHash,
+                  },
                 });
                 console.log("✅ Created admin:", email);
               } else {
                 await prisma.user.update({
                   where: { email },
-                  data: { name, role, passwordHash },
+                  data: {
+                    name,
+                    role,
+                    passwordHash,
+                  },
                 });
                 console.log("✅ Updated admin:", email);
               }
@@ -1259,7 +1270,7 @@ jobs:
             sleep 5
           done
           [ $ok -eq 1 ] || { echo "❌ Public health failed"; exit 1; }
-        
+
   hetzner_static:
     needs: [detect, build_test]
     if: needs.detect.outputs.project_type == 'static' && needs.detect.outputs.branch == 'main-hetz'
