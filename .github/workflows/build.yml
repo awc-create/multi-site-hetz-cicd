@@ -1143,72 +1143,99 @@ jobs:
             docker compose pull || true
             docker compose up -d --remove-orphans
 
-            # --- Prisma migrate + Admin ensure (only if DB enabled) ---
+            # --- Prisma migrate + Seed (only if DB enabled) ---
             if [ "${DB_MODE}" != "none" ]; then
-              docker compose exec -T app sh -s <<-'PRISMA_SH'
-            set -e
+              docker compose exec -T app sh -s <<'PRISMA_SH'
+            set -euo pipefail
+
+            # Always apply migrations
             NODE_PATH=/app/node_modules npx prisma migrate deploy
 
-            # Optional admin seeding – configurable per project via env
-            NODE_PATH=/app/node_modules node <<-'NODE_ADMIN'
+            # 1) Prefer the project's own seed if configured
+            #    (Prisma uses package.json -> prisma.seed)
+            if node -e "const fs=require('fs'); const pkg=require('./package.json'); const hasSeedCmd=!!(pkg.prisma && pkg.prisma.seed); const hasSeedFile=['prisma/seed.ts','prisma/seed.js','prisma/seed.mjs'].some(p=>fs.existsSync(p)); process.exit((hasSeedCmd||hasSeedFile)?0:1)"; then
+              echo "🌱 Running project seed (prisma db seed)..."
+              NODE_PATH=/app/node_modules npx prisma db seed
+              exit 0
+            fi
+
+            # 2) Fallback: schema-aware admin ensure (works across different User models)
+            echo "🌱 No project seed configured — running generic schema-aware admin ensure..."
+
+            NODE_PATH=/app/node_modules node <<'NODE_FALLBACK'
             (async () => {
-              const { PrismaClient } = require("@prisma/client");
+              const { PrismaClient, Role } = require("@prisma/client");
               const bcrypt = require("bcryptjs");
               const prisma = new PrismaClient();
 
-              // Turn off seeding for a project with ADMIN_ENABLED=false in SITE_ENV
               const enabledFlag = (process.env.ADMIN_ENABLED ?? "true").toLowerCase();
-              if (["false", "0", "no"].includes(enabledFlag)) {
-                console.log("ℹ️ ADMIN_ENABLED is false — skipping admin seed");
+              if (["false","0","no"].includes(enabledFlag)) {
+                console.log("ℹ️ ADMIN_ENABLED=false — skipping admin ensure");
                 await prisma.$disconnect();
                 return;
               }
 
+              // Detect User model fields from Prisma DMMF
+              const userModel = prisma?._dmmf?.datamodel?.models?.find(m => m.name === "User");
+              const fields = new Set((userModel?.fields ?? []).map(f => f.name));
+
               const siteDomain = (process.env.SITE_DOMAIN || "")
-                  .replace(/^https?:\/\//, "")
-                .replace(/\/.*/, "")
-                || "example.com";
+                .replace(/^https?:\/\//, "")
+                .replace(/\/.*/, "") || "example.com";
 
-              const email = (process.env.ADMIN_EMAIL || `admin@${siteDomain}`).toLowerCase();
-              const name = process.env.ADMIN_NAME || "Head Admin";
-              const plain = process.env.ADMIN_PASSWORD || "supersecurepassword";
-              const role = process.env.ADMIN_ROLE || "admin"; // your User.role is String
+              const email = (process.env.ADMIN_EMAIL || `admin@${siteDomain}`).trim().toLowerCase();
+              const name  = (process.env.ADMIN_NAME || "Admin").trim();
+              const plain = (process.env.ADMIN_PASSWORD || "").trim();
 
-              const existing = await prisma.user.findUnique({ where: { email } });
-              const passwordHash = await bcrypt.hash(plain, 12);
+              const createData = { email, name };
+              const updateData = { name };
 
-              if (!existing) {
-                await prisma.user.create({
-                  data: {
-                    email,
-                    name,
-                    role,
-                    passwordHash,
-                  },
-                });
-                console.log("✅ Created admin:", email);
-              } else {
-                await prisma.user.update({
-                  where: { email },
-                  data: {
-                    name,
-                    role,
-                    passwordHash,
-                  },
-                });
-                console.log("✅ Updated admin:", email);
+              // Role handling (enum vs string vs missing)
+              if (fields.has("role")) {
+                if (Role) {
+                  const pref = ["HEAD","ADMIN","OWNER","STAFF","VIEWER"];
+                  const key = pref.find(k => Role[k]);
+                  if (key) {
+                    createData.role = Role[key];
+                    updateData.role = Role[key];
+                  }
+                } else {
+                  const roleStr = (process.env.ADMIN_ROLE || "admin").trim();
+                  createData.role = roleStr;
+                  updateData.role = roleStr;
+                }
               }
 
+              // Password handling (password vs passwordHash)
+              if (plain) {
+                const hash = await bcrypt.hash(plain, 12);
+                if (fields.has("password")) {
+                  createData.password = hash;
+                  updateData.password = hash;
+                } else if (fields.has("passwordHash")) {
+                  createData.passwordHash = hash;
+                  updateData.passwordHash = hash;
+                }
+              }
+
+              await prisma.user.upsert({
+                where: { email },
+                create: createData,
+                update: updateData
+              });
+
+              console.log(`✅ Admin ensured: ${email}`);
               await prisma.$disconnect();
             })().catch(e => {
-              console.error(e);
+              console.error("❌ Fallback admin ensure failed:", e);
               process.exit(1);
             });
-            NODE_ADMIN
+            NODE_FALLBACK
             PRISMA_SH
             else
-              echo "🚫 DB disabled — skipping Prisma migrations and admin seed"
+              echo "🚫 DB disabled — skipping Prisma migrations and seeding"
             fi
+
 
       - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@v1
