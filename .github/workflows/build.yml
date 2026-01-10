@@ -513,7 +513,8 @@ jobs:
           KEY_UPPER="$(echo "$NAME" | tr '[:lower:]-' '[:upper:]_')"
           echo "KEY_UPPER=$KEY_UPPER" >> $GITHUB_OUTPUT
 
-      - name: Export base URLs from SITE_ENV secret
+
+      - name: Export base URLs + Crisp from SITE_ENV secret
         id: envparse
         env:
           SITE_ENV_SECRET: ${{ secrets[format('SITE_ENV__{0}', steps.repokey.outputs.KEY_UPPER)] }}
@@ -522,14 +523,30 @@ jobs:
         run: |
           [ -n "${SITE_ENV_SECRET:-}" ] || { echo "❌ Missing SITE_ENV secret"; exit 1; }
           printf "%s\n" "$SITE_ENV_SECRET" | sed 's/\r$//' > .site_env
+
           get(){ awk -F= -v k="$1" '$1==k{print $2}' .site_env | tail -1; }
+
           NPU="$(get NEXT_PUBLIC_SITE_URL)";   [ -n "$NPU" ] || NPU="https://${DOMAIN}"
           NPA="$(get NEXT_PUBLIC_ADMIN_URL)";  [ -n "$NPA" ] || { [ -n "${ADMIN_DOMAIN:-}" ] && NPA="https://${ADMIN_DOMAIN}" || NPA=""; }
           SU="$(get SITE_URL)";                [ -n "$SU" ]  || SU="https://${DOMAIN}"
+
+          # ✅ CRISP
+          CRISP_ID="$(get NEXT_PUBLIC_CRISP_WEBSITE_ID)"
+
           echo "NEXT_PUBLIC_SITE_URL=$NPU"  >> $GITHUB_OUTPUT
           echo "NEXT_PUBLIC_ADMIN_URL=$NPA" >> $GITHUB_OUTPUT
           echo "SITE_URL=$SU"               >> $GITHUB_OUTPUT
-          echo "Using base URLs:"; echo "$NPU"; echo "$NPA"; echo "$SU"
+          echo "NEXT_PUBLIC_CRISP_WEBSITE_ID=$CRISP_ID" >> $GITHUB_OUTPUT
+
+          echo "Using base URLs:"
+          echo "  NEXT_PUBLIC_SITE_URL=$NPU"
+          echo "  NEXT_PUBLIC_ADMIN_URL=$NPA"
+          echo "  SITE_URL=$SU"
+          if [ -n "$CRISP_ID" ]; then
+            echo "  NEXT_PUBLIC_CRISP_WEBSITE_ID=***set***"
+          else
+            echo "  ⚠️ NEXT_PUBLIC_CRISP_WEBSITE_ID is missing (Crisp will NOT show)"
+          fi
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -553,7 +570,8 @@ jobs:
             NEXT_PUBLIC_ADMIN_URL=${{ steps.envparse.outputs.NEXT_PUBLIC_ADMIN_URL }}
             SITE_URL=${{ steps.envparse.outputs.SITE_URL }}
             USE_DB=${{ needs.detect.outputs.db_mode != 'none' && 'true' || 'false' }}
-
+            # ✅ CRISP build-time injection (required for NEXT_PUBLIC_ vars)
+            NEXT_PUBLIC_CRISP_WEBSITE_ID=${{ steps.envparse.outputs.NEXT_PUBLIC_CRISP_WEBSITE_ID }}
 
   hetzner_node:
     needs: [detect, image_build_push]
