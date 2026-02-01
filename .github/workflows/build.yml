@@ -1161,6 +1161,7 @@ jobs:
                   # admin.domain -> app
                   # ----------------------------
                   - 'traefik.http.routers.${SLUG_SAFE}-admin.rule=Host("${ADMIN_DOMAIN}")'
+                  - 'traefik.http.routers.${SLUG_SAFE}-admin.priority=100'
                   - 'traefik.http.routers.${SLUG_SAFE}-admin.entrypoints=websecure'
                   - 'traefik.http.routers.${SLUG_SAFE}-admin.tls.certresolver=le'
                   - 'traefik.http.routers.${SLUG_SAFE}-admin.service=${SLUG_SAFE}'
