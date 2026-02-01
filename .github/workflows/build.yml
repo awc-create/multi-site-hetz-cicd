@@ -1134,29 +1134,70 @@ jobs:
                 labels:
                   - 'traefik.enable=true'
                   - 'traefik.docker.network=proxy'
+            
+                  # ----------------------------
+                  # MAIN SITE (root + www)
+                  # ----------------------------
                   - 'traefik.http.routers.${SLUG_SAFE}.rule=Host("${DOMAIN}") || Host("www.${DOMAIN}")'
                   - 'traefik.http.routers.${SLUG_SAFE}.entrypoints=websecure'
                   - 'traefik.http.routers.${SLUG_SAFE}.tls.certresolver=le'
                   - 'traefik.http.services.${SLUG_SAFE}.loadbalancer.server.port=${PORT}'
+            
+                  # ----------------------------
+                  # BLOCK /admin on main site:
+                  # www.domain/admin -> https://www.domain/
+                  # ----------------------------
+                  - 'traefik.http.routers.${SLUG_SAFE}-adminblock.rule=(Host("${DOMAIN}") || Host("www.${DOMAIN}")) && PathPrefix("/admin")'
+                  - 'traefik.http.routers.${SLUG_SAFE}-adminblock.entrypoints=websecure'
+                  - 'traefik.http.routers.${SLUG_SAFE}-adminblock.tls.certresolver=le'
+                  - 'traefik.http.routers.${SLUG_SAFE}-adminblock.middlewares=${SLUG_SAFE}-adminblock-redirect'
+                  - 'traefik.http.routers.${SLUG_SAFE}-adminblock.service=${SLUG_SAFE}'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-adminblock-redirect.redirectregex.regex=^https?://(www\.)?${DOMAIN}/admin.*'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-adminblock-redirect.redirectregex.replacement=https://www.${DOMAIN}/'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-adminblock-redirect.redirectregex.permanent=true'
+            
+                  # ----------------------------
+                  # ADMIN DOMAIN router (only if ADMIN_DOMAIN is set)
+                  # admin.domain -> app
+                  # ----------------------------
+                  - 'traefik.http.routers.${SLUG_SAFE}-admin.rule=Host("${ADMIN_DOMAIN}")'
+                  - 'traefik.http.routers.${SLUG_SAFE}-admin.entrypoints=websecure'
+                  - 'traefik.http.routers.${SLUG_SAFE}-admin.tls.certresolver=le'
+                  - 'traefik.http.routers.${SLUG_SAFE}-admin.service=${SLUG_SAFE}'
+            
+                  # ----------------------------
+                  # Redirect admin root "/" -> "/admin"
+                  # https://admin.domain/ -> https://admin.domain/admin
+                  # ----------------------------
+                  - 'traefik.http.routers.${SLUG_SAFE}-adminroot.rule=Host("${ADMIN_DOMAIN}") && Path(`/`)'
+                  - 'traefik.http.routers.${SLUG_SAFE}-adminroot.priority=200'
+                  - 'traefik.http.routers.${SLUG_SAFE}-adminroot.entrypoints=websecure'
+                  - 'traefik.http.routers.${SLUG_SAFE}-adminroot.tls.certresolver=le'
+                  - 'traefik.http.routers.${SLUG_SAFE}-adminroot.middlewares=${SLUG_SAFE}-adminroot-redirect'
+                  - 'traefik.http.routers.${SLUG_SAFE}-adminroot.service=${SLUG_SAFE}'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.regex=^https?://admin\.essentiaagency\.co\.uk/?$'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.replacement=https://admin.essentiaagency.co.uk/admin'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.permanent=true'
+            
                 networks:
                   - proxy
             APP_COMPOSE_YML
-
+            
             if [ "${DB_MODE}" != "none" ]; then
-              echo "      ${NET_LINE}" >> docker-compose.yml.tpl
+              echo "      - ${DB_NET}" >> docker-compose.yml.tpl
             fi
-
+            
             echo "networks:" >> docker-compose.yml.tpl
             echo "  proxy: { external: true, name: proxy }" >> docker-compose.yml.tpl
             if [ "${DB_MODE}" != "none" ]; then
               echo "  ${DB_NET}: { external: true, name: ${DB_NET} }" >> docker-compose.yml.tpl
             fi
-
-            export IMAGE_REF SLUG_SAFE DOMAIN PORT DB_NET
+            
+            export IMAGE_REF SLUG_SAFE DOMAIN ADMIN_DOMAIN PORT DB_NET
             if ! command -v envsubst >/dev/null 2>&1; then
               apt-get update -y && apt-get install -y --no-install-recommends gettext-base
             fi
-            envsubst '$IMAGE_REF $SLUG_SAFE $DOMAIN $PORT $DB_NET' < docker-compose.yml.tpl > docker-compose.yml
+            envsubst '$IMAGE_REF $SLUG_SAFE $DOMAIN $ADMIN_DOMAIN $PORT $DB_NET' < docker-compose.yml.tpl > docker-compose.yml
 
             docker compose pull || true
             docker compose up -d --remove-orphans
