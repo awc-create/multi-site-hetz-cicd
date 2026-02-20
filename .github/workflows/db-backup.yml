@@ -9,9 +9,13 @@ permissions:
   contents: read
 
 env:
-  HETZNER_HOST:    ${{ secrets.HETZNER_HOST }}
-  HETZNER_USER:    ${{ secrets.HETZNER_USER }}
-  HETZNER_SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+  HZ_HOST:    ${{ secrets.HZ_HOST }}
+  HZ_USER:    ${{ secrets.HZ_USER }}
+  HZ_SSH_KEY: ${{ secrets.HZ_SSH_KEY }}
+
+  # Optional:
+  # BACKUP_KEEP: "14"
+  # ONLY_SLUGS: "drcode,travelwithshego"   # comma-separated (optional)
 
 jobs:
   backup:
@@ -19,52 +23,95 @@ jobs:
     steps:
       - name: Verify SSH secrets
         run: |
-          test -n "${{ env.HETZNER_HOST }}"    || { echo "❌ Missing HETZNER_HOST"; exit 1; }
-          test -n "${{ env.HETZNER_SSH_KEY }}" || { echo "❌ Missing HETZNER_SSH_KEY"; exit 1; }
+          test -n "${{ env.HZ_HOST }}"    || { echo "❌ Missing HZ_HOST"; exit 1; }
+          test -n "${{ env.HZ_SSH_KEY }}" || { echo "❌ Missing HZ_SSH_KEY"; exit 1; }
 
-      - name: Run pg_dump on server (gzip + retention + integrity check)
+      - name: Run pg_dump for all project DB stacks (gzip + retention + integrity)
         uses: appleboy/ssh-action@v1
+        env:
+          BACKUP_KEEP: ${{ env.BACKUP_KEEP || '14' }}
+          ONLY_SLUGS:  ${{ env.ONLY_SLUGS || '' }}
         with:
-          host: ${{ env.HETZNER_HOST }}
-          username: ${{ env.HETZNER_USER || 'root' }}
-          key: ${{ env.HETZNER_SSH_KEY }}
+          host: ${{ env.HZ_HOST }}
+          username: ${{ env.HZ_USER || 'root' }}
+          key: ${{ env.HZ_SSH_KEY }}
           port: 22
           timeout: 60s
-          command_timeout: 20m
+          command_timeout: 40m
           script_stop: true
           script: |
             set -euo pipefail
 
-            DB_STACK_DIR="/opt/services/postgres"
-            BACKUP_DIR="/opt/backups/postgres"
-            mkdir -p "$BACKUP_DIR"
+            KEEP="${BACKUP_KEEP:-14}"
+            ONLY="${ONLY_SLUGS:-}"
 
-            # Ensure DB stack is up (postgres + pgbouncer)
-            cd "$DB_STACK_DIR"
-            docker compose up -d
+            STACK_GLOB="/opt/services/postgres-*"
+            BASE_BACKUP_DIR="/opt/backups/postgres"
+            mkdir -p "$BASE_BACKUP_DIR"
 
-            # Load DB password the stack uses
-            if [ ! -s .env ]; then
-              echo "❌ ${DB_STACK_DIR}/.env missing (needs POSTGRES_PASSWORD)"
+            should_backup_slug() {
+              local slug="$1"
+              [ -z "$ONLY" ] && return 0
+              # match comma-separated list
+              echo ",$ONLY," | grep -qi ",${slug}," 
+            }
+
+            found_any=0
+            for dir in $STACK_GLOB; do
+              [ -d "$dir" ] || continue
+              found_any=1
+
+              slug="$(basename "$dir" | sed 's/^postgres-//')"
+              if ! should_backup_slug "$slug"; then
+                echo "⏭️  Skipping $slug (not in ONLY_SLUGS)"
+                continue
+              fi
+
+              echo "=============================="
+              echo "🔎 Stack: $dir  (slug=$slug)"
+
+              if [ ! -s "${dir}/.env" ]; then
+                echo "⚠️  Missing ${dir}/.env — skipping"
+                continue
+              fi
+
+              # shellcheck disable=SC1090
+              set -a
+              . "${dir}/.env"
+              set +a
+
+              : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD missing in ${dir}/.env}"
+              : "${POSTGRES_USER:?POSTGRES_USER missing in ${dir}/.env}"
+              : "${POSTGRES_DB:?POSTGRES_DB missing in ${dir}/.env}"
+
+              cd "$dir"
+              docker compose up -d postgres >/dev/null
+
+              TS="$(date -u +'%Y%m%d-%H%M%S')"
+              OUT_DIR="${BASE_BACKUP_DIR}/${slug}"
+              mkdir -p "$OUT_DIR"
+              FILE="${OUT_DIR}/${POSTGRES_DB}-${TS}.sql.gz"
+
+              echo "🗄️  Dumping db=${POSTGRES_DB} user=${POSTGRES_USER} -> ${FILE}"
+
+              # Dump from postgres service (bypass pgbouncer)
+              docker compose exec -T -e PGPASSWORD="${POSTGRES_PASSWORD}" postgres \
+                sh -lc "pg_dump -h 127.0.0.1 -U \"${POSTGRES_USER}\" -d \"${POSTGRES_DB}\" --no-owner --no-privileges" \
+                | gzip -c > "${FILE}"
+
+              gzip -t "${FILE}"
+              echo "✅ Backup OK — size: $(du -h "${FILE}" | cut -f1)"
+
+              # Retention
+              ls -1t "${OUT_DIR}/${POSTGRES_DB}-"*.sql.gz 2>/dev/null | tail -n +"$((KEEP+1))" | xargs -r rm -f
+
+              echo "📌 Latest backups for ${slug}:"
+              ls -lh "${OUT_DIR}/${POSTGRES_DB}-"*.sql.gz 2>/dev/null | head -n 5 || true
+            done
+
+            if [ "$found_any" -eq 0 ]; then
+              echo "❌ No stacks found at ${STACK_GLOB}"
               exit 1
             fi
-            . ./.env
-            : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD missing in ${DB_STACK_DIR}/.env}"
 
-            TS="$(date -u +'%Y%m%d-%H%M%S')"
-            FILE="${BACKUP_DIR}/drcode-${TS}.sql.gz"
-            echo "🗄️  Creating backup ${FILE}"
-
-            # Dump directly from the postgres service; avoid PgBouncer for dumps
-            docker compose exec -T -e PGPASSWORD="${POSTGRES_PASSWORD}" postgres \
-              sh -lc 'pg_dump -h 127.0.0.1 -U admin -d drcode --no-owner --no-privileges' \
-              | gzip -c > "${FILE}"
-
-            gzip -t "${FILE}"
-            echo "✅ Backup OK — size: $(du -h "${FILE}" | cut -f1)"
-
-            # Keep last 14 backups
-            ls -1t "${BACKUP_DIR}"/drcode-*.sql.gz 2>/dev/null | tail -n +15 | xargs -r rm -f
-
-            echo "Latest backups:"
-            ls -lh "${BACKUP_DIR}"/drcode-*.sql.gz 2>/dev/null | head -n 5 || true
+            echo "✅ All done"
