@@ -1,0 +1,308 @@
+name: Destroy (Prepare on push, Run on manual)
+
+on:
+  push:
+    branches:
+      - "destroy/**"
+  workflow_dispatch:
+    inputs:
+      destroy_scope:
+        description: "What to destroy"
+        type: choice
+        options: [hetzner_only, cloudflare_only, vercel_only, hetzner_cloudflare, all]
+        required: true
+        default: all
+      confirm:
+        description: "Type: DESTROY <repo> <branch> (exact)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: destroy-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  # Used to decide if we're in PREPARE (push) or RUN (manual)
+  IS_MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      repository:      ${{ steps.p.outputs.repository }}
+      repository_name: ${{ steps.p.outputs.repository_name }}
+      branch:          ${{ steps.p.outputs.branch }}
+      slug:            ${{ steps.cfg.outputs.SLUG }}
+      domain_prod:     ${{ steps.dom.outputs.DOMAIN_PROD }}
+      domain_admin:    ${{ steps.dom.outputs.DOMAIN_ADMIN }}
+      domain_pgadmin:  ${{ steps.dom.outputs.DOMAIN_PGADMIN }}
+      db_mode:         ${{ steps.dbmode.outputs.DB_MODE }}
+      repokey:         ${{ steps.repokey.outputs.KEY_UPPER }}
+    steps:
+      - name: Resolve repo/branch
+        id: p
+        run: |
+          echo "repository=${{ github.repository }}" >> $GITHUB_OUTPUT
+          echo "repository_name=${{ github.event.repository.name }}" >> $GITHUB_OUTPUT
+          echo "branch=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+
+      - name: Checkout this branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read .cicd-config.yml (slug/port/domains)
+        id: cfg
+        shell: bash
+        run: |
+          SLUG="site"
+          PORT="3000"
+          DOMAIN_PROD=""
+          DOMAIN_ADMIN=""
+          DOMAIN_PGADMIN=""
+          if [ -f ".cicd-config.yml" ]; then
+            get_val(){ grep -E "^$1:" .cicd-config.yml | head -1 | awk -F': *' '{print $2}' | tr -d "\"'"; }
+            SLUG="$(get_val slug || echo "$SLUG")"
+            PORT="$(get_val port || echo "$PORT")"
+            DOM_BLOCK="$(awk '/^domains:/{f=1;next} f && /^[^ ]/{f=0} f{print}' .cicd-config.yml)"
+            DOMAIN_PROD="$(printf '%s\n' "$DOM_BLOCK" | awk '/prod:/{print $2}' | tr -d "\"'")"
+            DOMAIN_ADMIN="$(printf '%s\n' "$DOM_BLOCK" | awk '/admin:/{print $2}' | tr -d "\"'")"
+            PGADMIN_SUB="$(get_val pgadmin_subdomain || true)"
+            [ -n "$PGADMIN_SUB" ] && DOMAIN_PGADMIN="${PGADMIN_SUB}.${DOMAIN_PROD}"
+          fi
+          echo "SLUG=$SLUG" >> $GITHUB_OUTPUT
+          echo "PORT=$PORT" >> $GITHUB_OUTPUT
+          echo "DOMAIN_PROD_RAW=$DOMAIN_PROD" >> $GITHUB_OUTPUT
+          echo "DOMAIN_ADMIN_RAW=$DOMAIN_ADMIN" >> $GITHUB_OUTPUT
+          echo "DOMAIN_PGADMIN_RAW=$DOMAIN_PGADMIN" >> $GITHUB_OUTPUT
+
+      - name: Detect DB mode
+        id: dbmode
+        shell: bash
+        run: |
+          DBM="postgres"
+          if [ -f ".cicd-config.yml" ] && grep -qiE '^db:\s*none' .cicd-config.yml; then
+            DBM="none"
+          fi
+          echo "DB_MODE=$DBM" >> $GITHUB_OUTPUT
+
+      - name: Finalize domains (admin optional, pgadmin only if DB enabled)
+        id: dom
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROD="${{ steps.cfg.outputs.DOMAIN_PROD_RAW }}"
+          ADMIN_RAW="${{ steps.cfg.outputs.DOMAIN_ADMIN_RAW }}"
+          PGADMIN_RAW="${{ steps.cfg.outputs.DOMAIN_PGADMIN_RAW }}"
+          DB_MODE="${{ steps.dbmode.outputs.DB_MODE }}"
+
+          [ -n "$PROD" ] || { echo "❌ DOMAIN_PROD missing (.cicd-config.yml -> domains.prod)"; exit 1; }
+
+          ADMIN=""
+          [ -n "$ADMIN_RAW" ] && ADMIN="$ADMIN_RAW"
+
+          PGADMIN=""
+          if [ "$DB_MODE" != "none" ]; then
+            if [ -n "$PGADMIN_RAW" ]; then
+              PGADMIN="$PGADMIN_RAW"
+            else
+              PGADMIN="dbui.${PROD}"
+            fi
+          fi
+
+          echo "DOMAIN_PROD=$PROD" >> $GITHUB_OUTPUT
+          echo "DOMAIN_ADMIN=$ADMIN" >> $GITHUB_OUTPUT
+          echo "DOMAIN_PGADMIN=$PGADMIN" >> $GITHUB_OUTPUT
+
+      - name: Derive REPO_KEY
+        id: repokey
+        run: |
+          NAME="${{ github.event.repository.name }}"
+          KEY_UPPER="$(echo "$NAME" | tr '[:lower:]-' '[:upper:]_')"
+          echo "KEY_UPPER=$KEY_UPPER" >> $GITHUB_OUTPUT
+
+  prepare:
+    needs: [detect]
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepared (no destruction)
+        run: |
+          echo "✅ DESTROY PREPARED (no changes made)"
+          echo
+          echo "Repo:        ${{ needs.detect.outputs.repository }}"
+          echo "Branch:      ${{ needs.detect.outputs.branch }}"
+          echo "Slug:        ${{ needs.detect.outputs.slug }}"
+          echo "DB mode:     ${{ needs.detect.outputs.db_mode }}"
+          echo "Domain prod: ${{ needs.detect.outputs.domain_prod }}"
+          echo "Domain admin:${{ needs.detect.outputs.domain_admin }}"
+          echo "Domain pgadmin:${{ needs.detect.outputs.domain_pgadmin }}"
+          echo
+          echo "➡️ Next: Actions → 'Destroy (Prepare on push, Run on manual)' → Run workflow"
+          echo "Confirm text must be:"
+          echo "DESTROY ${{ needs.detect.outputs.repository }} ${{ needs.detect.outputs.branch }}"
+
+  confirm_guard:
+    needs: [detect]
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify confirmation string
+        run: |
+          EXPECT="DESTROY ${{ needs.detect.outputs.repository }} ${{ needs.detect.outputs.branch }}"
+          if [ "${{ github.event.inputs.confirm }}" != "$EXPECT" ]; then
+            echo "❌ Confirmation mismatch."
+            echo "Expected: $EXPECT"
+            exit 1
+          fi
+          echo "✅ Confirmation OK"
+
+  destroy_hetzner:
+    needs: [detect, confirm_guard]
+    if: ${{ github.event_name == 'workflow_dispatch' && contains(fromJson('["hetzner_only","hetzner_cloudflare","all"]'), github.event.inputs.destroy_scope) }}
+    runs-on: ubuntu-latest
+    environment: production-destroy
+    steps:
+      - name: SSH destroy Hetzner stacks
+        uses: appleboy/ssh-action@v1
+        env:
+          SLUG: ${{ needs.detect.outputs.slug }}
+          DB_MODE: ${{ needs.detect.outputs.db_mode }}
+        with:
+          host: ${{ secrets.HZ_HOST }}
+          username: ${{ secrets.HZ_USER || 'root' }}
+          key: ${{ secrets.HZ_SSH_KEY }}
+          port: 22
+          timeout: 60s
+          command_timeout: 20m
+          envs: SLUG,DB_MODE
+          script: |
+            set -euo pipefail
+            SLUG_SAFE="$(printf '%s' "${SLUG}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
+
+            SITE_DIR="/opt/sites/${SLUG_SAFE}"
+            DB_DIR="/opt/services/postgres-${SLUG_SAFE}"
+            DB_NET="${SLUG_SAFE}_db_net"
+
+            echo "🧨 Destroying site stack: $SITE_DIR"
+            if [ -d "$SITE_DIR" ] && [ -f "$SITE_DIR/docker-compose.yml" ]; then
+              (cd "$SITE_DIR" && docker compose down -v --remove-orphans) || true
+            fi
+            rm -rf "$SITE_DIR" || true
+
+            if [ "${DB_MODE}" != "none" ]; then
+              echo "🧨 Destroying db stack: $DB_DIR"
+              if [ -d "$DB_DIR" ] && [ -f "$DB_DIR/docker-compose.yml" ]; then
+                (cd "$DB_DIR" && docker compose down -v --remove-orphans) || true
+              fi
+              rm -rf "$DB_DIR" || true
+
+              echo "🧹 Removing db network: $DB_NET"
+              docker network rm "$DB_NET" >/dev/null 2>&1 || true
+            else
+              echo "DB disabled → skipping db teardown"
+            fi
+
+            echo "✅ Hetzner teardown complete"
+
+  destroy_cloudflare:
+    needs: [detect, confirm_guard]
+    if: ${{ github.event_name == 'workflow_dispatch' && contains(fromJson('["cloudflare_only","hetzner_cloudflare","all"]'), github.event.inputs.destroy_scope) }}
+    runs-on: ubuntu-latest
+    environment: production-destroy
+    steps:
+      - name: Remove Cloudflare DNS records (A)
+        env:
+          CF_TOKEN: ${{ secrets.CF_DNS_API_TOKEN }}
+          ROOT: ${{ needs.detect.outputs.domain_prod }}
+          ADMIN: ${{ needs.detect.outputs.domain_admin }}
+          PGADMIN: ${{ needs.detect.outputs.domain_pgadmin }}
+          DB_MODE: ${{ needs.detect.outputs.db_mode }}
+        run: |
+          set -euo pipefail
+          [ -n "${CF_TOKEN:-}" ] || { echo "❌ Missing CF_DNS_API_TOKEN"; exit 1; }
+          [ -n "${ROOT:-}" ] || { echo "❌ Missing ROOT"; exit 1; }
+
+          api() {
+            curl -fsS \
+              -H "Authorization: Bearer ${CF_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "$@"
+          }
+
+          # NOTE: this assumes zone name == ROOT.
+          # If your zone is apex (e.g. example.com) and ROOT is shop.example.com,
+          # copy your zone_candidates/get_zone_id logic here.
+          ZID="$(api -G "https://api.cloudflare.com/client/v4/zones" --data-urlencode "name=${ROOT}" | jq -r '.result[0].id')"
+          [ "$ZID" != "null" ] && [ -n "$ZID" ] || { echo "❌ Zone not found for ${ROOT}"; exit 1; }
+
+          del_a() {
+            local name="$1"
+            [ -n "$name" ] || return 0
+            rid="$(api -G "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records" \
+              --data-urlencode "type=A" \
+              --data-urlencode "name=${name}" | jq -r '.result[0].id')"
+            if [ "$rid" = "null" ] || [ -z "$rid" ]; then
+              echo "No A record for $name (skip)"
+            else
+              echo "Delete A $name"
+              api -X DELETE "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records/$rid" >/dev/null
+            fi
+          }
+
+          del_a "${ROOT}"
+          del_a "www.${ROOT}"
+          [ -n "${ADMIN:-}" ] && del_a "${ADMIN}" || true
+          if [ "${DB_MODE}" != "none" ] && [ -n "${PGADMIN:-}" ]; then del_a "${PGADMIN}"; fi
+          echo "✅ Cloudflare DNS cleanup done"
+
+  destroy_vercel:
+    needs: [detect, confirm_guard]
+    if: ${{ github.event_name == 'workflow_dispatch' && contains(fromJson('["vercel_only","all"]'), github.event.inputs.destroy_scope) }}
+    runs-on: ubuntu-latest
+    environment: production-destroy
+    steps:
+      - name: Load Vercel IDs from SITE_ENV__REPO_KEY
+        id: vercelids
+        env:
+          SITE_ENV: ${{ secrets[format('SITE_ENV__{0}', needs.detect.outputs.repokey)] }}
+        run: |
+          [ -n "${SITE_ENV:-}" ] || { echo "❌ Missing SITE_ENV__${{ needs.detect.outputs.repokey }}"; exit 1; }
+          printf "%s\n" "$SITE_ENV" | sed 's/\r$//' > .site_env
+          ORG="$(awk -F= '/^VERCEL_ORG_ID=/{print $2}' .site_env | tail -1)"
+          PRJ="$(awk -F= '/^VERCEL_PROJECT_ID=/{print $2}' .site_env | tail -1)"
+          [ -n "$ORG" ] || ORG="$(awk -F= '/^orgId=/{print $2}' .site_env | tail -1)"
+          [ -n "$PRJ" ] || PRJ="$(awk -F= '/^projectId=/{print $2}' .site_env | tail -1)"
+          [ -n "$ORG" ] && [ -n "$PRJ" ] || { echo "❌ Missing Vercel org/project id"; exit 1; }
+          echo "ORG=$ORG" >> $GITHUB_OUTPUT
+          echo "PRJ=$PRJ" >> $GITHUB_OUTPUT
+
+      - name: Delete Vercel deployments for this branch
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          ORG: ${{ steps.vercelids.outputs.ORG }}
+          PRJ: ${{ steps.vercelids.outputs.PRJ }}
+          BRANCH: ${{ needs.detect.outputs.branch }}
+        run: |
+          set -euo pipefail
+          [ -n "${VERCEL_TOKEN:-}" ] || { echo "❌ Missing VERCEL_TOKEN"; exit 1; }
+
+          resp="$(curl -fsS "https://api.vercel.com/v6/deployments?projectId=${PRJ}&teamId=${ORG}&meta-githubCommitRef=${BRANCH}&limit=100" \
+            -H "Authorization: Bearer ${VERCEL_TOKEN}")"
+
+          ids="$(echo "$resp" | jq -r '.deployments[].uid' || true)"
+          if [ -z "${ids:-}" ]; then
+            echo "No deployments found for branch=${BRANCH}"
+            exit 0
+          fi
+
+          echo "$ids" | while read -r id; do
+            [ -n "$id" ] || continue
+            echo "Deleting deployment $id"
+            curl -fsS -X DELETE "https://api.vercel.com/v13/deployments/${id}?teamId=${ORG}" \
+              -H "Authorization: Bearer ${VERCEL_TOKEN}" >/dev/null
+          done
+
+          echo "✅ Vercel branch deployments removed"
