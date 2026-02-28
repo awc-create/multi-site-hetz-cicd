@@ -10,10 +10,7 @@ on:
 env:
   NODE_VERSION: 22
 
-permissions:
-  contents: read
-  actions: read
-  packages: write
+permissions: {}
 
 concurrency:
   group: cicd-${{ github.event.repository.name || github.repository }}-${{ github.ref_name || github.event.client_payload.branch }}
@@ -21,6 +18,8 @@ concurrency:
 
 jobs:
   detect:
+    permissions:
+     contents: read
     runs-on: ubuntu-latest
     outputs:
       repository:       ${{ steps.p.outputs.repository }}
@@ -34,6 +33,31 @@ jobs:
       domain_pgadmin:   ${{ steps.dom.outputs.DOMAIN_PGADMIN }}
       db_mode:          ${{ steps.dbmode.outputs.DB_MODE }}
     steps:
+      - name: Security gate (dispatch auth + branch allowlist)
+        id: gate
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DEPLOY_KEY: ${{ github.event.client_payload.deploy_key }}
+          EXPECTED_KEY: ${{ secrets.DISPATCH_SHARED_KEY }}
+          BRANCH: ${{ github.event.client_payload.branch || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # Only allow repository_dispatch if it proves knowledge of shared key
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            [ -n "${EXPECTED_KEY:-}" ] || { echo "❌ Missing secret DISPATCH_SHARED_KEY"; exit 1; }
+            [ -n "${DEPLOY_KEY:-}" ] || { echo "❌ Missing client_payload.deploy_key"; exit 1; }
+            [ "$DEPLOY_KEY" = "$EXPECTED_KEY" ] || { echo "❌ Bad deploy_key"; exit 1; }
+            echo "✅ Dispatch key OK"
+          fi
+
+          # Strict deploy branch allowlist
+          case "$BRANCH" in
+            dev|main-hetz|feat/*|fix/*) echo "✅ Branch allowed: $BRANCH" ;;
+            *) echo "❌ Branch not allowed: $BRANCH"; exit 1 ;;
+          esac
+      
       - name: Extract payload (repo/branch)
         id: p
         run: |
@@ -42,7 +66,7 @@ jobs:
           echo "branch=${{ github.event.client_payload.branch || github.ref_name }}" >> $GITHUB_OUTPUT
 
       - name: Checkout target website repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           repository: ${{ steps.p.outputs.repository }}
           ref: ${{ steps.p.outputs.branch }}
@@ -141,19 +165,20 @@ jobs:
           echo "  ADMIN=${ADMIN:-<disabled>}"
           echo "  PGADMIN=${PGADMIN:-<disabled>}"
 
-
-
   build_test:
+    permissions:
+      contents: read
+      actions: read
     runs-on: ubuntu-latest
     needs: [detect]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           repository: ${{ needs.detect.outputs.repository }}
           ref: ${{ needs.detect.outputs.branch }}
           path: site
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: ${{ env.NODE_VERSION }}
 
@@ -167,6 +192,21 @@ jobs:
           if [ -f yarn.lock ]; then yarn install --immutable; \
           elif [ -f pnpm-lock.yaml ]; then corepack enable && pnpm i --frozen-lockfile; \
           else npm ci; fi
+
+      - name: Audit (non-blocking)
+        working-directory: site
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f yarn.lock ]; then
+            # Yarn classic: use npm audit as fallback unless you use yarn npm audit (berry)
+            npm audit --audit-level=high || true
+          elif [ -f pnpm-lock.yaml ]; then
+            corepack enable
+            pnpm audit --audit-level=high || true
+          else
+            npm audit --audit-level=high || true
+          fi
 
       - name: Lint (non-blocking)
         working-directory: site
@@ -216,8 +256,7 @@ jobs:
 
               grep -q '^DIRECT_DATABASE_URL=' .env || echo "DIRECT_DATABASE_URL=$DIRECT_URL" >> .env
           
-              echo "DB envs resolved for CI:"
-            grep -E '^(DATABASE_URL|DIRECT_DATABASE_URL)=' .env
+              echo "DB envs resolved for CI (redacted)"
             fi
           else
             echo "DB disabled (db: none)"
@@ -236,6 +275,61 @@ jobs:
         working-directory: site
         run: npm run build
 
+      - name: Build integrity scan (denylist domains)
+        working-directory: site
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DENYFILE="${GITHUB_WORKSPACE}/.cicd/denylist.regex"
+          [ -f "$DENYFILE" ] || { echo "❌ Missing $DENYFILE"; exit 1; }
+
+          DENYLIST="$(tr -d '\r\n' < "$DENYFILE")"
+          [ -n "$DENYLIST" ] || { echo "❌ Denylist empty"; exit 1; }
+
+          TARGETS=()
+          [ -d ".next" ] && TARGETS+=(".next")
+          [ -d "out" ] && TARGETS+=("out")
+          [ -d "public" ] && TARGETS+=("public")
+
+          if [ ${#TARGETS[@]} -eq 0 ]; then
+            echo "ℹ️ No build output dirs found (.next/out/public) — skipping"
+            exit 0
+          fi
+
+          if grep -RIn --binary-files=without-match -E "$DENYLIST" "${TARGETS[@]}" 2>/dev/null; then
+            echo "❌ Denylist match found — failing"
+            exit 1
+          else
+            echo "✅ Denylist scan OK"
+          fi
+     
+      - name: Build integrity scan (inline patterns)
+        working-directory: site
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE="${GITHUB_WORKSPACE}/.cicd/denylist.inline.regex"
+          [ -f "$FILE" ] || { echo "❌ Missing $FILE"; exit 1; }
+          PATTERN="$(tr -d '\r\n' < "$FILE")"
+          [ -n "$PATTERN" ] || { echo "❌ Inline denylist empty"; exit 1; }
+
+          TARGETS=()
+          [ -d ".next" ] && TARGETS+=(".next")
+          [ -d "out" ] && TARGETS+=("out")
+
+          if [ ${#TARGETS[@]} -eq 0 ]; then
+            echo "ℹ️ No .next/out found — skipping"
+            exit 0
+          fi
+
+          if grep -RIn --binary-files=without-match -E "$PATTERN" "${TARGETS[@]}" 2>/dev/null; then
+            echo "❌ Suspicious inline pattern found — failing"
+            exit 1
+          else
+            echo "✅ Inline scan OK"
+          fi
+
       - name: Unit tests (optional)
         working-directory: site
         run: npm test || echo "No tests / skipping"
@@ -247,19 +341,21 @@ jobs:
 
       - name: Upload out/ artifact (static only)
         if: needs.detect.outputs.project_type == 'static'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: static-export
           path: site/out
 
   vercel_preview:
+    permissions:
+      contents: read
     needs: [detect, build_test]
     if: startsWith(needs.detect.outputs.branch, 'feat/') || startsWith(needs.detect.outputs.branch, 'fix/')
     runs-on: ubuntu-latest
     env:
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           repository: ${{ needs.detect.outputs.repository }}
           ref: ${{ needs.detect.outputs.branch }}
@@ -368,13 +464,15 @@ jobs:
         run: vercel deploy --prebuilt --token="${{ env.VERCEL_TOKEN }}"
 
   vercel_prod:
+    permissions:
+      contents: read
     needs: [detect, build_test]
     if: needs.detect.outputs.branch == 'dev'
     runs-on: ubuntu-latest
     env:
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           repository: ${{ needs.detect.outputs.repository }}
           ref: ${{ needs.detect.outputs.branch }}
@@ -481,6 +579,9 @@ jobs:
   # Hetzner (unchanged logic)
   # ---------------------------
   image_build_push:
+    permissions:
+      contents: read
+      packages: write
     needs: [detect, build_test]
     if: needs.detect.outputs.project_type == 'node' && needs.detect.outputs.branch == 'main-hetz'
     runs-on: ubuntu-latest
@@ -488,7 +589,7 @@ jobs:
       image: ${{ steps.meta.outputs.image }}
       ref:   ${{ steps.meta.outputs.ref }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           repository: ${{ needs.detect.outputs.repository }}
           ref: ${{ needs.detect.outputs.branch }}
@@ -504,7 +605,7 @@ jobs:
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
           echo "ref=$IMAGE:$SHORT" >> $GITHUB_OUTPUT
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
       - name: Derive REPO_KEY (UPPERCASE, '-' -> '_')
         id: repokey
@@ -549,7 +650,7 @@ jobs:
           fi
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -557,7 +658,7 @@ jobs:
 
       - name: Build & push site image
         id: buildpush
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: site
           push: true
@@ -574,6 +675,8 @@ jobs:
             NEXT_PUBLIC_CRISP_WEBSITE_ID=${{ steps.envparse.outputs.NEXT_PUBLIC_CRISP_WEBSITE_ID }}
 
   hetzner_node:
+    permissions:
+      packages: read
     needs: [detect, image_build_push]
     if: needs.detect.outputs.project_type == 'node' && needs.detect.outputs.branch == 'main-hetz'
     runs-on: ubuntu-latest
@@ -786,7 +889,7 @@ jobs:
           echo "✅ DNS records ensured (admin/pgadmin optional)"
 
       - name: Deploy over SSH (Traefik + per-project DB + app + pgAdmin)
-        uses: appleboy/ssh-action@v1
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2
         env:
           SLUG:         ${{ needs.detect.outputs.slug }}
           PORT:         ${{ needs.detect.outputs.port }}
@@ -1117,83 +1220,118 @@ jobs:
               grep -q '^DIRECT_DATABASE_URL=' app.env || echo "DIRECT_DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@postgres:5432/${DB_NAME}?connect_timeout=5" >> app.env
             fi
 
-            # --- Compose template (DB-aware) ---
-            if [ "${DB_MODE}" != "none" ]; then
-              NET_LINE="- ${DB_NET}"
-            else
-              NET_LINE=""
-            fi
+            # ============================================
+            # Compose template (admin optional + DB optional + hardened + security headers)
+            # ============================================
 
-            cat > docker-compose.yml.tpl <<-'APP_COMPOSE_YML'
+            # Build docker-compose.yml.tpl
+            cat > docker-compose.yml.tpl <<'APP_COMPOSE_YML'
             services:
               app:
                 image: ${IMAGE_REF}
                 restart: unless-stopped
+
+                # ✅ Hardening (runtime)
+                security_opt:
+                  - no-new-privileges:true
+                cap_drop:
+                  - ALL
+                tmpfs:
+                  - /tmp
+                  - /var/tmp
+
                 env_file:
                   - app.env
+
                 labels:
                   - 'traefik.enable=true'
                   - 'traefik.docker.network=proxy'
-            
+
+                  # ----------------------------
+                  # ✅ Security headers middleware (per-site)
+                  # ----------------------------
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.contentTypeNosniff=true'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.referrerPolicy=strict-origin-when-cross-origin'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.permissionsPolicy=geolocation=(), microphone=(), camera=(), payment=(), usb=(), interest-cohort=()'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.customResponseHeaders.X-Frame-Options=DENY'
+                  - >-
+                    traefik.http.middlewares.${SLUG_SAFE}-sec.headers.customResponseHeaders.Content-Security-Policy=
+                    default-src 'self';
+                    base-uri 'self';
+                    object-src 'none';
+                    frame-ancestors 'none';
+                    form-action 'self';
+                    img-src 'self' data: https:;
+                    font-src 'self' data: https:;
+                    style-src 'self' 'unsafe-inline' https:;
+                    script-src 'self' https://js.stripe.com https://client.crisp.chat https://*.crisp.chat;
+                    connect-src 'self' https: wss:;
+
                   # ----------------------------
                   # MAIN SITE (root + www)
                   # ----------------------------
                   - 'traefik.http.routers.${SLUG_SAFE}.rule=Host("${DOMAIN}") || Host("www.${DOMAIN}")'
                   - 'traefik.http.routers.${SLUG_SAFE}.entrypoints=websecure'
                   - 'traefik.http.routers.${SLUG_SAFE}.tls.certresolver=le'
+                  - 'traefik.http.routers.${SLUG_SAFE}.middlewares=${SLUG_SAFE}-sec'
                   - 'traefik.http.services.${SLUG_SAFE}.loadbalancer.server.port=${PORT}'
-            
+
                   # ----------------------------
-                  # BLOCK /admin on main site:
-                  # www.domain/admin -> https://www.domain/
+                  # BLOCK /admin on public host
                   # ----------------------------
                   - 'traefik.http.routers.${SLUG_SAFE}-adminblock.rule=(Host("${DOMAIN}") || Host("www.${DOMAIN}")) && PathPrefix("/admin")'
                   - 'traefik.http.routers.${SLUG_SAFE}-adminblock.entrypoints=websecure'
                   - 'traefik.http.routers.${SLUG_SAFE}-adminblock.tls.certresolver=le'
-                  - 'traefik.http.routers.${SLUG_SAFE}-adminblock.middlewares=${SLUG_SAFE}-adminblock-redirect'
                   - 'traefik.http.routers.${SLUG_SAFE}-adminblock.service=${SLUG_SAFE}'
+                  - 'traefik.http.routers.${SLUG_SAFE}-adminblock.middlewares=${SLUG_SAFE}-sec,${SLUG_SAFE}-adminblock-redirect'
                   - 'traefik.http.middlewares.${SLUG_SAFE}-adminblock-redirect.redirectregex.regex=^https?://(www\.)?${DOMAIN}/admin.*'
                   - 'traefik.http.middlewares.${SLUG_SAFE}-adminblock-redirect.redirectregex.replacement=https://www.${DOMAIN}/'
                   - 'traefik.http.middlewares.${SLUG_SAFE}-adminblock-redirect.redirectregex.permanent=true'
-            
-                  # ----------------------------
-                  # ADMIN DOMAIN router (only if ADMIN_DOMAIN is set)
-                  # admin.domain -> app
-                  # ----------------------------
+
+                networks:
+                  - proxy
+            APP_COMPOSE_YML
+
+            # ✅ Append admin routers ONLY if ADMIN_DOMAIN exists (prevents Traefik warnings)
+            if [ -n "${ADMIN_DOMAIN:-}" ]; then
+              cat >> docker-compose.yml.tpl <<'ADMIN_LABELS'
+                labels:
                   - 'traefik.http.routers.${SLUG_SAFE}-admin.rule=Host("${ADMIN_DOMAIN}")'
                   - 'traefik.http.routers.${SLUG_SAFE}-admin.priority=100'
                   - 'traefik.http.routers.${SLUG_SAFE}-admin.entrypoints=websecure'
                   - 'traefik.http.routers.${SLUG_SAFE}-admin.tls.certresolver=le'
                   - 'traefik.http.routers.${SLUG_SAFE}-admin.service=${SLUG_SAFE}'
-            
-                  # ----------------------------
+                  - 'traefik.http.routers.${SLUG_SAFE}-admin.middlewares=${SLUG_SAFE}-sec'
+
                   # Redirect admin root "/" -> "/admin"
-                  # https://admin.domain/ -> https://admin.domain/admin
-                  # ----------------------------
                   - 'traefik.http.routers.${SLUG_SAFE}-adminroot.rule=Host("${ADMIN_DOMAIN}") && Path(`/`)'
                   - 'traefik.http.routers.${SLUG_SAFE}-adminroot.priority=200'
                   - 'traefik.http.routers.${SLUG_SAFE}-adminroot.entrypoints=websecure'
                   - 'traefik.http.routers.${SLUG_SAFE}-adminroot.tls.certresolver=le'
-                  - 'traefik.http.routers.${SLUG_SAFE}-adminroot.middlewares=${SLUG_SAFE}-adminroot-redirect'
                   - 'traefik.http.routers.${SLUG_SAFE}-adminroot.service=${SLUG_SAFE}'
-                  - 'traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.regex=^https?://admin\.essentiaagency\.co\.uk/?$'
-                  - 'traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.replacement=https://admin.essentiaagency.co.uk/admin'
+                  - 'traefik.http.routers.${SLUG_SAFE}-adminroot.middlewares=${SLUG_SAFE}-sec,${SLUG_SAFE}-adminroot-redirect'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.regex=^https?://(www\.)?${ADMIN_DOMAIN}/?$'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.replacement=https://${ADMIN_DOMAIN}/admin'
                   - 'traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.permanent=true'
-            
-                networks:
-                  - proxy
-            APP_COMPOSE_YML
-            
-            if [ "${DB_MODE}" != "none" ]; then
-              echo "      - ${DB_NET}" >> docker-compose.yml.tpl
+            ADMIN_LABELS
             fi
-            
-            echo "networks:" >> docker-compose.yml.tpl
-            echo "  proxy: { external: true, name: proxy }" >> docker-compose.yml.tpl
-            if [ "${DB_MODE}" != "none" ]; then
-              echo "  ${DB_NET}: { external: true, name: ${DB_NET} }" >> docker-compose.yml.tpl
+
+            # ✅ Attach DB network only when DB enabled
+            if [ "${DB_MODE:-postgres}" != "none" ]; then
+              perl -0777 -i -pe 's/networks:\n\s*- proxy/networks:\n      - proxy\n      - ${DB_NET}/' docker-compose.yml.tpl
             fi
-            
+
+            # ✅ Define networks section (proxy always, db_net only if DB enabled)
+            {
+              echo ""
+              echo "networks:"
+              echo "  proxy: { external: true, name: proxy }"
+              if [ "${DB_MODE:-postgres}" != "none" ]; then
+                echo "  ${DB_NET}: { external: true, name: ${DB_NET} }"
+              fi
+            } >> docker-compose.yml.tpl
+
+            # ✅ Render final compose
             export IMAGE_REF SLUG_SAFE DOMAIN ADMIN_DOMAIN PORT DB_NET
             if ! command -v envsubst >/dev/null 2>&1; then
               apt-get update -y && apt-get install -y --no-install-recommends gettext-base
@@ -1298,7 +1436,7 @@ jobs:
 
 
       - name: In-container health check (bypasses DNS/SSL)
-        uses: appleboy/ssh-action@v1
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2
         env:
           SLUG:   ${{ needs.detect.outputs.slug }}
           DOMAIN: ${{ needs.detect.outputs.domain_prod }}
@@ -1359,6 +1497,10 @@ jobs:
           [ $ok -eq 1 ] || { echo "❌ Public health failed"; exit 1; }
 
   hetzner_static:
+    permissions:
+      contents: read
+      actions: read
+      packages: write
     needs: [detect, build_test]
     if: needs.detect.outputs.project_type == 'static' && needs.detect.outputs.branch == 'main-hetz'
     runs-on: ubuntu-latest
@@ -1369,7 +1511,7 @@ jobs:
     steps:
       # ⬇️ Download artifact INTO a folder
       - name: Download static export
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: static-export
           path: static-export   # ✅ THIS IS THE FIX
@@ -1397,17 +1539,17 @@ jobs:
 
           EXPOSE 80
           DOCKER
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build & push static image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
           file: site.Dockerfile
@@ -1417,7 +1559,7 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/static-${{ needs.detect.outputs.repository_name }}:latest
 
       - name: Deploy static container on Hetzner (HTTPS only)
-        uses: appleboy/ssh-action@v1
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2
         env:
           SLUG: ${{ needs.detect.outputs.slug }}
           DOMAIN: ${{ needs.detect.outputs.domain_prod }}
@@ -1451,17 +1593,48 @@ jobs:
                 labels:
                   - 'traefik.enable=true'
                   - 'traefik.docker.network=proxy'
+
+                  # ----------------------------
+                  # ✅ Security headers middleware (per-site)
+                  # ----------------------------
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.contentTypeNosniff=true'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.referrerPolicy=strict-origin-when-cross-origin'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.permissionsPolicy=geolocation=(), microphone=(), camera=(), payment=(), usb=(), interest-cohort=()'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.customResponseHeaders.X-Frame-Options=DENY'
+                  - >-
+                    traefik.http.middlewares.${SLUG_SAFE}-sec.headers.customResponseHeaders.Content-Security-Policy=
+                    default-src 'self';
+                    base-uri 'self';
+                    object-src 'none';
+                    frame-ancestors 'none';
+                    form-action 'self';
+                    img-src 'self' data: https:;
+                    font-src 'self' data: https:;
+                    style-src 'self' 'unsafe-inline' https:;
+                    script-src 'self';
+                    connect-src 'self' https: wss:;
+
+                  # ----------------------------
+                  # HTTPS router
+                  # ----------------------------
                   - 'traefik.http.routers.${SLUG_SAFE}.rule=Host("${DOMAIN}")'
                   - 'traefik.http.routers.${SLUG_SAFE}.entrypoints=websecure'
                   - 'traefik.http.routers.${SLUG_SAFE}.tls.certresolver=le'
+                  - 'traefik.http.routers.${SLUG_SAFE}.middlewares=${SLUG_SAFE}-sec'
                   - 'traefik.http.services.${SLUG_SAFE}.loadbalancer.server.port=80'
+
+                  # ----------------------------
+                  # HTTP router -> redirect to HTTPS (still applies sec middleware)
+                  # ----------------------------
                   - 'traefik.http.routers.${SLUG_SAFE}-http.rule=Host("${DOMAIN}")'
                   - 'traefik.http.routers.${SLUG_SAFE}-http.entrypoints=web'
-                  - 'traefik.http.routers.${SLUG_SAFE}-http.middlewares=${SLUG_SAFE}-redirect'
+                  - 'traefik.http.routers.${SLUG_SAFE}-http.middlewares=${SLUG_SAFE}-sec,${SLUG_SAFE}-redirect'
                   - 'traefik.http.routers.${SLUG_SAFE}-http.service=${SLUG_SAFE}'
                   - 'traefik.http.middlewares.${SLUG_SAFE}-redirect.redirectscheme.scheme=https'
+
                 networks:
                   - proxy
+
             networks:
               proxy:
                 external: true
@@ -1496,6 +1669,7 @@ jobs:
           {
             "event_type": "deploy",
             "client_payload": {
+              "deploy_key": "${{ secrets.DISPATCH_SHARED_KEY }}",
               "repository": "${{ needs.detect.outputs.repository }}",
               "repository_name": "${{ needs.detect.outputs.repository_name }}",
               "branch": "${{ needs.detect.outputs.branch }}"
