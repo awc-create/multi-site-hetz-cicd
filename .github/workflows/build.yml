@@ -38,7 +38,6 @@ jobs:
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
-          DEPLOY_KEY: ${{ github.event.client_payload.deploy_key }}
           EXPECTED_KEY: ${{ secrets.DISPATCH_SHARED_KEY }}
           BRANCH: ${{ github.event.client_payload.branch || github.ref_name }}
         run: |
@@ -46,9 +45,12 @@ jobs:
 
           # Only allow repository_dispatch if it proves knowledge of shared key
           if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            DEPLOY_KEY="${{ github.event.client_payload.deploy_key || '' }}"
+
             [ -n "${EXPECTED_KEY:-}" ] || { echo "❌ Missing secret DISPATCH_SHARED_KEY"; exit 1; }
-            [ -n "${DEPLOY_KEY:-}" ] || { echo "❌ Missing client_payload.deploy_key"; exit 1; }
+            [ -n "${DEPLOY_KEY:-}" ]   || { echo "❌ Missing client_payload.deploy_key"; exit 1; }
             [ "$DEPLOY_KEY" = "$EXPECTED_KEY" ] || { echo "❌ Bad deploy_key"; exit 1; }
+
             echo "✅ Dispatch key OK"
           fi
 
