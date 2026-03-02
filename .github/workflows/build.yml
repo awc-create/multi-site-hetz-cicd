@@ -895,6 +895,35 @@ jobs:
 
           echo "✅ DNS records ensured (admin/pgadmin optional)"
 
+      - name: "Preflight: block DOCKER_* env pollution + empty domains"
+        shell: bash
+        env:
+          DOMAIN: ${{ needs.detect.outputs.domain_prod }}
+          ADMIN_DOMAIN: ${{ needs.detect.outputs.domain_admin }}
+          PGADMIN_HOST: ${{ needs.detect.outputs.domain_pgadmin }}
+          DB_MODE: ${{ needs.detect.outputs.db_mode }}
+        run: |
+          set -euo pipefail
+
+          echo "🔎 Preflight checks"
+
+          # 1) Domain must exist
+          [ -n "${DOMAIN:-}" ] || { echo "❌ DOMAIN empty"; exit 1; }
+
+          # 2) If DB enabled, pgadmin host must not be empty
+          if [ "${DB_MODE}" != "none" ]; then
+            [ -n "${PGADMIN_HOST:-}" ] || { echo "❌ DB enabled but PGADMIN_HOST empty (would create Host(\"\") )"; exit 1; }
+          fi
+
+          # 3) Stop runner/CI from leaking Docker env vars into compose context
+          if env | grep -E '^DOCKER_(API_VERSION|HOST|TLS_VERIFY|CERT_PATH)=' >/dev/null; then
+            echo "❌ Forbidden DOCKER_* env vars present in workflow environment:"
+            env | grep -E '^DOCKER_(API_VERSION|HOST|TLS_VERIFY|CERT_PATH)='
+            exit 1
+          fi
+
+          echo "✅ Preflight OK"
+
       - name: Deploy over SSH (Traefik + per-project DB + app + pgAdmin)
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2
         env:
@@ -960,15 +989,18 @@ jobs:
             CLOUDFLARE_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
             TRAEFIK_ENV
 
-            cat > "$TDIR/docker-compose.yml" <<-'TRAEFIK_YML'
+            # Only create compose if missing (prevents drift)
+            if [ ! -f "$TDIR/docker-compose.yml" ]; then
+              cat > "$TDIR/docker-compose.yml" <<'TRAEFIK_YML'
             services:
               traefik:
-                image: traefik:v3.0
+                image: traefik@sha256:fd5932c796f7e2db9fd6bff485ef693d53797f0ee8ad03dc68aa424ea6f21958
                 restart: unless-stopped
                 env_file: .env
                 command:
                   - --providers.docker=true
                   - --providers.docker.exposedbydefault=false
+                  - --providers.docker.endpoint=unix:///var/run/docker.sock
                   - --entrypoints.web.address=:80
                   - --entrypoints.websecure.address=:443
                   - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
@@ -977,7 +1009,6 @@ jobs:
                   - --certificatesresolvers.le.acme.dnschallenge.provider=cloudflare
                   - --certificatesresolvers.le.acme.dnschallenge.delaybeforecheck=10
                 environment:
-                  CF_DNS_API_TOKEN: ${CF_DNS_API_TOKEN}
                   CLOUDFLARE_DNS_API_TOKEN: ${CLOUDFLARE_DNS_API_TOKEN}
                 ports:
                   - "80:80"
@@ -993,6 +1024,9 @@ jobs:
                 external: true
                 name: proxy
             TRAEFIK_YML
+            else
+              echo "✅ Traefik compose exists — not overwriting"
+            fi
 
             (cd "$TDIR" && docker compose up -d)
 
@@ -1515,6 +1549,25 @@ jobs:
       DOMAIN: ${{ needs.detect.outputs.domain_prod }}
 
     steps:
+      - name: "Preflight: validate inputs + block DOCKER_* env pollution"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "🔎 Preflight checks (static)"
+
+          [ -n "${SLUG:-}" ]   || { echo "❌ SLUG empty"; exit 1; }
+          [ -n "${DOMAIN:-}" ] || { echo "❌ DOMAIN empty"; exit 1; }
+
+          # Stop runner/CI from leaking Docker env vars into compose context
+          if env | grep -E '^DOCKER_(API_VERSION|HOST|TLS_VERIFY|CERT_PATH)=' >/dev/null; then
+            echo "❌ Forbidden DOCKER_* env vars present:"
+            env | grep -E '^DOCKER_(API_VERSION|HOST|TLS_VERIFY|CERT_PATH)='
+            exit 1
+          fi
+
+          echo "✅ Preflight OK"
+
       # ⬇️ Download artifact INTO a folder
       - name: Download static export
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
