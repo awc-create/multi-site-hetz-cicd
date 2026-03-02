@@ -184,6 +184,11 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
+      - name: Checkout CICD repo (this repo)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          path: cicd
+
       - name: Clean npm lock (use Yarn only)
         working-directory: site
         run: rm -f package-lock.json
@@ -283,7 +288,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          DENYFILE="${GITHUB_WORKSPACE}/.cicd/denylist.regex"
+          DENYFILE="${GITHUB_WORKSPACE}/cicd/.cicd/denylist.regex"
           [ -f "$DENYFILE" ] || { echo "❌ Missing $DENYFILE"; exit 1; }
 
           DENYLIST="$(tr -d '\r\n' < "$DENYFILE")"
@@ -311,7 +316,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          FILE="${GITHUB_WORKSPACE}/.cicd/denylist.inline.regex"
+          FILE="${GITHUB_WORKSPACE}/cicd/.cicd/denylist.inline.regex"
           [ -f "$FILE" ] || { echo "❌ Missing $FILE"; exit 1; }
           PATTERN="$(tr -d '\r\n' < "$FILE")"
           [ -n "$PATTERN" ] || { echo "❌ Inline denylist empty"; exit 1; }
