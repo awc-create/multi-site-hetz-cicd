@@ -1336,27 +1336,44 @@ jobs:
             CSP_ESCAPED="$(printf "%s" "$CSP" | sed "s/'/''/g")"
             sed -i "s|__CSP__|$CSP_ESCAPED|g" docker-compose.yml.tpl
 
-            # ✅ Insert admin labels ONLY if ADMIN_DOMAIN exists, otherwise remove marker
+            # ✅ Insert admin labels ONLY if ADMIN_DOMAIN exists, otherwise remove marker (safe)
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
-              sed -i '/# __ADMIN_LABELS__/c\
-                  - '\''traefik.http.routers.${SLUG_SAFE}-admin.rule=Host("${ADMIN_DOMAIN}")'\''\
-                  - '\''traefik.http.routers.${SLUG_SAFE}-admin.priority=100'\''\
-                  - '\''traefik.http.routers.${SLUG_SAFE}-admin.entrypoints=websecure'\''\
-                  - '\''traefik.http.routers.${SLUG_SAFE}-admin.tls.certresolver=le'\''\
-                  - '\''traefik.http.routers.${SLUG_SAFE}-admin.service=${SLUG_SAFE}'\''\
-                  - '\''traefik.http.routers.${SLUG_SAFE}-admin.middlewares=${SLUG_SAFE}-sec'\''\
-                  - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.rule=Host("${ADMIN_DOMAIN}") && Path(`/`)'\''\
-                  - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.priority=200'\''\
-                  - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.entrypoints=websecure'\''\
-                  - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.tls.certresolver=le'\''\
-                  - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.service=${SLUG_SAFE}'\''\
-                  - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.middlewares=${SLUG_SAFE}-sec,${SLUG_SAFE}-adminroot-redirect'\''\
-                  - '\''traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.regex=^https?://(www\.)?${ADMIN_DOMAIN}/?$'\''\
-                  - '\''traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.replacement=https://${ADMIN_DOMAIN}/admin'\''\
-                  - '\''traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.permanent=true'\''\
-              ' docker-compose.yml.tpl
+              cat > /tmp/admin_labels.block <<EOF
+                              - 'traefik.http.routers.${SLUG_SAFE}-admin.rule=Host("${ADMIN_DOMAIN}")'
+                              - 'traefik.http.routers.${SLUG_SAFE}-admin.priority=100'
+                              - 'traefik.http.routers.${SLUG_SAFE}-admin.entrypoints=websecure'
+                              - 'traefik.http.routers.${SLUG_SAFE}-admin.tls.certresolver=le'
+                              - 'traefik.http.routers.${SLUG_SAFE}-admin.service=${SLUG_SAFE}'
+                              - 'traefik.http.routers.${SLUG_SAFE}-admin.middlewares=${SLUG_SAFE}-sec'
+
+                              - 'traefik.http.routers.${SLUG_SAFE}-adminroot.rule=Host("${ADMIN_DOMAIN}") && Path(`/`)'
+                              - 'traefik.http.routers.${SLUG_SAFE}-adminroot.priority=200'
+                              - 'traefik.http.routers.${SLUG_SAFE}-adminroot.entrypoints=websecure'
+                              - 'traefik.http.routers.${SLUG_SAFE}-adminroot.tls.certresolver=le'
+                              - 'traefik.http.routers.${SLUG_SAFE}-adminroot.service=${SLUG_SAFE}'
+                              - 'traefik.http.routers.${SLUG_SAFE}-adminroot.middlewares=${SLUG_SAFE}-sec,${SLUG_SAFE}-adminroot-redirect'
+                              - 'traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.regex=^https?://(www\.)?${ADMIN_DOMAIN}/?$'
+                              - 'traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.replacement=https://${ADMIN_DOMAIN}/admin'
+                              - 'traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.permanent=true'
+            EOF
+
+              awk '
+                BEGIN { inserted=0 }
+                /# __ADMIN_LABELS__/ {
+                  while ((getline line < "/tmp/admin_labels.block") > 0) print line
+                  close("/tmp/admin_labels.block")
+                  inserted=1
+                  next
+                }
+                { print }
+                END { if (!inserted) exit 2 }
+              ' docker-compose.yml.tpl > docker-compose.yml.tpl.new
+
+              mv docker-compose.yml.tpl.new docker-compose.yml.tpl
             else
-              sed -i '/# __ADMIN_LABELS__/d' docker-compose.yml.tpl
+              # remove marker line if admin disabled
+              grep -v '# __ADMIN_LABELS__' docker-compose.yml.tpl > docker-compose.yml.tpl.new
+              mv docker-compose.yml.tpl.new docker-compose.yml.tpl
             fi
 
             # ✅ Attach DB network only if DB enabled (replace whole marker line)
