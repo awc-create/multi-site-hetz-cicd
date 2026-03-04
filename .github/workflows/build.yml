@@ -1213,7 +1213,7 @@ jobs:
               echo "⚙️ Ensuring role/db/ownership for '${DB_USER}' / '${DB_NAME}'"
               db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
                 psql -h postgres -U "${SUPER_USER}" -d postgres \
-                -v APP_USER="${DB_USER}" -v APP_DB="${DB_NAME}" -v APP_PASS="${DB_PASS}" <<'SQL'
+                -v APP_USER="${DB_USER}" -v APP_DB="${DB_NAME}" -v APP_PASS="${DB_PASS}" <<SQL
               DO $$
               DECLARE
                 u text := :'APP_USER';
