@@ -976,7 +976,9 @@ jobs:
             DB_USER="$(printf "%s" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_USER|DB_USER)=/{print $2}' | tail -1)"
             [ -n "$DB_USER" ] || DB_USER="${SLUG_SAFE}_admin"
             DB_PASS="$(printf "%s" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_PASSWORD|DB_PASSWORD)=/{print $2}' | tail -1)"
-            [ -n "$DB_PASS" ] || DB_PASS=""
+            if [ "${DB_MODE}" != "none" ]; then
+              [ -n "$DB_PASS" ] || { echo "❌ DB_PASSWORD/POSTGRES_PASSWORD missing in SITE_ENV"; exit 1; }
+            fi
 
             # --- Traefik (shared) ---
             TDIR="/opt/services/traefik"
@@ -1212,26 +1214,28 @@ jobs:
               db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
                 psql -h postgres -U "${SUPER_USER}" -d postgres \
                 -v APP_USER="${DB_USER}" -v APP_DB="${DB_NAME}" -v APP_PASS="${DB_PASS}" <<'SQL'
-            DO $$
-            BEGIN
-              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_setting('APP_USER', true)) THEN
-                EXECUTE format('CREATE ROLE %I LOGIN', current_setting('APP_USER', true));
-              END IF;
+              DO $$
+              DECLARE
+                u text := :'APP_USER';
+                d text := :'APP_DB';
+                p text := :'APP_PASS';
+              BEGIN
+                IF u IS NULL OR u = '' THEN RAISE EXCEPTION 'APP_USER empty'; END IF;
+                IF d IS NULL OR d = '' THEN RAISE EXCEPTION 'APP_DB empty'; END IF;
 
-              EXECUTE format(
-                'ALTER ROLE %I WITH PASSWORD %s',
-                current_setting('APP_USER', true),
-                quote_literal(current_setting('APP_PASS', true))
-              );
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = u) THEN
+                  EXECUTE format('CREATE ROLE %I LOGIN', u);
+                END IF;
 
-              IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = current_setting('APP_DB', true)) THEN
-                EXECUTE format('CREATE DATABASE %I OWNER %I', current_setting('APP_DB', true), current_setting('APP_USER', true));
-              END IF;
+                EXECUTE format('ALTER ROLE %I WITH PASSWORD %L', u, p);
 
-              EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_setting('APP_DB', true), current_setting('APP_USER', true));
-            END
-            $$;
-            SQL
+                IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = d) THEN
+                  EXECUTE format('CREATE DATABASE %I OWNER %I', d, u);
+                END IF;
+
+                EXECUTE format('ALTER DATABASE %I OWNER TO %I', d, u);
+              END $$;
+              SQL
 
               # Restart pgbouncer so it definitely picks up the updated password
               db_compose restart pgbouncer >/dev/null 2>&1 || true
@@ -1355,9 +1359,9 @@ jobs:
               sed -i '/# __ADMIN_LABELS__/d' docker-compose.yml.tpl
             fi
 
-            # ✅ Attach DB network only if DB enabled
+            # ✅ Attach DB network only if DB enabled (replace whole marker line)
             if [ "${DB_MODE:-postgres}" != "none" ]; then
-              sed -i "s|# __DB_NET__| - ${DB_NET}|g" docker-compose.yml.tpl
+              sed -i "s|^\\s*# __DB_NET__\\s*$|                  - ${DB_NET}|" docker-compose.yml.tpl
             else
               sed -i '/# __DB_NET__/d' docker-compose.yml.tpl
             fi
@@ -1378,6 +1382,23 @@ jobs:
               apt-get update -y && apt-get install -y --no-install-recommends gettext-base
             fi
             envsubst '$IMAGE_REF $SLUG_SAFE $DOMAIN $ADMIN_DOMAIN $PORT $DB_NET' < docker-compose.yml.tpl > docker-compose.yml
+
+            # ✅ Sanity checks (NOW the file exists)
+            echo "🔎 Compose sanity:"
+            docker compose -f docker-compose.yml config >/dev/null || {
+              echo "❌ Invalid compose file"
+              sed -n '1,260p' docker-compose.yml
+              exit 1
+            }
+
+            echo "🔎 App networks:"
+            awk '
+              $1=="services:"{s=1}
+              s && $1=="app:"{a=1}
+              a && $1=="networks:"{n=1}
+              n{print}
+              n && $1=="labels:"{exit}
+            ' docker-compose.yml || true
 
             docker compose pull || true
             docker compose up -d --remove-orphans
