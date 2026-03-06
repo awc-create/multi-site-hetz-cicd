@@ -895,7 +895,7 @@ jobs:
 
           echo "✅ DNS records ensured (admin/pgadmin optional)"
 
-      - name: Preflight: validate deploy inputs
+      - name: "Preflight: validate deploy inputs"
         shell: bash
         env:
           DOMAIN: ${{ needs.detect.outputs.domain_prod }}
