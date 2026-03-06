@@ -947,8 +947,12 @@ jobs:
           script: |
             set -euo pipefail
 
+            # =========================================================
             # Basic required vars
-            [ -n "${SLUG:-}" ] && [ -n "${DOMAIN:-}" ] && [ -n "${IMAGE_REF:-}" ] || { echo "❌ Missing SLUG/DOMAIN/IMAGE_REF"; exit 1; }
+            # =========================================================
+            [ -n "${SLUG:-}" ] || { echo "❌ Missing SLUG"; exit 1; }
+            [ -n "${DOMAIN:-}" ] || { echo "❌ Missing DOMAIN"; exit 1; }
+            [ -n "${IMAGE_REF:-}" ] || { echo "❌ Missing IMAGE_REF"; exit 1; }
 
             SLUG_SAFE="$(printf '%s' "${SLUG}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
             [ -n "$SLUG_SAFE" ] || { echo "❌ Bad SLUG"; exit 1; }
@@ -956,26 +960,33 @@ jobs:
             DB_NET="${SLUG_SAFE}_db_net"
             DB_DIR="/opt/services/postgres-${SLUG_SAFE}"
             SITE_DIR="/opt/sites/${SLUG_SAFE}"
+            TDIR="/opt/services/traefik"
 
             docker network create proxy >/dev/null 2>&1 || true
             if [ "${DB_MODE}" != "none" ]; then
               docker network create "${DB_NET}" >/dev/null 2>&1 || true
             fi
 
+            # =========================================================
             # Normalize SITE_ENV
+            # =========================================================
             SITE_ENV_NORM="$(printf "%s" "${SITE_ENV:-}" | sed 's/\r$//')"
+
             ACME_EMAIL="$(printf "%s" "$SITE_ENV_NORM" | awk -F= '/^ACME_EMAIL=/{print $2}' | tail -1)"
             [ -n "$ACME_EMAIL" ] || { echo "❌ ACME_EMAIL missing in SITE_ENV"; exit 1; }
 
             DB_NAME="$(printf "%s" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_DB|DB_NAME)=/{print $2}' | tail -1)"
             [ -n "$DB_NAME" ] || DB_NAME="${SLUG_SAFE}"
+
             DB_USER="$(printf "%s" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_USER|DB_USER)=/{print $2}' | tail -1)"
             [ -n "$DB_USER" ] || DB_USER="${SLUG_SAFE}_admin"
+
             DB_PASS="$(printf "%s" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_PASSWORD|DB_PASSWORD)=/{print $2}' | tail -1)"
             [ -n "$DB_PASS" ] || DB_PASS=""
 
-            # --- Traefik (shared) ---
-            TDIR="/opt/services/traefik"
+            # =========================================================
+            # Shared Traefik
+            # =========================================================
             mkdir -p "$TDIR/letsencrypt"
             [ -f "$TDIR/letsencrypt/acme.json" ] || install -m 600 /dev/null "$TDIR/letsencrypt/acme.json"
 
@@ -985,7 +996,7 @@ jobs:
               "CLOUDFLARE_DNS_API_TOKEN=${CF_DNS_API_TOKEN}" \
               > "$TDIR/.env"
 
-            cat > "$TDIR/docker-compose.yml" <<'__TRAEFIK_COMPOSE__'
+            cat > "$TDIR/docker-compose.yml" <<'TRAEFIK_COMPOSE'
             services:
               traefik:
                 image: traefik:v3.0
@@ -1019,21 +1030,24 @@ jobs:
               proxy:
                 external: true
                 name: proxy
-            __TRAEFIK_COMPOSE__
+            TRAEFIK_COMPOSE
 
             (cd "$TDIR" && docker compose config >/dev/null)
             (cd "$TDIR" && docker compose up -d)
 
-            # --- Login to GHCR (if token provided) ---
+            # =========================================================
+            # Login to GHCR
+            # =========================================================
             if [ -n "${GHCR_TOKEN:-}" ]; then
               echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             fi
 
-            # ============================================
-            # DB stack only if DB_MODE != none
-            # ============================================
+            # =========================================================
+            # Per-project DB stack
+            # =========================================================
             if [ "${DB_MODE}" != "none" ]; then
               echo "🔹 DB enabled — setting up Postgres + PgBouncer + pgAdmin"
+
               [ -n "${PGADMIN_HOST:-}" ] || { echo "❌ PGADMIN_HOST missing while DB is enabled"; exit 1; }
               [ -n "${PGADMIN_EMAIL:-}" ] || { echo "❌ PGADMIN_EMAIL missing while DB is enabled"; exit 1; }
               [ -n "${PGADMIN_PASSWORD:-}" ] || { echo "❌ PGADMIN_PASSWORD missing while DB is enabled"; exit 1; }
@@ -1144,9 +1158,9 @@ jobs:
               echo "🚫 DB disabled — skipping Postgres/PgBouncer/pgAdmin setup"
             fi
 
-            # --------------------------------------------
-            # DB credential reconcile (auto-reset password)
-            # --------------------------------------------
+            # =========================================================
+            # DB credential reconcile
+            # =========================================================
             if [ "${DB_MODE}" != "none" ]; then
               echo "🔧 DB: verifying credentials for user '${DB_USER}' on db '${DB_NAME}'"
 
@@ -1198,36 +1212,40 @@ jobs:
                 fi
               fi
 
-              # Now we can safely reconcile the role/db using the SUPERUSER connection
               echo "⚙️ Ensuring role/db/ownership for '${DB_USER}' / '${DB_NAME}'"
-              db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
-                psql -h postgres -U "${SUPER_USER}" -d postgres \
-                -v APP_USER="${DB_USER}" -v APP_DB="${DB_NAME}" -v APP_PASS="${DB_PASS}" <<'__SQL_RECONCILE__'
-              DO $do$
+
+              DB_USER_ESC="${DB_USER//\'/\'\'}"
+              DB_NAME_ESC="${DB_NAME//\'/\'\'}"
+              DB_PASS_ESC="${DB_PASS//\'/\'\'}"
+
+              SQL_RECONCILE="
+              DO \$do\$
               BEGIN
-                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'APP_USER') THEN
-                  EXECUTE format('CREATE ROLE %I LOGIN', :'APP_USER');
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${DB_USER_ESC}') THEN
+                  EXECUTE format('CREATE ROLE %I LOGIN', '${DB_USER_ESC}');
                 END IF;
 
-                EXECUTE format('ALTER ROLE %I WITH PASSWORD %L', :'APP_USER', :'APP_PASS');
+                EXECUTE format('ALTER ROLE %I WITH PASSWORD %L', '${DB_USER_ESC}', '${DB_PASS_ESC}');
 
-                IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'APP_DB') THEN
-                  EXECUTE format('CREATE DATABASE %I OWNER %I', :'APP_DB', :'APP_USER');
+                IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = '${DB_NAME_ESC}') THEN
+                  EXECUTE format('CREATE DATABASE %I OWNER %I', '${DB_NAME_ESC}', '${DB_USER_ESC}');
                 END IF;
 
-                EXECUTE format('ALTER DATABASE %I OWNER TO %I', :'APP_DB', :'APP_USER');
+                EXECUTE format('ALTER DATABASE %I OWNER TO %I', '${DB_NAME_ESC}', '${DB_USER_ESC}');
               END
-              $do$;
-              __SQL_RECONCILE__
+              \$do\$;
+              "
 
-              # Restart pgbouncer so it definitely picks up the updated password
+              db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
+                psql -h postgres -U "${SUPER_USER}" -d postgres -v ON_ERROR_STOP=1 -c "${SQL_RECONCILE}"
+
               db_compose restart pgbouncer >/dev/null 2>&1 || true
               echo "✅ DB reconcile done"
             fi
 
-            # ============================================
-            # App deploy (common)
-            # ============================================
+            # =========================================================
+            # App deploy
+            # =========================================================
             mkdir -p "${SITE_DIR}"
             cd "${SITE_DIR}"
             printf "%s\n" "$SITE_ENV_NORM" > app.env
@@ -1244,7 +1262,7 @@ jobs:
               grep -q '^DIRECT_DATABASE_URL=' app.env || echo "DIRECT_DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@postgres:5432/${DB_NAME}?connect_timeout=5" >> app.env
             fi
 
-            cat > docker-compose.yml.tpl <<'__APP_COMPOSE__'
+            cat > docker-compose.yml.tpl <<'APP_COMPOSE'
             services:
               app:
                 image: ${IMAGE_REF}
@@ -1284,7 +1302,7 @@ jobs:
                   - proxy
             # __DB_NET__
 
-            __APP_COMPOSE__
+            APP_COMPOSE
 
             CSP="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https://js.stripe.com https://client.crisp.chat https://*.crisp.chat; connect-src 'self' https: wss:;"
             CSP_ESCAPED="$(printf "%s" "$CSP" | sed "s/'/''/g")"
@@ -1312,7 +1330,6 @@ jobs:
               sed -i '/# __ADMIN_LABELS__/d' docker-compose.yml.tpl
             fi
 
-            # ✅ Attach DB network only if DB enabled
             if [ "${DB_MODE:-postgres}" != "none" ]; then
               sed -i "s|^# __DB_NET__$|                  - ${DB_NET}|" docker-compose.yml.tpl
             else
@@ -1334,17 +1351,18 @@ jobs:
             fi
             envsubst '$IMAGE_REF $SLUG_SAFE $DOMAIN $ADMIN_DOMAIN $PORT $DB_NET' < docker-compose.yml.tpl > docker-compose.yml
 
-            docker compose config >/dev/null
             echo "----- rendered docker-compose.yml -----"
             sed -n '1,260p' docker-compose.yml
             docker compose config >/dev/null
-            
+
             docker compose pull || true
             docker compose up -d --remove-orphans
 
-            # --- Prisma migrate + Seed (only if DB enabled) ---
+            # =========================================================
+            # Prisma migrate + seed
+            # =========================================================
             if [ "${DB_MODE}" != "none" ]; then
-              docker compose exec -T app sh -s <<'__PRISMA_BOOTSTRAP__'
+              docker compose exec -T app sh -s <<'PRISMA_BOOTSTRAP'
             set -euo pipefail
 
             NODE_PATH=/app/node_modules npx prisma migrate deploy
@@ -1357,7 +1375,7 @@ jobs:
 
             echo "🌱 No project seed configured — running generic schema-aware admin ensure..."
 
-            NODE_PATH=/app/node_modules node <<'__NODE_FALLBACK__'
+            NODE_PATH=/app/node_modules node <<'NODE_FALLBACK'
             (async () => {
               const { PrismaClient, Role } = require("@prisma/client");
               const bcrypt = require("bcryptjs");
@@ -1422,13 +1440,13 @@ jobs:
               console.error("❌ Fallback admin ensure failed:", e);
               process.exit(1);
             });
-            __NODE_FALLBACK__
-            __PRISMA_BOOTSTRAP__
+            NODE_FALLBACK
+            PRISMA_BOOTSTRAP
             else
               echo "🚫 DB disabled — skipping Prisma migrations and seeding"
-            fi
-          
-      - name: In-container health check (bypasses DNS/SSL)
+            fi       
+      
+            - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2
         env:
           SLUG:   ${{ needs.detect.outputs.slug }}
