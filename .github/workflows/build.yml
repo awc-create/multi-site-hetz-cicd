@@ -895,11 +895,10 @@ jobs:
 
           echo "✅ DNS records ensured (admin/pgadmin optional)"
 
-      - name: "Preflight: block DOCKER_* env pollution + empty domains"
+      - name: Preflight: validate deploy inputs
         shell: bash
         env:
           DOMAIN: ${{ needs.detect.outputs.domain_prod }}
-          ADMIN_DOMAIN: ${{ needs.detect.outputs.domain_admin }}
           PGADMIN_HOST: ${{ needs.detect.outputs.domain_pgadmin }}
           DB_MODE: ${{ needs.detect.outputs.db_mode }}
         run: |
@@ -907,17 +906,14 @@ jobs:
 
           echo "🔎 Preflight checks"
 
-          # 1) Domain must exist
           [ -n "${DOMAIN:-}" ] || { echo "❌ DOMAIN empty"; exit 1; }
 
-          # 2) If DB enabled, pgadmin host must not be empty
           if [ "${DB_MODE}" != "none" ]; then
-            [ -n "${PGADMIN_HOST:-}" ] || { echo "❌ DB enabled but PGADMIN_HOST empty (would create Host(\"\") )"; exit 1; }
+            [ -n "${PGADMIN_HOST:-}" ] || { echo "❌ DB enabled but PGADMIN_HOST empty"; exit 1; }
           fi
 
-          # 3) Stop runner/CI from leaking Docker env vars into compose context
           if env | grep -E '^DOCKER_(API_VERSION|HOST|TLS_VERIFY|CERT_PATH)=' >/dev/null; then
-            echo "❌ Forbidden DOCKER_* env vars present in workflow environment:"
+            echo "❌ Forbidden DOCKER_* env vars present:"
             env | grep -E '^DOCKER_(API_VERSION|HOST|TLS_VERIFY|CERT_PATH)='
             exit 1
           fi
@@ -976,9 +972,7 @@ jobs:
             DB_USER="$(printf "%s" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_USER|DB_USER)=/{print $2}' | tail -1)"
             [ -n "$DB_USER" ] || DB_USER="${SLUG_SAFE}_admin"
             DB_PASS="$(printf "%s" "$SITE_ENV_NORM" | awk -F= '/^(POSTGRES_PASSWORD|DB_PASSWORD)=/{print $2}' | tail -1)"
-            if [ "${DB_MODE}" != "none" ]; then
-              [ -n "$DB_PASS" ] || { echo "❌ DB_PASSWORD/POSTGRES_PASSWORD missing in SITE_ENV"; exit 1; }
-            fi
+            [ -n "$DB_PASS" ] || DB_PASS=""
 
             # --- Traefik (shared) ---
             TDIR="/opt/services/traefik"
@@ -991,26 +985,26 @@ jobs:
             CLOUDFLARE_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
             TRAEFIK_ENV
 
-            # Only create compose if missing (prevents drift)
-            if [ ! -f "$TDIR/docker-compose.yml" ]; then
-              cat > "$TDIR/docker-compose.yml" <<'TRAEFIK_YML'
+            cat > "$TDIR/docker-compose.yml" <<-'TRAEFIK_YML'
             services:
               traefik:
-                image: traefik@sha256:fd5932c796f7e2db9fd6bff485ef693d53797f0ee8ad03dc68aa424ea6f21958
+                image: traefik:v3.0
                 restart: unless-stopped
                 env_file: .env
                 command:
                   - --providers.docker=true
                   - --providers.docker.exposedbydefault=false
-                  - --providers.docker.endpoint=unix:///var/run/docker.sock
                   - --entrypoints.web.address=:80
                   - --entrypoints.websecure.address=:443
+                  - --entrypoints.web.http.redirections.entrypoint.to=websecure
+                  - --entrypoints.web.http.redirections.entrypoint.scheme=https
                   - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
                   - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
                   - --certificatesresolvers.le.acme.dnschallenge=true
                   - --certificatesresolvers.le.acme.dnschallenge.provider=cloudflare
                   - --certificatesresolvers.le.acme.dnschallenge.delaybeforecheck=10
                 environment:
+                  CF_DNS_API_TOKEN: ${CF_DNS_API_TOKEN}
                   CLOUDFLARE_DNS_API_TOKEN: ${CLOUDFLARE_DNS_API_TOKEN}
                 ports:
                   - "80:80"
@@ -1026,9 +1020,6 @@ jobs:
                 external: true
                 name: proxy
             TRAEFIK_YML
-            else
-              echo "✅ Traefik compose exists — not overwriting"
-            fi
 
             (cd "$TDIR" && docker compose up -d)
 
@@ -1213,29 +1204,27 @@ jobs:
               echo "⚙️ Ensuring role/db/ownership for '${DB_USER}' / '${DB_NAME}'"
               db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
                 psql -h postgres -U "${SUPER_USER}" -d postgres \
-                -v APP_USER="${DB_USER}" -v APP_DB="${DB_NAME}" -v APP_PASS="${DB_PASS}" <<SQL
-              DO $$
-              DECLARE
-                u text := :'APP_USER';
-                d text := :'APP_DB';
-                p text := :'APP_PASS';
-              BEGIN
-                IF u IS NULL OR u = '' THEN RAISE EXCEPTION 'APP_USER empty'; END IF;
-                IF d IS NULL OR d = '' THEN RAISE EXCEPTION 'APP_DB empty'; END IF;
+                -v APP_USER="${DB_USER}" -v APP_DB="${DB_NAME}" -v APP_PASS="${DB_PASS}" <<'SQL'
+            DO $$
+            BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_setting('APP_USER', true)) THEN
+                EXECUTE format('CREATE ROLE %I LOGIN', current_setting('APP_USER', true));
+              END IF;
 
-                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = u) THEN
-                  EXECUTE format('CREATE ROLE %I LOGIN', u);
-                END IF;
+              EXECUTE format(
+                'ALTER ROLE %I WITH PASSWORD %s',
+                current_setting('APP_USER', true),
+                quote_literal(current_setting('APP_PASS', true))
+              );
 
-                EXECUTE format('ALTER ROLE %I WITH PASSWORD %L', u, p);
+              IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = current_setting('APP_DB', true)) THEN
+                EXECUTE format('CREATE DATABASE %I OWNER %I', current_setting('APP_DB', true), current_setting('APP_USER', true));
+              END IF;
 
-                IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = d) THEN
-                  EXECUTE format('CREATE DATABASE %I OWNER %I', d, u);
-                END IF;
-
-                EXECUTE format('ALTER DATABASE %I OWNER TO %I', d, u);
-              END $$;
-              SQL
+              EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_setting('APP_DB', true), current_setting('APP_USER', true));
+            END
+            $$;
+            SQL
 
               # Restart pgbouncer so it definitely picks up the updated password
               db_compose restart pgbouncer >/dev/null 2>&1 || true
@@ -1336,49 +1325,32 @@ jobs:
             CSP_ESCAPED="$(printf "%s" "$CSP" | sed "s/'/''/g")"
             sed -i "s|__CSP__|$CSP_ESCAPED|g" docker-compose.yml.tpl
 
-            # ✅ Insert admin labels ONLY if ADMIN_DOMAIN exists, otherwise remove marker (safe)
+            # ✅ Insert admin labels ONLY if ADMIN_DOMAIN exists, otherwise remove marker
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
-              cat > /tmp/admin_labels.block <<EOF
-                              - 'traefik.http.routers.${SLUG_SAFE}-admin.rule=Host("${ADMIN_DOMAIN}")'
-                              - 'traefik.http.routers.${SLUG_SAFE}-admin.priority=100'
-                              - 'traefik.http.routers.${SLUG_SAFE}-admin.entrypoints=websecure'
-                              - 'traefik.http.routers.${SLUG_SAFE}-admin.tls.certresolver=le'
-                              - 'traefik.http.routers.${SLUG_SAFE}-admin.service=${SLUG_SAFE}'
-                              - 'traefik.http.routers.${SLUG_SAFE}-admin.middlewares=${SLUG_SAFE}-sec'
-
-                              - 'traefik.http.routers.${SLUG_SAFE}-adminroot.rule=Host("${ADMIN_DOMAIN}") && Path(`/`)'
-                              - 'traefik.http.routers.${SLUG_SAFE}-adminroot.priority=200'
-                              - 'traefik.http.routers.${SLUG_SAFE}-adminroot.entrypoints=websecure'
-                              - 'traefik.http.routers.${SLUG_SAFE}-adminroot.tls.certresolver=le'
-                              - 'traefik.http.routers.${SLUG_SAFE}-adminroot.service=${SLUG_SAFE}'
-                              - 'traefik.http.routers.${SLUG_SAFE}-adminroot.middlewares=${SLUG_SAFE}-sec,${SLUG_SAFE}-adminroot-redirect'
-                              - 'traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.regex=^https?://(www\.)?${ADMIN_DOMAIN}/?$'
-                              - 'traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.replacement=https://${ADMIN_DOMAIN}/admin'
-                              - 'traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.permanent=true'
-            EOF
-
-              awk '
-                BEGIN { inserted=0 }
-                /# __ADMIN_LABELS__/ {
-                  while ((getline line < "/tmp/admin_labels.block") > 0) print line
-                  close("/tmp/admin_labels.block")
-                  inserted=1
-                  next
-                }
-                { print }
-                END { if (!inserted) exit 2 }
-              ' docker-compose.yml.tpl > docker-compose.yml.tpl.new
-
-              mv docker-compose.yml.tpl.new docker-compose.yml.tpl
+              sed -i '/# __ADMIN_LABELS__/c\
+                  - '\''traefik.http.routers.${SLUG_SAFE}-admin.rule=Host("${ADMIN_DOMAIN}")'\''\
+                  - '\''traefik.http.routers.${SLUG_SAFE}-admin.priority=100'\''\
+                  - '\''traefik.http.routers.${SLUG_SAFE}-admin.entrypoints=websecure'\''\
+                  - '\''traefik.http.routers.${SLUG_SAFE}-admin.tls.certresolver=le'\''\
+                  - '\''traefik.http.routers.${SLUG_SAFE}-admin.service=${SLUG_SAFE}'\''\
+                  - '\''traefik.http.routers.${SLUG_SAFE}-admin.middlewares=${SLUG_SAFE}-sec'\''\
+                  - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.rule=Host("${ADMIN_DOMAIN}") && Path(`/`)'\''\
+                  - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.priority=200'\''\
+                  - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.entrypoints=websecure'\''\
+                  - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.tls.certresolver=le'\''\
+                  - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.service=${SLUG_SAFE}'\''\
+                  - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.middlewares=${SLUG_SAFE}-sec,${SLUG_SAFE}-adminroot-redirect'\''\
+                  - '\''traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.regex=^https?://(www\.)?${ADMIN_DOMAIN}/?$'\''\
+                  - '\''traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.replacement=https://${ADMIN_DOMAIN}/admin'\''\
+                  - '\''traefik.http.middlewares.${SLUG_SAFE}-adminroot-redirect.redirectregex.permanent=true'\''\
+              ' docker-compose.yml.tpl
             else
-              # remove marker line if admin disabled
-              grep -v '# __ADMIN_LABELS__' docker-compose.yml.tpl > docker-compose.yml.tpl.new
-              mv docker-compose.yml.tpl.new docker-compose.yml.tpl
+              sed -i '/# __ADMIN_LABELS__/d' docker-compose.yml.tpl
             fi
 
-            # ✅ Attach DB network only if DB enabled (replace whole marker line)
+            # ✅ Attach DB network only if DB enabled
             if [ "${DB_MODE:-postgres}" != "none" ]; then
-              sed -i "s|^\\s*# __DB_NET__\\s*$|                  - ${DB_NET}|" docker-compose.yml.tpl
+              sed -i "s|# __DB_NET__| - ${DB_NET}|g" docker-compose.yml.tpl
             else
               sed -i '/# __DB_NET__/d' docker-compose.yml.tpl
             fi
@@ -1399,23 +1371,6 @@ jobs:
               apt-get update -y && apt-get install -y --no-install-recommends gettext-base
             fi
             envsubst '$IMAGE_REF $SLUG_SAFE $DOMAIN $ADMIN_DOMAIN $PORT $DB_NET' < docker-compose.yml.tpl > docker-compose.yml
-
-            # ✅ Sanity checks (NOW the file exists)
-            echo "🔎 Compose sanity:"
-            docker compose -f docker-compose.yml config >/dev/null || {
-              echo "❌ Invalid compose file"
-              sed -n '1,260p' docker-compose.yml
-              exit 1
-            }
-
-            echo "🔎 App networks:"
-            awk '
-              $1=="services:"{s=1}
-              s && $1=="app:"{a=1}
-              a && $1=="networks:"{n=1}
-              n{print}
-              n && $1=="labels:"{exit}
-            ' docker-compose.yml || true
 
             docker compose pull || true
             docker compose up -d --remove-orphans
@@ -1587,25 +1542,6 @@ jobs:
       DOMAIN: ${{ needs.detect.outputs.domain_prod }}
 
     steps:
-      - name: "Preflight: validate inputs + block DOCKER_* env pollution"
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "🔎 Preflight checks (static)"
-
-          [ -n "${SLUG:-}" ]   || { echo "❌ SLUG empty"; exit 1; }
-          [ -n "${DOMAIN:-}" ] || { echo "❌ DOMAIN empty"; exit 1; }
-
-          # Stop runner/CI from leaking Docker env vars into compose context
-          if env | grep -E '^DOCKER_(API_VERSION|HOST|TLS_VERIFY|CERT_PATH)=' >/dev/null; then
-            echo "❌ Forbidden DOCKER_* env vars present:"
-            env | grep -E '^DOCKER_(API_VERSION|HOST|TLS_VERIFY|CERT_PATH)='
-            exit 1
-          fi
-
-          echo "✅ Preflight OK"
-
       # ⬇️ Download artifact INTO a folder
       - name: Download static export
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
