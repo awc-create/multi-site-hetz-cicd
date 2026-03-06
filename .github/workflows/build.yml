@@ -1446,7 +1446,7 @@ jobs:
               echo "🚫 DB disabled — skipping Prisma migrations and seeding"
             fi       
       
-            - name: In-container health check (bypasses DNS/SSL)
+      - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2
         env:
           SLUG:   ${{ needs.detect.outputs.slug }}
