@@ -979,13 +979,13 @@ jobs:
             mkdir -p "$TDIR/letsencrypt"
             [ -f "$TDIR/letsencrypt/acme.json" ] || install -m 600 /dev/null "$TDIR/letsencrypt/acme.json"
 
-            cat > "$TDIR/.env" <<-TRAEFIK_ENV
+            cat > "$TDIR/.env" <<EOF
             ACME_EMAIL=${ACME_EMAIL}
             CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
             CLOUDFLARE_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
-            TRAEFIK_ENV
+            EOF
 
-            cat > "$TDIR/docker-compose.yml" <<-'TRAEFIK_YML'
+            cat > "$TDIR/docker-compose.yml" <<'TRAEFIK_YML'
             services:
               traefik:
                 image: traefik:v3.0
