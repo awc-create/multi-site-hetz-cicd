@@ -1330,10 +1330,11 @@ jobs:
               sed -i '/# __ADMIN_LABELS__/d' docker-compose.yml.tpl
             fi
 
+            # ✅ Attach DB network only if DB enabled
             if [ "${DB_MODE:-postgres}" != "none" ]; then
-              sed -i "s|^# __DB_NET__$|                  - ${DB_NET}|" docker-compose.yml.tpl
+              sed -i "s|^[[:space:]]*# __DB_NET__[[:space:]]*$|      - ${DB_NET}|" docker-compose.yml.tpl
             else
-              sed -i '/^# __DB_NET__$/d' docker-compose.yml.tpl
+              sed -i '/^[[:space:]]*# __DB_NET__[[:space:]]*$/d' docker-compose.yml.tpl
             fi
 
             {
