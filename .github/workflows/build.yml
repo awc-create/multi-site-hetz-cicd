@@ -923,19 +923,19 @@ jobs:
       - name: Deploy over SSH (Traefik + per-project DB + app + pgAdmin)
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2
         env:
-          SLUG:         ${{ needs.detect.outputs.slug }}
-          PORT:         ${{ needs.detect.outputs.port }}
-          DOMAIN:       ${{ needs.detect.outputs.domain_prod }}
+          SLUG: ${{ needs.detect.outputs.slug }}
+          PORT: ${{ needs.detect.outputs.port }}
+          DOMAIN: ${{ needs.detect.outputs.domain_prod }}
           ADMIN_DOMAIN: ${{ needs.detect.outputs.domain_admin }}
           PGADMIN_HOST: ${{ needs.detect.outputs.domain_pgadmin }}
-          IMAGE_REF:    ${{ needs.image_build_push.outputs.ref }}
-          SITE_ENV:     ${{ env.SITE_ENV }}
-          GHCR_USER:    ${{ github.repository_owner }}
-          GHCR_TOKEN:   ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
+          IMAGE_REF: ${{ needs.image_build_push.outputs.ref }}
+          SITE_ENV: ${{ env.SITE_ENV }}
+          GHCR_USER: ${{ github.repository_owner }}
+          GHCR_TOKEN: ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
           CF_DNS_API_TOKEN: ${{ env.CF_DNS_API_TOKEN }}
-          PGADMIN_EMAIL:    ${{ env.PGADMIN_EMAIL }}
+          PGADMIN_EMAIL: ${{ env.PGADMIN_EMAIL }}
           PGADMIN_PASSWORD: ${{ env.PGADMIN_PASSWORD }}
-          DB_MODE:          ${{ needs.detect.outputs.db_mode }}
+          DB_MODE: ${{ needs.detect.outputs.db_mode }}
         with:
           host: ${{ secrets.HZ_HOST }}
           username: ${{ secrets.HZ_USER || 'root' }}
@@ -979,13 +979,13 @@ jobs:
             mkdir -p "$TDIR/letsencrypt"
             [ -f "$TDIR/letsencrypt/acme.json" ] || install -m 600 /dev/null "$TDIR/letsencrypt/acme.json"
 
-            cat > "$TDIR/.env" <<EOF
-            ACME_EMAIL=${ACME_EMAIL}
-            CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
-            CLOUDFLARE_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
-            EOF
+            printf '%s\n' \
+              "ACME_EMAIL=${ACME_EMAIL}" \
+              "CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}" \
+              "CLOUDFLARE_DNS_API_TOKEN=${CF_DNS_API_TOKEN}" \
+              > "$TDIR/.env"
 
-            cat > "$TDIR/docker-compose.yml" <<'TRAEFIK_YML'
+            cat > "$TDIR/docker-compose.yml" <<'__TRAEFIK_COMPOSE__'
             services:
               traefik:
                 image: traefik:v3.0
@@ -1019,8 +1019,9 @@ jobs:
               proxy:
                 external: true
                 name: proxy
-            TRAEFIK_YML
+            __TRAEFIK_COMPOSE__
 
+            (cd "$TDIR" && docker compose config >/dev/null)
             (cd "$TDIR" && docker compose up -d)
 
             # --- Login to GHCR (if token provided) ---
@@ -1033,6 +1034,10 @@ jobs:
             # ============================================
             if [ "${DB_MODE}" != "none" ]; then
               echo "🔹 DB enabled — setting up Postgres + PgBouncer + pgAdmin"
+              [ -n "${PGADMIN_HOST:-}" ] || { echo "❌ PGADMIN_HOST missing while DB is enabled"; exit 1; }
+              [ -n "${PGADMIN_EMAIL:-}" ] || { echo "❌ PGADMIN_EMAIL missing while DB is enabled"; exit 1; }
+              [ -n "${PGADMIN_PASSWORD:-}" ] || { echo "❌ PGADMIN_PASSWORD missing while DB is enabled"; exit 1; }
+
               mkdir -p "${DB_DIR}"
 
               {
@@ -1133,7 +1138,7 @@ jobs:
                 echo "    name: proxy"
               } > "${DB_DIR}/docker-compose.yml"
 
-
+              (cd "${DB_DIR}" && docker compose config >/dev/null)
               (cd "${DB_DIR}" && docker compose up -d)
             else
               echo "🚫 DB disabled — skipping Postgres/PgBouncer/pgAdmin setup"
@@ -1147,12 +1152,9 @@ jobs:
 
               db_compose() { docker compose -f "${DB_DIR}/docker-compose.yml" "$@"; }
 
-              # Because DB_DIR/.env sets POSTGRES_USER/POSTGRES_PASSWORD from DB_USER/DB_PASS,
-              # the "superuser" we expect is DB_USER.
               SUPER_USER="${DB_USER}"
               SUPER_PASS="${DB_PASS}"
 
-              # Wait for postgres to be ready (pg_isready itself doesn't validate password)
               for i in $(seq 1 30); do
                 if db_compose exec -T postgres pg_isready -h postgres -U "${SUPER_USER}" -d postgres >/dev/null 2>&1; then
                   break
@@ -1161,7 +1163,6 @@ jobs:
                 sleep 2
               done
 
-              # Test superuser auth (expected creds)
               super_ok=0
               if db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
                 psql -h postgres -U "${SUPER_USER}" -d postgres -c "SELECT 1;" >/dev/null 2>&1; then
@@ -1172,14 +1173,12 @@ jobs:
                 echo "❌ Cannot authenticate as superuser '${SUPER_USER}'."
                 echo "   This usually means the DB volume was created previously with DIFFERENT creds."
 
-                # OPTIONAL: only wipe if you explicitly allow it
                 RESET_FLAG="$(printf "%s" "$SITE_ENV_NORM" | awk -F= '/^DB_RESET_ON_FAIL=/{print tolower($2)}' | tail -1)"
                 if [ "$RESET_FLAG" = "true" ] || [ "$RESET_FLAG" = "1" ] || [ "$RESET_FLAG" = "yes" ]; then
                   echo "🔥 DB_RESET_ON_FAIL enabled — wiping DB volumes and recreating fresh"
                   (cd "${DB_DIR}" && docker compose down -v)
                   (cd "${DB_DIR}" && docker compose up -d)
 
-                  # wait again after reset
                   for i in $(seq 1 30); do
                     if db_compose exec -T postgres pg_isready -h postgres -U "${SUPER_USER}" -d postgres >/dev/null 2>&1; then
                       break
@@ -1188,7 +1187,6 @@ jobs:
                     sleep 2
                   done
 
-                  # must succeed now (brand new cluster)
                   db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
                     psql -h postgres -U "${SUPER_USER}" -d postgres -c "SELECT 1;" >/dev/null 2>&1 \
                     || { echo "❌ Still cannot auth after reset"; exit 1; }
@@ -1200,11 +1198,10 @@ jobs:
                 fi
               fi
 
-              # Now we can safely reconcile the role/db using the SUPERUSER connection
               echo "⚙️ Ensuring role/db/ownership for '${DB_USER}' / '${DB_NAME}'"
               db_compose exec -T -e PGPASSWORD="${SUPER_PASS}" postgres \
                 psql -h postgres -U "${SUPER_USER}" -d postgres \
-                -v APP_USER="${DB_USER}" -v APP_DB="${DB_NAME}" -v APP_PASS="${DB_PASS}" <<'SQL'
+                -v APP_USER="${DB_USER}" -v APP_DB="${DB_NAME}" -v APP_PASS="${DB_PASS}" <<'__SQL_RECONCILE__'
             DO $$
             BEGIN
               IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_setting('APP_USER', true)) THEN
@@ -1224,9 +1221,8 @@ jobs:
               EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_setting('APP_DB', true), current_setting('APP_USER', true));
             END
             $$;
-            SQL
+            __SQL_RECONCILE__
 
-              # Restart pgbouncer so it definitely picks up the updated password
               db_compose restart pgbouncer >/dev/null 2>&1 || true
               echo "✅ DB reconcile done"
             fi
@@ -1238,34 +1234,23 @@ jobs:
             cd "${SITE_DIR}"
             printf "%s\n" "$SITE_ENV_NORM" > app.env
 
-            # Basic shared env setup
             grep -q '^AUTH_TRUST_HOST=' app.env || echo 'AUTH_TRUST_HOST=true' >> app.env
             grep -q '^NEXTAUTH_URL_PUBLIC=' app.env || echo "NEXTAUTH_URL_PUBLIC=https://${DOMAIN}" >> app.env
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
               grep -q '^NEXTAUTH_URL_ADMIN=' app.env || echo "NEXTAUTH_URL_ADMIN=https://${ADMIN_DOMAIN}" >> app.env
             fi
-            # Expose the base domain for seed script
             grep -q '^SITE_DOMAIN=' app.env || echo "SITE_DOMAIN=${DOMAIN}" >> app.env
 
-
-            # Inject DB URLs only if DB enabled
             if [ "${DB_MODE}" != "none" ]; then
               grep -q '^DATABASE_URL=' app.env || echo "DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@pgbouncer:5432/${DB_NAME}?pgbouncer=true&connection_limit=1&connect_timeout=5" >> app.env
               grep -q '^DIRECT_DATABASE_URL=' app.env || echo "DIRECT_DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@postgres:5432/${DB_NAME}?connect_timeout=5" >> app.env
             fi
 
-            # ============================================
-            # Compose template (admin optional + DB optional + hardened + security headers)
-            # ============================================
-
-            # Build docker-compose.yml.tpl with placeholders we can safely replace
-            cat > docker-compose.yml.tpl <<'APP_COMPOSE_YML'
+            cat > docker-compose.yml.tpl <<'__APP_COMPOSE__'
             services:
               app:
                 image: ${IMAGE_REF}
                 restart: unless-stopped
-
-                # ✅ Hardening (runtime)
                 security_opt:
                   - no-new-privileges:true
                 cap_drop:
@@ -1273,35 +1258,21 @@ jobs:
                 tmpfs:
                   - /tmp
                   - /var/tmp
-
                 env_file:
                   - app.env
-
                 labels:
                   - 'traefik.enable=true'
                   - 'traefik.docker.network=proxy'
-
-                  # ----------------------------
-                  # ✅ Security headers middleware (per-site)
-                  # ----------------------------
                   - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.contentTypeNosniff=true'
                   - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.referrerPolicy=strict-origin-when-cross-origin'
                   - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.permissionsPolicy=geolocation=(), microphone=(), camera=(), payment=(), usb=(), interest-cohort=()'
                   - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.customResponseHeaders.X-Frame-Options=DENY'
                   - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.customResponseHeaders.Content-Security-Policy=__CSP__'
-
-                  # ----------------------------
-                  # MAIN SITE (root + www)
-                  # ----------------------------
                   - 'traefik.http.routers.${SLUG_SAFE}.rule=Host("${DOMAIN}") || Host("www.${DOMAIN}")'
                   - 'traefik.http.routers.${SLUG_SAFE}.entrypoints=websecure'
                   - 'traefik.http.routers.${SLUG_SAFE}.tls.certresolver=le'
                   - 'traefik.http.routers.${SLUG_SAFE}.middlewares=${SLUG_SAFE}-sec'
                   - 'traefik.http.services.${SLUG_SAFE}.loadbalancer.server.port=${PORT}'
-
-                  # ----------------------------
-                  # BLOCK /admin on public host
-                  # ----------------------------
                   - 'traefik.http.routers.${SLUG_SAFE}-adminblock.rule=(Host("${DOMAIN}") || Host("www.${DOMAIN}")) && PathPrefix("/admin")'
                   - 'traefik.http.routers.${SLUG_SAFE}-adminblock.entrypoints=websecure'
                   - 'traefik.http.routers.${SLUG_SAFE}-adminblock.tls.certresolver=le'
@@ -1310,22 +1281,17 @@ jobs:
                   - 'traefik.http.middlewares.${SLUG_SAFE}-adminblock-redirect.redirectregex.regex=^https?://(www\.)?${DOMAIN}/admin.*'
                   - 'traefik.http.middlewares.${SLUG_SAFE}-adminblock-redirect.redirectregex.replacement=https://www.${DOMAIN}/'
                   - 'traefik.http.middlewares.${SLUG_SAFE}-adminblock-redirect.redirectregex.permanent=true'
-
                   # __ADMIN_LABELS__
-
                 networks:
                   - proxy
                   # __DB_NET__
 
-            APP_COMPOSE_YML
+            __APP_COMPOSE__
 
-            # ✅ CSP MUST be a single-line label value (Traefik label requirement)
             CSP="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https://js.stripe.com https://client.crisp.chat https://*.crisp.chat; connect-src 'self' https: wss:;"
-            # escape for YAML single-quoted label string (double single-quotes)
             CSP_ESCAPED="$(printf "%s" "$CSP" | sed "s/'/''/g")"
             sed -i "s|__CSP__|$CSP_ESCAPED|g" docker-compose.yml.tpl
 
-            # ✅ Insert admin labels ONLY if ADMIN_DOMAIN exists, otherwise remove marker
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
               sed -i '/# __ADMIN_LABELS__/c\
                   - '\''traefik.http.routers.${SLUG_SAFE}-admin.rule=Host("${ADMIN_DOMAIN}")'\''\
@@ -1348,14 +1314,12 @@ jobs:
               sed -i '/# __ADMIN_LABELS__/d' docker-compose.yml.tpl
             fi
 
-            # ✅ Attach DB network only if DB enabled
             if [ "${DB_MODE:-postgres}" != "none" ]; then
               sed -i "s|# __DB_NET__| - ${DB_NET}|g" docker-compose.yml.tpl
             else
               sed -i '/# __DB_NET__/d' docker-compose.yml.tpl
             fi
 
-            # ✅ Define networks section (proxy always, db_net only if DB enabled)
             {
               echo ""
               echo "networks:"
@@ -1365,36 +1329,32 @@ jobs:
               fi
             } >> docker-compose.yml.tpl
 
-            # ✅ Render final compose
             export IMAGE_REF SLUG_SAFE DOMAIN ADMIN_DOMAIN PORT DB_NET
             if ! command -v envsubst >/dev/null 2>&1; then
               apt-get update -y && apt-get install -y --no-install-recommends gettext-base
             fi
             envsubst '$IMAGE_REF $SLUG_SAFE $DOMAIN $ADMIN_DOMAIN $PORT $DB_NET' < docker-compose.yml.tpl > docker-compose.yml
 
+            docker compose config >/dev/null
             docker compose pull || true
             docker compose up -d --remove-orphans
 
             # --- Prisma migrate + Seed (only if DB enabled) ---
             if [ "${DB_MODE}" != "none" ]; then
-              docker compose exec -T app sh -s <<'PRISMA_SH'
+              docker compose exec -T app sh -s <<'__PRISMA_BOOTSTRAP__'
             set -euo pipefail
 
-            # Always apply migrations
             NODE_PATH=/app/node_modules npx prisma migrate deploy
 
-            # 1) Prefer the project's own seed if configured
-            #    (Prisma uses package.json -> prisma.seed)
             if node -e "const fs=require('fs'); const pkg=require('./package.json'); const hasSeedCmd=!!(pkg.prisma && pkg.prisma.seed); const hasSeedFile=['prisma/seed.ts','prisma/seed.js','prisma/seed.mjs'].some(p=>fs.existsSync(p)); process.exit((hasSeedCmd||hasSeedFile)?0:1)"; then
               echo "🌱 Running project seed (prisma db seed)..."
               NODE_PATH=/app/node_modules npx prisma db seed
               exit 0
             fi
 
-            # 2) Fallback: schema-aware admin ensure (works across different User models)
             echo "🌱 No project seed configured — running generic schema-aware admin ensure..."
 
-            NODE_PATH=/app/node_modules node <<'NODE_FALLBACK'
+            NODE_PATH=/app/node_modules node <<'__NODE_FALLBACK__'
             (async () => {
               const { PrismaClient, Role } = require("@prisma/client");
               const bcrypt = require("bcryptjs");
@@ -1407,7 +1367,6 @@ jobs:
                 return;
               }
 
-              // Detect User model fields from Prisma DMMF
               const userModel = prisma?._dmmf?.datamodel?.models?.find(m => m.name === "User");
               const fields = new Set((userModel?.fields ?? []).map(f => f.name));
 
@@ -1422,7 +1381,6 @@ jobs:
               const createData = { email, name };
               const updateData = { name };
 
-              // Role handling (enum vs string vs missing)
               if (fields.has("role")) {
                 if (Role) {
                   const pref = ["HEAD","ADMIN","OWNER","STAFF","VIEWER"];
@@ -1438,7 +1396,6 @@ jobs:
                 }
               }
 
-              // Password handling (password vs passwordHash)
               if (plain) {
                 const hash = await bcrypt.hash(plain, 12);
                 if (fields.has("password")) {
@@ -1462,12 +1419,12 @@ jobs:
               console.error("❌ Fallback admin ensure failed:", e);
               process.exit(1);
             });
-            NODE_FALLBACK
-            PRISMA_SH
+            __NODE_FALLBACK__
+            __PRISMA_BOOTSTRAP__
             else
               echo "🚫 DB disabled — skipping Prisma migrations and seeding"
             fi
-
+          
       - name: In-container health check (bypasses DNS/SSL)
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2
         env:
