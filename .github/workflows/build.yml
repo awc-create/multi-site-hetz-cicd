@@ -1310,12 +1310,15 @@ jobs:
 
             if [ -n "${ADMIN_DOMAIN:-}" ]; then
               sed -i '/# __ADMIN_LABELS__/c\
+                  - '\''traefik.http.middlewares.${SLUG_SAFE}-upload.buffering.maxRequestBodyBytes=268435456'\''\
+                  - '\''traefik.http.middlewares.${SLUG_SAFE}-upload.buffering.memRequestBodyBytes=10485760'\''\
+                  - '\''traefik.http.middlewares.${SLUG_SAFE}-upload.buffering.maxResponseBodyBytes=0'\''\
                   - '\''traefik.http.routers.${SLUG_SAFE}-admin.rule=Host("${ADMIN_DOMAIN}")'\''\
                   - '\''traefik.http.routers.${SLUG_SAFE}-admin.priority=100'\''\
                   - '\''traefik.http.routers.${SLUG_SAFE}-admin.entrypoints=websecure'\''\
                   - '\''traefik.http.routers.${SLUG_SAFE}-admin.tls.certresolver=le'\''\
                   - '\''traefik.http.routers.${SLUG_SAFE}-admin.service=${SLUG_SAFE}'\''\
-                  - '\''traefik.http.routers.${SLUG_SAFE}-admin.middlewares=${SLUG_SAFE}-sec'\''\
+                  - '\''traefik.http.routers.${SLUG_SAFE}-admin.middlewares=${SLUG_SAFE}-sec,${SLUG_SAFE}-upload'\''\
                   - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.rule=Host("${ADMIN_DOMAIN}") && Path(`/`)'\''\
                   - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.priority=200'\''\
                   - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.entrypoints=websecure'\''\
