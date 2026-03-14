@@ -1304,7 +1304,7 @@ jobs:
 
             APP_COMPOSE
 
-            CSP="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https://js.stripe.com https://client.crisp.chat https://*.crisp.chat; connect-src 'self' https: wss:;"
+            CSP="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https://js.stripe.com https://client.crisp.chat https://*.crisp.chat; media-src 'self' https:; connect-src 'self' https: wss:;"
             CSP_ESCAPED="$(printf "%s" "$CSP" | sed "s/'/''/g")"
             sed -i "s|__CSP__|$CSP_ESCAPED|g" docker-compose.yml.tpl
 
@@ -1313,12 +1313,15 @@ jobs:
                   - '\''traefik.http.middlewares.${SLUG_SAFE}-upload.buffering.maxRequestBodyBytes=268435456'\''\
                   - '\''traefik.http.middlewares.${SLUG_SAFE}-upload.buffering.memRequestBodyBytes=10485760'\''\
                   - '\''traefik.http.middlewares.${SLUG_SAFE}-upload.buffering.maxResponseBodyBytes=0'\''\
+                  - '\''traefik.http.middlewares.${SLUG_SAFE}-stripslash.redirectregex.regex=^(https?://[^/]+/.*[^/])/$'\''\
+                  - '\''traefik.http.middlewares.${SLUG_SAFE}-stripslash.redirectregex.replacement=$$1'\''\
+                  - '\''traefik.http.middlewares.${SLUG_SAFE}-stripslash.redirectregex.permanent=false'\''\
                   - '\''traefik.http.routers.${SLUG_SAFE}-admin.rule=Host("${ADMIN_DOMAIN}")'\''\
                   - '\''traefik.http.routers.${SLUG_SAFE}-admin.priority=100'\''\
                   - '\''traefik.http.routers.${SLUG_SAFE}-admin.entrypoints=websecure'\''\
                   - '\''traefik.http.routers.${SLUG_SAFE}-admin.tls.certresolver=le'\''\
                   - '\''traefik.http.routers.${SLUG_SAFE}-admin.service=${SLUG_SAFE}'\''\
-                  - '\''traefik.http.routers.${SLUG_SAFE}-admin.middlewares=${SLUG_SAFE}-sec,${SLUG_SAFE}-upload'\''\
+                  - '\''traefik.http.routers.${SLUG_SAFE}-admin.middlewares=${SLUG_SAFE}-sec,${SLUG_SAFE}-upload,${SLUG_SAFE}-stripslash'\''\
                   - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.rule=Host("${ADMIN_DOMAIN}") && Path(`/`)'\''\
                   - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.priority=200'\''\
                   - '\''traefik.http.routers.${SLUG_SAFE}-adminroot.entrypoints=websecure'\''\
