@@ -1304,7 +1304,7 @@ jobs:
 
             APP_COMPOSE
 
-            CSP="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; frame-src https://www.youtube.com https://player.vimeo.com; img-src 'self' data: https:; font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https://js.stripe.com https://client.crisp.chat https://*.crisp.chat; media-src 'self' https:; connect-src 'self' https: wss:;"
+            CSP="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; frame-src 'self' https://www.youtube.com https://player.vimeo.com; img-src 'self' data: https:; font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https://js.stripe.com https://client.crisp.chat https://*.crisp.chat; media-src 'self' https:; connect-src 'self' https: wss:;"
 
             CSP_ESCAPED="$(printf "%s" "$CSP" | sed "s/'/''/g")"
             sed -i "s|__CSP__|$CSP_ESCAPED|g" docker-compose.yml.tpl
@@ -1619,7 +1619,7 @@ jobs:
                   - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.contentTypeNosniff=true'
                   - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.referrerPolicy=strict-origin-when-cross-origin'
                   - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.permissionsPolicy=geolocation=(), microphone=(), camera=(), payment=(), usb=(), interest-cohort=()'
-                  - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.customResponseHeaders.X-Frame-Options=DENY'
+                  - 'traefik.http.middlewares.${SLUG_SAFE}-sec.headers.customResponseHeaders.X-Frame-Options=SAMEORIGIN'
                   - >-
                     traefik.http.middlewares.${SLUG_SAFE}-sec.headers.customResponseHeaders.Content-Security-Policy=
                     default-src 'self';
