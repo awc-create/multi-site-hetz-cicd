@@ -608,9 +608,11 @@ jobs:
           OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           REPO_NAME="${{ needs.detect.outputs.repository_name }}"
           IMAGE="ghcr.io/${OWNER_LOWER}/${REPO_NAME}"
-          SHORT="${GITHUB_SHA::7}"
+          # Use the SITE repo's SHA — GITHUB_SHA is the CICD repo's SHA and never
+          # changes between site deploys, causing the same image tag every time.
+          SITE_SHA=$(git -C site rev-parse --short HEAD)
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
-          echo "ref=$IMAGE:$SHORT" >> $GITHUB_OUTPUT
+          echo "ref=$IMAGE:$SITE_SHA" >> $GITHUB_OUTPUT
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
