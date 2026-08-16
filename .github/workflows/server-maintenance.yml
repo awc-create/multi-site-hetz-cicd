@@ -1,0 +1,150 @@
+name: Server Maintenance (Hetzner disk)
+
+# Run from the GitHub UI: Actions → Server Maintenance (Hetzner disk) → Run workflow.
+# Reuses the same HZ_* secrets as the deploy/backup workflows, so you do not need
+# a local SSH key or console access to diagnose or free up disk space.
+#
+# Default action is READ-ONLY. Pruning must be chosen explicitly.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What to do"
+        required: true
+        default: diagnose
+        type: choice
+        options:
+          - diagnose          # read-only: report disk usage, change nothing
+          - prune-safe        # remove unused images + build cache (keeps volumes/data)
+          - prune-aggressive  # same, but ignores the age filter
+      keep_since:
+        description: "prune-safe only: keep images newer than this (e.g. 168h = 7 days)"
+        required: false
+        default: "168h"
+
+permissions:
+  contents: read
+
+env:
+  HZ_HOST: ${{ secrets.HZ_HOST }}
+  HZ_USER: ${{ secrets.HZ_USER }}
+  HZ_SSH_KEY: ${{ secrets.HZ_SSH_KEY }}
+
+jobs:
+  maintenance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify SSH secrets
+        run: |
+          test -n "${{ env.HZ_HOST }}"    || { echo "❌ Missing HZ_HOST"; exit 1; }
+          test -n "${{ env.HZ_SSH_KEY }}" || { echo "❌ Missing HZ_SSH_KEY"; exit 1; }
+
+      - name: Run maintenance on Hetzner
+        uses: appleboy/ssh-action@v1
+        env:
+          ACTION: ${{ inputs.action }}
+          KEEP_SINCE: ${{ inputs.keep_since }}
+        with:
+          host: ${{ env.HZ_HOST }}
+          username: ${{ env.HZ_USER || 'root' }}
+          key: ${{ env.HZ_SSH_KEY }}
+          port: 22
+          timeout: 60s
+          command_timeout: 20m
+          envs: ACTION,KEEP_SINCE
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            ACTION="${ACTION:-diagnose}"
+            KEEP_SINCE="${KEEP_SINCE:-168h}"
+
+            report() {
+              echo "=============================================="
+              echo "💽 Filesystem usage"
+              df -h /
+
+              echo
+              echo "🐳 Docker usage (RECLAIMABLE is what a prune would free)"
+              docker system df || true
+
+              echo
+              echo "📁 Largest things under /opt"
+              du -sh /opt/* 2>/dev/null | sort -h | tail -n 10 || true
+
+              echo
+              echo "🗄️  Postgres backups per site"
+              du -sh /opt/backups/postgres/* 2>/dev/null | sort -h || echo "  (none found)"
+
+              echo
+              echo "🔢 Backup file counts (retention keeps 14 per DB — extras here mean stale prefixes)"
+              for d in /opt/backups/postgres/*/; do
+                [ -d "$d" ] || continue
+                printf '  %-40s %s files\n' "$(basename "$d")" "$(find "$d" -name '*.sql.gz' | wc -l)"
+              done
+
+              echo
+              echo "📦 Docker images on disk (top 10 by size)"
+              docker images --format '{{.Size}}\t{{.Repository}}:{{.Tag}}' \
+                | sort -h -r | head -n 10 || true
+
+              echo
+              echo "📝 Container log sizes (top 5)"
+              du -sh /var/lib/docker/containers/*/*-json.log 2>/dev/null \
+                | sort -h | tail -n 5 || echo "  (none)"
+              echo "=============================================="
+            }
+
+            echo "### BEFORE ###"
+            report
+
+            case "$ACTION" in
+              diagnose)
+                echo
+                echo "ℹ️  Read-only run — nothing was changed."
+                ;;
+
+              prune-safe|prune-aggressive)
+                echo
+                echo "🧹 Pruning unused images and build cache…"
+                echo "⚠️  Volumes are NEVER pruned here — that is what holds the Postgres data."
+
+                if [ "$ACTION" = "prune-safe" ]; then
+                  docker image prune -af --filter "until=${KEEP_SINCE}" || true
+                  docker builder prune -af --filter "until=${KEEP_SINCE}" || true
+                else
+                  docker image prune -af || true
+                  docker builder prune -af || true
+                fi
+
+                # Stopped containers and unused networks are safe to clear.
+                docker container prune -f || true
+                docker network prune -f   || true
+
+                echo
+                echo "### AFTER ###"
+                report
+
+                echo
+                echo "🔎 Postgres write check (does the DB accept writes again?)"
+                for dir in /opt/services/postgres-*; do
+                  [ -d "$dir" ] || continue
+                  slug="$(basename "$dir" | sed 's/^postgres-//')"
+                  [ -s "${dir}/.env" ] || { echo "  ⏭️  ${slug}: no .env, skipping"; continue; }
+                  # shellcheck disable=SC1090
+                  set -a; . "${dir}/.env"; set +a
+                  ( cd "$dir" && docker compose exec -T \
+                      -e PGPASSWORD="${POSTGRES_PASSWORD}" postgres \
+                      psql -h 127.0.0.1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+                      -c "CREATE TEMP TABLE _disk_check(x int); DROP TABLE _disk_check;" \
+                      >/dev/null 2>&1 \
+                    && echo "  ✅ ${slug}: writes OK" \
+                    || echo "  ❌ ${slug}: still cannot write" )
+                done
+                ;;
+
+              *)
+                echo "❌ Unknown action: $ACTION"; exit 1
+                ;;
+            esac
