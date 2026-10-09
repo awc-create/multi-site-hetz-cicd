@@ -32,6 +32,7 @@ jobs:
       domain_admin:     ${{ steps.dom.outputs.DOMAIN_ADMIN }}
       domain_pgadmin:   ${{ steps.dom.outputs.DOMAIN_PGADMIN }}
       db_mode:          ${{ steps.dbmode.outputs.DB_MODE }}
+      sha:              ${{ steps.p.outputs.sha }}
     steps:
       - name: Security gate (dispatch auth + branch allowlist)
         id: gate
@@ -66,6 +67,23 @@ jobs:
           echo "repository=${{ github.event.client_payload.repository || github.repository }}" >> $GITHUB_OUTPUT
           echo "repository_name=${{ github.event.client_payload.repository_name || github.event.repository.name }}" >> $GITHUB_OUTPUT
           echo "branch=${{ github.event.client_payload.branch || github.ref_name }}" >> $GITHUB_OUTPUT
+          # Optional. Sites whose trigger-deploy.yml predates this send nothing,
+          # in which case status reporting is skipped rather than failing.
+          echo "sha=${{ github.event.client_payload.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Report "pending" to the site repo
+        if: steps.p.outputs.sha != ''
+        continue-on-error: true
+        run: |
+          curl -sS -X POST \
+            -H "Authorization: token ${{ secrets.SITE_REPO_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ steps.p.outputs.repository }}/statuses/${{ steps.p.outputs.sha }}" \
+            -d '{
+              "state": "pending",
+              "context": "Deploy",
+              "description": "Building and deploying…"
+            }' >/dev/null
 
       - name: Checkout target website repo
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -1313,7 +1331,13 @@ jobs:
 
             APP_COMPOSE
 
-            CSP="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; frame-src 'self' https://www.youtube.com https://player.vimeo.com; img-src 'self' data: https: blob:; font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https://js.stripe.com https://client.crisp.chat https://*.crisp.chat; media-src 'self' https:; connect-src 'self' https: wss:;"
+            # Traefik sets this header and it REPLACES the one from
+            # next.config.js, so anything a site loads from a third party has
+            # to be allowed here too. script-src is the only explicit
+            # allowlist: img-src, connect-src and media-src already permit
+            # https:, so new analytics or CDN domains usually only need adding
+            # to script-src.
+            CSP="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; frame-src 'self' https://www.youtube.com https://player.vimeo.com; img-src 'self' data: https: blob:; font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https://js.stripe.com https://client.crisp.chat https://*.crisp.chat https://www.clarity.ms https://*.clarity.ms; media-src 'self' https:; connect-src 'self' https: wss:;"
             
             CSP_ESCAPED="$(printf "%s" "$CSP" | sed "s/'/''/g")"
             sed -i "s|__CSP__|$CSP_ESCAPED|g" docker-compose.yml.tpl
@@ -1709,3 +1733,71 @@ jobs:
           }
           JSON
       - run: echo "Hetzner deploy steps unchanged; using your existing definitions."
+  # =====================================================================
+  # Report the outcome back to the site repo as a commit status.
+  #
+  # The client only has access to their own repo, not this one, so without
+  # this their Actions tab shows "trigger-deploy" succeeding even when the
+  # build failed here. They now get a ✓ / ✗ against their own commit.
+  #
+  # Skipped entirely for sites that don't send a sha in the dispatch, so
+  # older site repos keep working unchanged.
+  # =====================================================================
+  report_status:
+    needs: [detect, build_test, vercel_preview, vercel_prod, hetzner_node, hetzner_static]
+    if: always() && needs.detect.outputs.sha != ''
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post result to the originating repo
+        continue-on-error: true
+        env:
+          BUILD: ${{ needs.build_test.result }}
+          VPREV: ${{ needs.vercel_preview.result }}
+          VPROD: ${{ needs.vercel_prod.result }}
+          HNODE: ${{ needs.hetzner_node.result }}
+          HSTATIC: ${{ needs.hetzner_static.result }}
+          BRANCH: ${{ needs.detect.outputs.branch }}
+          DOMAIN: ${{ needs.detect.outputs.domain_prod }}
+        run: |
+          set -euo pipefail
+
+          # "skipped" is normal — only one deploy path runs per branch.
+          fail=0
+          for r in "$BUILD" "$VPREV" "$VPROD" "$HNODE" "$HSTATIC"; do
+            case "$r" in
+              failure|cancelled) fail=1 ;;
+            esac
+          done
+
+          if [ "$fail" -eq 1 ]; then
+            STATE="failure"
+            if [ "$BUILD" = "failure" ]; then
+              DESC="Build failed — the site was not deployed"
+            else
+              DESC="Build passed but deployment failed"
+            fi
+            URL=""
+          else
+            STATE="success"
+            case "$BRANCH" in
+              main-hetz) DESC="Deployed to production"; URL="https://${DOMAIN}" ;;
+              dev)       DESC="Deployed to the test site"; URL="" ;;
+              *)         DESC="Preview deployed"; URL="" ;;
+            esac
+          fi
+
+          echo "Reporting $STATE for $BRANCH: $DESC"
+
+          jq -n \
+            --arg state "$STATE" \
+            --arg desc "$DESC" \
+            --arg url "$URL" \
+            '{state: $state, context: "Deploy", description: $desc}
+             + (if $url == "" then {} else {target_url: $url} end)' \
+          | curl -sS -X POST \
+              -H "Authorization: token ${{ secrets.SITE_REPO_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ needs.detect.outputs.repository }}/statuses/${{ needs.detect.outputs.sha }}" \
+              -d @- >/dev/null
